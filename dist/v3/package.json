@@ -1,6 +1,6 @@
 {
   "name": "gpt-talk-enhancer-v3-codex-plus",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "host": "codex-desktop",
   "codexPlus": {
     "minimumConfirmedVersion": "1.2.56",

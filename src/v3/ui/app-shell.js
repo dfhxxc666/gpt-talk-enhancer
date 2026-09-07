@@ -89,6 +89,7 @@ export class AppShell {
     this.rail?.setVisible(timelineVisible);
     this.questionList?.setVisible(timelineVisible);
     this.promptTrigger?.setVisible(promptVisible);
+    if (surface === SURFACE.SETTINGS) this.promptPanel?.setOpen?.(false);
     this.promptPanel?.setVisible(promptVisible);
     if (this.hostElement?.getAttribute?.("data-gte-surface") !== surface) this.hostElement?.setAttribute?.("data-gte-surface", surface);
   }
@@ -132,8 +133,8 @@ export class AppShell {
     const viewportWidth = Number(this.window?.visualViewport?.width ?? this.window?.innerWidth ?? 0);
     const contentRight = Number(rect?.right);
     const inset = viewportWidth > 0 && Number.isFinite(contentRight)
-      ? Math.max(10, viewportWidth - Math.min(viewportWidth, Math.max(0, contentRight)) + 10)
-      : 10;
+      ? Math.max(14, viewportWidth - Math.min(viewportWidth, Math.max(0, contentRight)) + 14)
+      : 14;
     this.rail?.setRightInset?.(inset);
     this.toast?.setViewportRect?.(rect, viewportWidth);
     this.questionList?.updatePosition?.();

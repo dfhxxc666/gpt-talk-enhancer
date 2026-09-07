@@ -79,10 +79,31 @@ export class ConversationAdapter {
     return `${location?.pathname ?? ""}${location?.search ?? ""}${location?.hash ?? ""}`;
   }
 
-  getConversationRoot() {
+  getStableConversationRoot() {
     return this.document?.querySelector?.("[data-thread-find-target='conversation']")
       ?? this.document?.querySelector?.("[data-chatgpt-conversation-selection-target='true']")
       ?? this.document?.querySelector?.("main [data-testid='conversation-turn-list']")
+      ?? null;
+  }
+
+  isVisibleConversationRoot(root) {
+    if (!root || root.isConnected === false || root.hidden === true) return false;
+    const style = this.window?.getComputedStyle?.(root);
+    if (style?.display === "none" || style?.visibility === "hidden") return false;
+    const rect = root.getBoundingClientRect?.();
+    return !rect || (Number(rect.width) > 0 && Number(rect.height) > 0);
+  }
+
+  hasVisibleConversationContent() {
+    const root = this.getStableConversationRoot();
+    if (!this.isVisibleConversationRoot(root)) return false;
+    return Boolean(this.document?.querySelector?.(
+      "[data-markdown-text-tone='user-message'], [data-turn-key], [data-content-search-turn-key], [data-turn-id], [data-turn-id-container]"
+    ));
+  }
+
+  getConversationRoot() {
+    return this.getStableConversationRoot()
       ?? this.document?.querySelector?.("main")
       ?? null;
   }

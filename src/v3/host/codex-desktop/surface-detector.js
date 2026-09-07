@@ -14,7 +14,9 @@ export class SurfaceDetector {
     if (/(^|\/)settings?(\/|$)/.test(route)) return SURFACE.SETTINGS;
     if (/(^|\/)(plugins?|skills?|mcp)(\/|$)/.test(route)) return SURFACE.PLUGIN_MANAGER;
     if (this.conversationAdapter?.getConversationId?.()) return SURFACE.CONVERSATION;
-    if (this.document?.querySelector?.("#prompt-textarea, textarea[placeholder], [contenteditable='true'][role='textbox']")) return SURFACE.NEW_CHAT;
+    if (this.conversationAdapter?.hasVisibleConversationContent?.()) return SURFACE.CONVERSATION;
+    if (this.document?.querySelector?.("#prompt-textarea")
+      ?? this.document?.querySelector?.("[contenteditable='true'][role='textbox']")) return SURFACE.NEW_CHAT;
     return SURFACE.OTHER;
   }
 }

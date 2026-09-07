@@ -63,7 +63,7 @@ for (const [id, source] of modules) {
   body += `${JSON.stringify(id)}: (module, exports, __require) => {\n${source}\n},\n`;
 }
 
-let bundle = `/*\n * GPT TalkEnhancer 0.4.5 Desktop bundle\n * Includes GPL-3.0-or-later derived Timeline UI material.\n * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.\n */\n(() => {\n  \"use strict\";\n  const __modules = {\n${body}  };\n  const __cache = Object.create(null);\n  function __require(id) {\n    if (__cache[id]) return __cache[id].exports;\n    const factory = __modules[id];\n    if (!factory) throw new Error(\`Missing bundled module: \${id}\`);\n    const module = { exports: {} };\n    __cache[id] = module;\n    factory(module, module.exports, __require);\n    return module.exports;\n  }\n  __require(${JSON.stringify(entryId)});\n})();\n`;
+let bundle = `/*\n * GPT TalkEnhancer 0.5.0 Desktop bundle\n * Includes GPL-3.0-or-later derived Timeline UI material.\n * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.\n */\n(() => {\n  \"use strict\";\n  const __modules = {\n${body}  };\n  const __cache = Object.create(null);\n  function __require(id) {\n    if (__cache[id]) return __cache[id].exports;\n    const factory = __modules[id];\n    if (!factory) throw new Error(\`Missing bundled module: \${id}\`);\n    const module = { exports: {} };\n    __cache[id] = module;\n    factory(module, module.exports, __require);\n    return module.exports;\n  }\n  __require(${JSON.stringify(entryId)});\n})();\n`;
 
 const css = `${fs.readFileSync(timelineCss, "utf8")}\n${fs.readFileSync(promptCss, "utf8")}`;
 bundle = bundle.replace(JSON.stringify(STYLE_PLACEHOLDER), JSON.stringify(css));
@@ -76,7 +76,7 @@ fs.copyFileSync(noticeSource, path.join(outDir, "NOTICE-GPL.md"));
 fs.copyFileSync(licenseSource, path.join(outDir, "THIRD_PARTY_GPL-3.0.txt"));
 fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({
   name: "gpt-talk-enhancer-v3-codex-plus",
-  version: "0.4.5",
+  version: "0.5.0",
   host: "codex-desktop",
   codexPlus: {
     minimumConfirmedVersion: "1.2.56",

@@ -114,6 +114,15 @@ test("Rail stays sparse and active marker owns exact turn id", () => {
   assert.equal(selected, "q57");
 });
 
+test("Timeline rail hover detail stays compact", () => {
+  const rail = new TimelineRail({ document: new FakeDocument(), maxMarkers: 14 });
+  rail.mount(new FakeElement());
+  rail.setState([{ id: "q1", order: 0, text: "12345678901234567890" }], "q1");
+  const marker = rail.findMarker("q1");
+  assert.equal(marker.title, "Q1 · 123456789012345678…");
+  assert.equal(marker.getAttribute("aria-label"), "Q1 12345678901234567890");
+});
+
 test("Timeline rail marks pending separately from active", () => {
   const rail = new TimelineRail({ document: new FakeDocument(), maxMarkers: 14 });
   rail.mount(new FakeElement());
@@ -152,14 +161,14 @@ test("AppShell keeps Timeline inside the conversation viewport and follows pane 
   shell.rail = { setRightInset: (value) => { inset = Math.round(value); } };
   shell.toast = { setViewportRect: (rect) => { toastCenter = Math.round((rect.left + rect.right) / 2); } };
   shell.questionList = { updatePosition: () => { panelUpdates += 1; } };
-  assert.equal(shell.refreshTimelineLayout(), 410);
-  assert.equal(inset, 410);
+  assert.equal(shell.refreshTimelineLayout(), 414);
+  assert.equal(inset, 414);
   assert.equal(toastCenter, 520);
   assert.equal(shell.timelineLayoutObserver.observed[0], viewport);
 
   viewport.rect = { ...viewport.rect, right: 960, width: 720 };
   shell.timelineLayoutObserver.callback();
-  assert.equal(inset, 250);
+  assert.equal(inset, 254);
   assert.equal(toastCenter, 600);
   assert.equal(panelUpdates, 2);
 });
@@ -257,6 +266,23 @@ test("AppShell surface matrix hides/shows Timeline and Prompt correctly", () => 
   }
 });
 
+
+test("AppShell closes Prompt Panel when entering Settings", () => {
+  const shell = new AppShell({});
+  let open = true;
+  let visible = true;
+  shell.rail = { setVisible() {} };
+  shell.questionList = { setVisible() {} };
+  shell.promptTrigger = { setVisible() {} };
+  shell.promptPanel = {
+    setOpen(value) { open = Boolean(value); },
+    setVisible(value) { visible = Boolean(value); }
+  };
+
+  shell.setSurface(SURFACE.SETTINGS);
+  assert.equal(open, false);
+  assert.equal(visible, false);
+});
 
 test("Rail marker geometry follows absolute turn order instead of equal spacing", () => {
   const document = new FakeDocument();

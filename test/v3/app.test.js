@@ -9,8 +9,9 @@ function createHarness({ navigationOk = true, storage = null } = {}) {
   const turns = Array.from({ length: 50 }, (_, i) => ({ id: `q${i + 1}`, order: i, text: `Question ${i + 1}`, source: "dom", visible: i >= 20 && i < 28 }));
   let active = "q22";
   let conversationId = "A";
+  let surface = SURFACE.CONVERSATION;
   const host = {
-    getSurface: () => SURFACE.CONVERSATION,
+    getSurface: () => surface,
     getConversationId: () => conversationId,
     getConversationIdentity: () => ({ id: conversationId, source: "test", host: "test", kind: "conversation", stable: true }),
     getRoute: () => `/c/${conversationId}`,
@@ -43,7 +44,7 @@ function createHarness({ navigationOk = true, storage = null } = {}) {
     destroy() {}
   };
   app.refresh("test-init");
-  return { app, host, shellState, turns, getActive: () => active, setConversationId: (value) => { conversationId = value; } };
+  return { app, host, shellState, turns, getActive: () => active, setConversationId: (value) => { conversationId = value; }, setSurface: (value) => { surface = value; } };
 }
 
 test("Timeline cache restores a complete long-conversation index before DOM hydration catches up", () => {
@@ -173,7 +174,7 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
 test("debug status exposes requested v3 runtime fields", () => {
   const { app } = createHarness();
   const status = app.status();
-  assert.equal(status.version, "0.4.5");
+  assert.equal(status.version, "0.5.0");
   assert.deepEqual(status.conversationIdentity, { id: "A", source: "test", host: "test", kind: "conversation", stable: true });
   assert.equal(status.host, "codex-desktop");
   assert.equal(status.hostContract.revision, "codex-desktop-v1");
@@ -216,6 +217,41 @@ test("conversation switch invalidates in-flight navigation without stale failure
   assert.equal(app.status().navigationUx.state, "idle");
 });
 
+test("transient conversation UI gap preserves the current session without inventing a host identity", () => {
+  const { app, host, shellState, setConversationId, setSurface } = createHarness();
+  const previousTurns = shellState.turns;
+  setConversationId(null);
+  setSurface(SURFACE.CONVERSATION);
+  app.refresh("conversation-identity-transient");
+  assert.equal(host.getConversationId(), null);
+  assert.equal(app.currentConversationId, "A");
+  assert.equal(shellState.turns, previousTurns);
+});
+
+test("Settings surface invalidates in-flight navigation without stale failure UI", async () => {
+  const { app, host, shellState, setSurface } = createHarness();
+  let context = null;
+  let resolveNavigation = null;
+  let cancellations = 0;
+  host.cancelNavigation = () => { cancellations += 1; };
+  host.navigateToTurn = (_turnId, nextContext) => {
+    context = nextContext;
+    return new Promise((resolve) => { resolveNavigation = resolve; });
+  };
+  const navigation = app.navigate("q1");
+  assert.equal(context.isCurrent(), true);
+  setSurface(SURFACE.SETTINGS);
+  app.refresh("settings-interrupt");
+  assert.equal(context.isCurrent(), false);
+  assert.equal(app.currentConversationId, null);
+  assert.equal(app.status().navigationUx.state, "idle");
+  assert.ok(cancellations >= 1);
+  resolveNavigation({ ok: false, target: "q1", verified: false, reason: "superseded" });
+  await navigation;
+  assert.equal(shellState.toasts.length, 0);
+  assert.equal(app.status().navigationUx.state, "idle");
+});
+
 test("conversation inherits active capture hook status on activation", () => {
   const { app } = createHarness();
   app.captureStatus = { status: "active", turnCount: 0, lastError: "" };
@@ -245,7 +281,20 @@ test("sidebar conversation click settles after Desktop selection transition", ()
   const calls = [];
   app.scheduleRefresh = (reason) => calls.push(reason);
   app.refresh = (reason) => calls.push(reason);
-  app.window = { setTimeout(callback) { callback(); return 7; }, clearTimeout() {} };
-  app.handleConversationSelect({ target: { closest: () => ({}) } });
+  app.window = { performance: { now: () => 1000 }, setTimeout(callback) { callback(); return 7; }, clearTimeout() {} };
+  app.handleConversationSelect({ target: { closest: () => ({ getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? "local:test" : null }) } });
   assert.deepEqual(calls, ["conversation-select", "conversation-select-settled"]);
+  assert.equal(app.localNavigationSettleUntil, 1500);
+});
+
+test("Local Work navigation waits for the short host restore settle window", async () => {
+  const { app, host } = createHarness();
+  host.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  let calledAt = 0;
+  host.navigateToTurn = async (turnId) => { calledAt = Date.now(); return { ok: true, target: turnId, verified: true }; };
+  const startedAt = Date.now();
+  app.localNavigationSettleUntil = startedAt + 25;
+  const result = await app.navigate("q4");
+  assert.equal(result.ok, true);
+  assert.ok(calledAt - startedAt >= 15, `expected Local navigation to wait for host settle, got ${calledAt - startedAt}ms`);
 });

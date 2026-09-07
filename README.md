@@ -1,13 +1,13 @@
 # GPT TalkEnhancer
 
-GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定版为 **v0.4.5**。
+GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定版为 **v0.5.0**。
 
 它专注于两个核心能力：
 
 - **Conversation Timeline / Question List**：为长对话建立问题索引、当前位置高亮和可验证跳转。
 - **Prompt Picker / Prompt Library**：保存、搜索、编辑并插入常用提示词，不会自动发送。
 
-> **v0.4.5 是 0.4.x 的冻结稳定基线。** 已完成真实 Codex Desktop / Work 验收；后续新增能力进入 0.5.x，除非出现可复现回归，否则不再调整 0.4.x 的 Navigation / TurnIndex / Cache 核心。
+> **v0.5.0 是当前稳定基线。** `v0.4.5` tag 继续保留为冻结的 0.4.x 历史基线；后续 Chat / Work Navigation 提速实验不得回归 0.5.0 已验收的正确性与 Restore 语义。
 
 ## 功能
 
@@ -24,16 +24,20 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ## 当前状态
 
-**v0.4.5 / stable**
+**v0.5.0 / stable**
 
-- 自动测试：`151 / 151 PASS`
+- 自动测试：`158 / 158 PASS`
 - `npm run check`：PASS
 - `npm run build`：PASS
-- 真实 Codex Desktop / Work：PASS
-- Desktop bundle SHA-256：
-  `6FA4E8DA773642402BED9666AF6465E684ABF58BAA9BAB1CF0F24A06422EF117`
+- `npm run build:market`：PASS
+- 真实 Codex Desktop Chat / Work：PASS
+- Codex++ 单文件安装：PASS
+- 正式单文件 SHA-256：`2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA`
+- Desktop bundle SHA-256：`4668A17637BD88DC7EA2F6EB217CA90B9151C2F3BCFFF95A0D8EFFA1421C1E6D`
 
-详细冻结验收见 [`docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md)。
+详细收口验收见 [`docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md)。
+
+`v0.4.5` 仍保留为 0.4.x 冻结历史基线，不移动原 tag。
 
 ## 环境要求
 
@@ -50,42 +54,39 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ### 方式一：AI 一键安装（推荐）
 
-如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。提示词固定到 `v0.4.5` tag，并要求核对 SHA-256，不会覆盖或删除其他 Codex++ User Scripts。
+如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。v0.5.0 的推荐安装形态已经收敛为 **一个 User Script 文件**。
 
 ```text
-请为我安装 GPT TalkEnhancer v0.4.5 到当前 Windows 用户的 Codex++ User Scripts。
+请为我安装 GPT TalkEnhancer v0.5.0 到当前 Windows 用户的 Codex++ User Scripts。
 
 要求：
-1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.4.5 tag 获取以下两个文件，不要使用 main 上的开发版本：
-   - dist/v3/00-gpt-talk-enhancer.v3.bundle.js
-   - dist/v3/10-gpt-talk-enhancer.v3.loader.js
-2. 安装目标目录必须是 %APPDATA%\Codex++\user_scripts；如果目录不存在可以创建。
-3. 只新增或更新上面两个 GPT TalkEnhancer 文件，不要删除、覆盖或修改其他 User Scripts，也不要修改 Codex++ 本体。
+1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.5.0 tag 获取：
+   - dist/market/gpt-talk-enhancer.js
+   不要使用 main 上的开发版本。
+2. 安装目标为 %APPDATA%\Codex++\user_scripts\gpt-talk-enhancer.js；目录不存在时可以创建。
+3. 只新增或更新这个 GPT TalkEnhancer 文件，不要删除、覆盖或修改其他 User Scripts，也不要修改 Codex++ 本体。
 4. 下载后核对 SHA-256：
-   - 00-gpt-talk-enhancer.v3.bundle.js = 6FA4E8DA773642402BED9666AF6465E684ABF58BAA9BAB1CF0F24A06422EF117
-   - 10-gpt-talk-enhancer.v3.loader.js = 2DDBD127C0DFB14EC3B36184765AB72CE84F1343B823AC3AFBC540B37978400C
-5. 如果本机有 Node.js，对两个已安装文件执行 node --check。
-6. 不要直接编辑 Codex++ 的 user_scripts.json；如果脚本尚未启用，只告诉我在 Codex++ UI 中启用这两个文件。
-7. 完成后报告安装路径、两个文件的实际 SHA-256、语法检查结果，以及是否需要重启 Codex Desktop。
+   - gpt-talk-enhancer.js = 2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA
+5. 如果本机有 Node.js，对已安装文件执行 node --check。
+6. 不要直接编辑 Codex++ 的 user_scripts.json；如旧版 0.4.x 双文件仍处于启用状态，请告诉我在 Codex++ UI 中禁用旧的 00-gpt-talk-enhancer.v3.bundle.js 与 10-gpt-talk-enhancer.v3.loader.js，避免重复加载，不要擅自删除其他文件。
+7. 完成后报告安装路径、实际 SHA-256、语法检查结果，以及是否需要重启 Codex Desktop。
 ```
 
-这个方法适合 Codex、Claude Code、ChatGPT Work 等具备本机文件/终端操作能力的环境。普通网页聊天无法直接写入你的 `%APPDATA%` 时，请使用下面的手动安装。
+这个方法适合 Codex、Claude Code、ChatGPT Work 等具备本机文件/终端操作能力的环境。普通网页聊天无法直接写入 `%APPDATA%` 时，请使用下面的手动安装。
 
-### 方式二：使用仓库中的稳定构建
+### 方式二：使用稳定单文件
 
-1. 下载或克隆 `v0.4.5` 对应源码。
+1. 下载或克隆 `v0.5.0` 对应源码。
 2. 找到：
 
 ```text
-dist/v3/
-├─ 00-gpt-talk-enhancer.v3.bundle.js
-└─ 10-gpt-talk-enhancer.v3.loader.js
+dist/market/gpt-talk-enhancer.js
 ```
 
-3. 将两个文件复制到 Codex++ User Scripts 目录：
+3. 复制到：
 
 ```text
-%APPDATA%\Codex++\user_scripts
+%APPDATA%\Codex++\user_scripts\gpt-talk-enhancer.js
 ```
 
 PowerShell 示例，在仓库根目录运行：
@@ -93,22 +94,22 @@ PowerShell 示例，在仓库根目录运行：
 ```powershell
 $target = Join-Path $env:APPDATA 'Codex++\user_scripts'
 New-Item -ItemType Directory -Force -Path $target | Out-Null
-Copy-Item 'dist\v3\00-gpt-talk-enhancer.v3.bundle.js' $target -Force
-Copy-Item 'dist\v3\10-gpt-talk-enhancer.v3.loader.js' $target -Force
+Copy-Item 'dist\market\gpt-talk-enhancer.js' (Join-Path $target 'gpt-talk-enhancer.js') -Force
 ```
 
-4. 在 Codex++ 中确认两个 User Script 均已启用。
-5. 重启 Codex Desktop，或使用 Codex++ 提供的 User Scripts reload 机制重新加载。
-
-两个文件的数字前缀是必要的。Codex++ 按文件名排序加载 User Scripts，bundle 必须先于 loader 执行。
+4. 在 Codex++ 中启用 `gpt-talk-enhancer.js`。若旧 0.4.x 双文件仍启用，请通过 Codex++ UI 禁用旧双文件。
+5. 重启 Codex Desktop，或使用 Codex++ 的 User Scripts reload 机制重新加载。
 
 ### 方式三：从源码构建
 
 ```powershell
-npm run build:v3
+npm run build:market
 ```
 
-构建完成后按上面的方式复制 `dist/v3/` 中两个文件。
+推荐安装 `dist/market/gpt-talk-enhancer.js`。
+
+`dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 与 `dist/v3/10-gpt-talk-enhancer.v3.loader.js` 继续保留为开发/兼容构建，但不再是 v0.5.0 推荐安装形态。
+
 ## 验证安装
 
 打开 Codex Desktop DevTools 后可检查：
@@ -120,7 +121,7 @@ window.__GPTTalkEnhancerDebug
 正常情况下应至少能看到：
 
 ```text
-version: 0.4.5
+version: 0.5.0
 hostContract.status: ready
 ```
 
@@ -256,4 +257,4 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 
 ## Roadmap
 
-0.4.x 已冻结。新的产品能力与架构演进进入 **0.5.x** 规划，不回填到 0.4.x。
+0.4.x 已冻结。**0.5.0** 定位为 Compatibility & Distribution Release：关闭 UI-001 / UI-002，并把 Codex++ Market 正式发行形态收敛为单文件；本轮不新增产品功能。新的产品功能候选推迟到 0.6.0。

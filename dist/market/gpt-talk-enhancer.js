@@ -2,7 +2,7 @@
 @codex-plus-script
 name: GPT TalkEnhancer
 description: Conversation Timeline / Question List and Prompt Library for Codex Desktop.
-version: 0.4.5
+version: 0.5.0
 author: dfhxxc666
 homepage: https://github.com/dfhxxc666/gpt-talk-enhancer
 license: GPL-3.0-or-later
@@ -12,7 +12,7 @@ See the project NOTICE.md and LICENSE for attribution and license details.
 */
 
 /*
- * GPT TalkEnhancer 0.4.5 Desktop bundle
+ * GPT TalkEnhancer 0.5.0 Desktop bundle
  * Includes GPL-3.0-or-later derived Timeline UI material.
  * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.
  */
@@ -860,10 +860,31 @@ class ConversationAdapter {
     return `${location?.pathname ?? ""}${location?.search ?? ""}${location?.hash ?? ""}`;
   }
 
-  getConversationRoot() {
+  getStableConversationRoot() {
     return this.document?.querySelector?.("[data-thread-find-target='conversation']")
       ?? this.document?.querySelector?.("[data-chatgpt-conversation-selection-target='true']")
       ?? this.document?.querySelector?.("main [data-testid='conversation-turn-list']")
+      ?? null;
+  }
+
+  isVisibleConversationRoot(root) {
+    if (!root || root.isConnected === false || root.hidden === true) return false;
+    const style = this.window?.getComputedStyle?.(root);
+    if (style?.display === "none" || style?.visibility === "hidden") return false;
+    const rect = root.getBoundingClientRect?.();
+    return !rect || (Number(rect.width) > 0 && Number(rect.height) > 0);
+  }
+
+  hasVisibleConversationContent() {
+    const root = this.getStableConversationRoot();
+    if (!this.isVisibleConversationRoot(root)) return false;
+    return Boolean(this.document?.querySelector?.(
+      "[data-markdown-text-tone='user-message'], [data-turn-key], [data-content-search-turn-key], [data-turn-id], [data-turn-id-container]"
+    ));
+  }
+
+  getConversationRoot() {
+    return this.getStableConversationRoot()
       ?? this.document?.querySelector?.("main")
       ?? null;
   }
@@ -1145,7 +1166,9 @@ class SurfaceDetector {
     if (/(^|\/)settings?(\/|$)/.test(route)) return SURFACE.SETTINGS;
     if (/(^|\/)(plugins?|skills?|mcp)(\/|$)/.test(route)) return SURFACE.PLUGIN_MANAGER;
     if (this.conversationAdapter?.getConversationId?.()) return SURFACE.CONVERSATION;
-    if (this.document?.querySelector?.("#prompt-textarea, textarea[placeholder], [contenteditable='true'][role='textbox']")) return SURFACE.NEW_CHAT;
+    if (this.conversationAdapter?.hasVisibleConversationContent?.()) return SURFACE.CONVERSATION;
+    if (this.document?.querySelector?.("#prompt-textarea")
+      ?? this.document?.querySelector?.("[contenteditable='true'][role='textbox']")) return SURFACE.NEW_CHAT;
     return SURFACE.OTHER;
   }
 }
@@ -1399,7 +1422,11 @@ class NavigationAdapter {
       snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
     }
 
-    while (probes < this.maxHydrationSteps && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
+    const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
+
+    while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
+      && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
       const loopNow = nowMs(this.window);
       if (loopNow - lastProgressAt >= this.inactivityNavigationMs) {
         return this.navigationFailure("navigation-inactive", turnId, {
@@ -1443,9 +1470,13 @@ class NavigationAdapter {
       snapshot = currentSnapshot;
 
       const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
-      const reverseEarlier = model.isColumnReverse && direction < 0 && targetBeforeVisible;
+      const localWorkEarlier = conversationIdentity?.host === "local"
+        && conversationIdentity?.source === "sidebar-local"
+        && model.isColumnReverse
+        && direction < 0
+        && targetBeforeVisible;
 
-      if (reverseEarlier) {
+      if (localWorkEarlier) {
         if (!workCompatibilityNotified) {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
@@ -1564,7 +1595,7 @@ class NavigationAdapter {
     }
     return this.navigationFailure("navigation-hard-limit", turnId, {
       probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
-      budgetLimit: probes >= this.maxHydrationSteps ? "probes" : "absolute-time"
+      budgetLimit: probes >= this.maxHydrationSteps && !allowFirstTurnProbeOverrun ? "probes" : "absolute-time"
     });
   }
 
@@ -2649,8 +2680,9 @@ class TimelineRail {
       button.dataset.turnOrder = String(order);
       button.style.top = `${(ratio * 100).toFixed(3)}%`;
       const displayText = normalizeQuestionDisplayText(turn.text);
-      button.title = `Q${order + 1} ${displayText}`.trim();
-      button.setAttribute("aria-label", button.title);
+      const shortText = compactRailTooltip(displayText);
+      button.title = shortText ? `Q${order + 1} · ${shortText}` : `Q${order + 1}`;
+      button.setAttribute("aria-label", displayText ? `Q${order + 1} ${displayText}` : `Q${order + 1}`);
       button.addEventListener("click", () => this.onSelect(turn.id));
       this.markers.append(button);
     }
@@ -2692,6 +2724,12 @@ class TimelineRail {
     this.toggle = null;
     this.pendingTurnId = null;
   }
+}
+
+function compactRailTooltip(value, maxLength = 18) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}…`;
 }
 
 Object.assign(exports, { TimelineRail });
@@ -3464,6 +3502,7 @@ class AppShell {
     this.rail?.setVisible(timelineVisible);
     this.questionList?.setVisible(timelineVisible);
     this.promptTrigger?.setVisible(promptVisible);
+    if (surface === SURFACE.SETTINGS) this.promptPanel?.setOpen?.(false);
     this.promptPanel?.setVisible(promptVisible);
     if (this.hostElement?.getAttribute?.("data-gte-surface") !== surface) this.hostElement?.setAttribute?.("data-gte-surface", surface);
   }
@@ -3507,8 +3546,8 @@ class AppShell {
     const viewportWidth = Number(this.window?.visualViewport?.width ?? this.window?.innerWidth ?? 0);
     const contentRight = Number(rect?.right);
     const inset = viewportWidth > 0 && Number.isFinite(contentRight)
-      ? Math.max(10, viewportWidth - Math.min(viewportWidth, Math.max(0, contentRight)) + 10)
-      : 10;
+      ? Math.max(14, viewportWidth - Math.min(viewportWidth, Math.max(0, contentRight)) + 14)
+      : 14;
     this.rail?.setRightInset?.(inset);
     this.toast?.setViewportRect?.(rect, viewportWidth);
     this.questionList?.updatePosition?.();
@@ -3577,8 +3616,9 @@ const { SURFACE } = __require("src/v3/host/host-interface.js");
 const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
 
-const VERSION = "0.4.5";
+const VERSION = "0.5.0";
 const NAVIGATION_PENDING_DELAY_MS = 650;
+const LOCAL_NAVIGATION_SETTLE_MS = 500;
 
 class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -3606,6 +3646,7 @@ class TalkEnhancerV3App {
     this.boundScroll = () => this.scheduleRefresh("scroll");
     this.boundRoute = () => this.scheduleRefresh("route");
     this.conversationSelectTimer = null;
+    this.localNavigationSettleUntil = 0;
     this.boundConversationSelect = (event) => this.handleConversationSelect(event);
     this.host = host ?? new CodexDesktopHost({
       document: this.document,
@@ -3648,6 +3689,8 @@ class TalkEnhancerV3App {
       "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]"
     );
     if (!row) return;
+    const localThreadSelected = Boolean(row?.getAttribute?.("data-app-action-sidebar-thread-id"));
+    this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
     if (this.conversationSelectTimer != null) {
@@ -3695,6 +3738,9 @@ class TalkEnhancerV3App {
       const activeTurnId = index.resolveCanonicalId(this.host.getActiveTurnId());
       this.conversations.update(conversationId, { turnCount: index.size(), activeTurnId, route: this.host.getRoute?.() ?? "" });
       this.shell.updateTimeline(index.getOrdered(), activeTurnId);
+      this.bindScrollContainer(this.host.getScrollContainer?.());
+    } else if (surface === SURFACE.CONVERSATION && this.currentConversationId) {
+      if (this.navigationUx.state === "pending") this.invalidateNavigation("conversation-identity-transient");
       this.bindScrollContainer(this.host.getScrollContainer?.());
     } else {
       if (surface !== SURFACE.MEDIA_VIEWER) this.deactivateConversationView();
@@ -3816,6 +3862,14 @@ class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    if (identity?.host === "local") {
+      const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
+      if (remainingSettleMs > 0) {
+        await waitMs(this.window, remainingSettleMs);
+        if (!isCurrent()) return { ok: false, target: turnId, verified: false, reason: "superseded" };
+      }
+    }
     const result = await this.host.navigateToTurn(turnId, { turns: index.getOrdered(), getTurns: () => index.getOrdered(), isCurrent });
     if (requestId !== this.navigationRequestId) return result;
     this.clearNavigationUxTimer();
@@ -3935,6 +3989,16 @@ function registerBundle(windowRef = globalThis.window) {
 }
 
 if (typeof window !== "undefined") registerBundle(window);
+
+function appNowMs(windowRef = globalThis.window) {
+  const value = Number(windowRef?.performance?.now?.());
+  return Number.isFinite(value) ? value : Date.now();
+}
+
+function waitMs(windowRef, ms) {
+  const set = windowRef?.setTimeout ?? setTimeout;
+  return new Promise((resolve) => set(resolve, Math.max(0, Number(ms) || 0)));
+}
 
 Object.assign(exports, { VERSION, TalkEnhancerV3App, registerBundle });
 

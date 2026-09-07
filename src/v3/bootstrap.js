@@ -10,8 +10,9 @@ import { SURFACE } from "./host/host-interface.js";
 import { CodexDesktopHost } from "./host/codex-desktop/codex-host.js";
 import { AppShell } from "./ui/app-shell.js";
 
-export const VERSION = "0.4.5";
+export const VERSION = "0.5.0";
 const NAVIGATION_PENDING_DELAY_MS = 650;
+const LOCAL_NAVIGATION_SETTLE_MS = 500;
 
 export class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -39,6 +40,7 @@ export class TalkEnhancerV3App {
     this.boundScroll = () => this.scheduleRefresh("scroll");
     this.boundRoute = () => this.scheduleRefresh("route");
     this.conversationSelectTimer = null;
+    this.localNavigationSettleUntil = 0;
     this.boundConversationSelect = (event) => this.handleConversationSelect(event);
     this.host = host ?? new CodexDesktopHost({
       document: this.document,
@@ -81,6 +83,8 @@ export class TalkEnhancerV3App {
       "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]"
     );
     if (!row) return;
+    const localThreadSelected = Boolean(row?.getAttribute?.("data-app-action-sidebar-thread-id"));
+    this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
     if (this.conversationSelectTimer != null) {
@@ -128,6 +132,9 @@ export class TalkEnhancerV3App {
       const activeTurnId = index.resolveCanonicalId(this.host.getActiveTurnId());
       this.conversations.update(conversationId, { turnCount: index.size(), activeTurnId, route: this.host.getRoute?.() ?? "" });
       this.shell.updateTimeline(index.getOrdered(), activeTurnId);
+      this.bindScrollContainer(this.host.getScrollContainer?.());
+    } else if (surface === SURFACE.CONVERSATION && this.currentConversationId) {
+      if (this.navigationUx.state === "pending") this.invalidateNavigation("conversation-identity-transient");
       this.bindScrollContainer(this.host.getScrollContainer?.());
     } else {
       if (surface !== SURFACE.MEDIA_VIEWER) this.deactivateConversationView();
@@ -249,6 +256,14 @@ export class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    if (identity?.host === "local") {
+      const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
+      if (remainingSettleMs > 0) {
+        await waitMs(this.window, remainingSettleMs);
+        if (!isCurrent()) return { ok: false, target: turnId, verified: false, reason: "superseded" };
+      }
+    }
     const result = await this.host.navigateToTurn(turnId, { turns: index.getOrdered(), getTurns: () => index.getOrdered(), isCurrent });
     if (requestId !== this.navigationRequestId) return result;
     this.clearNavigationUxTimer();
@@ -368,3 +383,13 @@ export function registerBundle(windowRef = globalThis.window) {
 }
 
 if (typeof window !== "undefined") registerBundle(window);
+
+function appNowMs(windowRef = globalThis.window) {
+  const value = Number(windowRef?.performance?.now?.());
+  return Number.isFinite(value) ? value : Date.now();
+}
+
+function waitMs(windowRef, ms) {
+  const set = windowRef?.setTimeout ?? setTimeout;
+  return new Promise((resolve) => set(resolve, Math.max(0, Number(ms) || 0)));
+}

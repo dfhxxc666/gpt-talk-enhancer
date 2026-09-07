@@ -85,7 +85,11 @@ export class NavigationAdapter {
       snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
     }
 
-    while (probes < this.maxHydrationSteps && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
+    const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
+
+    while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
+      && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
       const loopNow = nowMs(this.window);
       if (loopNow - lastProgressAt >= this.inactivityNavigationMs) {
         return this.navigationFailure("navigation-inactive", turnId, {
@@ -129,9 +133,13 @@ export class NavigationAdapter {
       snapshot = currentSnapshot;
 
       const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
-      const reverseEarlier = model.isColumnReverse && direction < 0 && targetBeforeVisible;
+      const localWorkEarlier = conversationIdentity?.host === "local"
+        && conversationIdentity?.source === "sidebar-local"
+        && model.isColumnReverse
+        && direction < 0
+        && targetBeforeVisible;
 
-      if (reverseEarlier) {
+      if (localWorkEarlier) {
         if (!workCompatibilityNotified) {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
@@ -250,7 +258,7 @@ export class NavigationAdapter {
     }
     return this.navigationFailure("navigation-hard-limit", turnId, {
       probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
-      budgetLimit: probes >= this.maxHydrationSteps ? "probes" : "absolute-time"
+      budgetLimit: probes >= this.maxHydrationSteps && !allowFirstTurnProbeOverrun ? "probes" : "absolute-time"
     });
   }
 

@@ -1,79 +1,123 @@
 # GPT TalkEnhancer Known Issues
 
-本文记录已经确认存在、但不会回填到 0.4.x 冻结基线的问题。除非问题升级为阻塞性回归，否则修复进入 0.5.x。
+本文记录 GPT TalkEnhancer Desktop 已确认的问题、0.5.0 修复结果与后续优化项。`v0.4.5` 仍是冻结的 0.4.x 历史基线；以下 0.5.0 项均已在真实 Codex Desktop 中复测。
 
 ## UI-001：全屏 + 折叠左侧栏时 Timeline 跟随侧栏 hover 隐显
 
-- 状态：Open
-- 优先级：Medium
-- 计划版本：0.5.x
+- 类型：Desktop UI compatibility
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.0
 - 首次记录：2026-09-07
-- 影响范围：Codex Desktop；当前仅在“窗口化 → 折叠左侧栏 → 再最大化/全屏”路径中复现
-- 0.4.x：不修，保持 `v0.4.5` 冻结
 
-### 复现步骤
+### 原现象
 
-1. 以窗口化方式打开 Codex Desktop。
-2. 折叠左侧侧边栏。
-3. 将 Codex Desktop 最大化/全屏。
-4. 此时右侧 GPT TalkEnhancer Timeline 会跟随左侧侧边栏一起自动隐藏。
-5. 鼠标移动到左侧边缘，Codex 左侧侧边栏以 hover/overlay 方式显示时，Timeline 也跟随出现。
-6. 鼠标移到右侧，左侧侧边栏收起，Timeline 随之再次隐藏；右侧本身没有独立 hover 响应。
-7. 重新把左侧侧边栏设置为展开/固定状态后，Timeline 自动恢复正常显示。
+窗口化 Codex 中折叠左侧栏后再最大化/全屏，Timeline 会跟随左侧栏 hover overlay 一起出现/消失；固定展开左侧栏后恢复。
 
-### 对照行为
+### 0.5.0 最终修复
 
-- 在窗口化状态下折叠左侧侧边栏，不会出现该问题。
-- 展开/固定左侧侧边栏后，Timeline 正常。
+不再为了维持 Timeline 可见性而保留或猜测 Local Conversation identity。最终采用“UI 可见性与会话身份解耦”：
 
-### 期望行为
+- `ConversationAdapter` 可判断真实可见的 conversation root / user turn；
+- 左侧 selected row 短暂消失但正文仍可见时，Surface 仍保持 `CONVERSATION`；
+- Bootstrap 只保留当前 Timeline 视图与 scroll binding；
+- 不 reindex、不写 cache、不 `saveNow`、不启动新的导航身份；
+- 真实 identity 恢复后回到正常路径。
 
-Timeline 的可见性应由当前 Surface、Conversation viewport 和自身显示状态决定，不应依赖左侧侧边栏当前是固定展开、折叠还是 hover overlay。
+真实验收覆盖窗口化、最大化、侧栏折叠、hover overlay、右侧移出和固定展开往返，未再复现。
 
-### 后续排查范围
-
-优先检查以下边界，不先修改 Navigation / TurnIndex / Timeline Cache：
-
-- `AppShell.syncTimelineLayoutObserver()` / `refreshTimelineLayout()` 的 viewport 绑定是否在窗口模式切换后指向错误或暂时隐藏的节点；
-- Codex Desktop Host 的 `getConversationViewportElement()` / `getConversationViewportRect()` 在“最大化 + collapsed sidebar overlay”状态下是否发生身份或几何变化；
-- ResizeObserver / visualViewport resize 是否遗漏最大化后侧栏 overlay 状态切换；
-- Timeline host/root 是否意外继承了宿主侧栏相关的 display / visibility / clipping 状态。
-
-修复验收必须至少覆盖：窗口化、最大化、侧栏固定展开、侧栏折叠、左侧 hover overlay、右侧鼠标移入，以及状态之间往返切换。
 ## UI-002：Codex Settings 页面错误显示 Prompt 按钮
 
-- 状态：Open
-- 优先级：Medium
-- 计划版本：0.5.x
+- 类型：Surface / Prompt visibility
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.0
 - 首次记录：2026-09-07
-- 影响范围：Codex Desktop Settings surface
-- 0.4.x：不修，保持 `v0.4.5` 冻结
 
-### 现象
+### 0.5.0 最终修复
 
-进入 Codex 设置页面后，GPT TalkEnhancer 的 Prompt Trigger 仍可能显示在页面左下/输入区域附近。Settings 页面不是对话输入 Surface，这个按钮在此处没有合理交互目标。
+- Settings 一律视为 Prompt 禁用 Surface；
+- 收紧 New Chat Composer 判定，不再把普通 `textarea[placeholder]` 当成 Composer；
+- Prompt 只允许在 `NEW_CHAT` / `CONVERSATION` 出现；
+- 进入 `SETTINGS` 时已打开的 Prompt Panel 会直接关闭；
+- 返回 Conversation / New Chat 后正常恢复。
 
-### 期望行为
+真实验收通过。
 
-采用明确的一刀切策略：
+## NAV-001：长 Chat `Q76 → Q1` 提前报未定位到
 
-- `SETTINGS` surface 永远不显示 Prompt Trigger；
-- `SETTINGS` surface 永远不显示 Prompt Panel；
-- Prompt 仅允许在 `NEW_CHAT` 与 `CONVERSATION` surface 出现；
-- 进入 Settings 时若 Prompt Panel 已打开，应立即关闭/隐藏；
-- 离开 Settings 回到 New Chat / Conversation 后，Prompt 能正常恢复。
+- 类型：Navigation correctness / virtualization timing
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.0
+- 首次记录：2026-09-07
+- 原复现：长 Chat 从后段点击 Q1，曾在 Q17/Q16、随后 Q13/Q14 附近提前失败
 
-### 后续排查范围
+### 最终根因
 
-优先检查 Surface 识别和 UI visibility 同步，不先改 Prompt Library 核心：
+真实运行时诊断先后显示：
 
-- `SurfaceDetector` 是否在 Codex 设置页被误判为 `NEW_CHAT` / `CONVERSATION`；
-- `AppShell.setSurface()` 是否在 surface 切换后存在漏更新或异步竞态；
-- Prompt Trigger 的 composer anchor/rebind 是否会在 Settings 中绕过 `setVisible(false)`；
-- Settings 页面 DOM 更新后是否触发了错误的 Prompt 重新挂载。
+- `probes=256`
+- `stalls=0`
+- `budgetLimit="probes"`
+- 放宽 probe 后变为 `budgetLimit="absolute-time"`
+- `conversationIdentity.host="chatgpt"`
+- Chat 实际同样使用 `column-reverse`
 
-### 修复边界
+旧逻辑把“`column-reverse + Earlier`”一律送进 Local Work 专用 wheel hydration，因此 Chat 被错误使用较慢的 Work 路径。导航一直有真实进展，但先耗尽 256 probe，随后又撞到 45 秒 absolute hard limit。
 
-0.5.x 默认不为 Settings 页面适配 Prompt 功能。除非后续出现明确产品需求，否则 Settings 直接视为 Prompt 禁用 Surface。
+### 0.5.0 最终修复
 
-修复验收至少覆盖：Conversation → Settings → Conversation、New Chat → Settings → New Chat、Settings 页面内部切换不同设置项，以及 Prompt Panel 打开状态下进入 Settings。
+- Earlier 路径改为按真实 Host identity 区分，而不是用 `column-reverse` 猜宿主；
+- 只有 `host=local + source=sidebar-local` 才进入 Local Work wheel hydration；
+- `host=chatgpt` 即使是 `column-reverse`，也走通用 progressive logical jump；
+- Chat Q1 在持续产生真实 hydration progress 时可超过 256 probe；
+- 仍保留 consecutive stall、约 5 秒 inactivity、45 秒 absolute hard limit、`verifyAndAlign` 与 post-settle 安全边界；
+- Settings / Surface 中断仍通过 `superseded` 取消，不回滚已提交给宿主的最后一次滚动。
+
+最终真实复测：`Q76 → Q1` 明显加速，并连续往返测试通过。
+
+## WORK-001：刚进入 Local Work 后点击靠近 tail 的目标发生回弹
+
+- 类型：Host restore timing
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.0
+- 首次记录：2026-09-07
+
+### 原现象
+
+刚点击进入 Local Work 会话后立即点击 Timeline，例如 Q1～Q6 会话点 Q4，或点击最后一问的上一问，正文会在目标与最后一问之间来回跳。
+
+### 0.5.0 最终修复
+
+保留既有 `saveNow(explicitLocalSessionUuid, exactScrollContainer)` Restore 机制，不回退 0.4.4 已验证的持久化修复。
+
+仅新增一个窄的 Local Work restore settle gate：
+
+- 点击 Local Work sidebar row 后记录 500ms settle window；
+- 若用户在该窗口内立即发起 Timeline 导航，先等待宿主自己的 scroll restore 落稳；
+- Chat 不走此 gate；
+- 已经打开超过该窗口的 Work 不增加延迟；
+- Work wheel、tail verification、post-settle 与 Restore persistence 不变。
+
+最终真实复测未再出现回弹。
+
+## OPT-001：完整加载后的 Chat / Work Timeline 瞬时直达优化
+
+- 类型：Performance / UX Optimization
+- 状态：Backlog / Post-0.5.0
+- 优先级：Medium
+- 首次记录：2026-09-07
+
+### 观察
+
+官方 Work 时间线在会话已经完整加载时，点击可以近乎瞬时直达。GPT TalkEnhancer 0.5.0 仍以正确性、三路一致性、Restore 和 fail-closed 为优先。
+
+0.5.0 开发期间曾尝试 known-index 快探测，但真实 Work 出现刚进入会话后目标被宿主 restore 拉回等回归，因此该实验已撤回，不属于 0.5.0 正式实现。
+
+### 后续目标
+
+在 0.5.0 稳定基线上继续单独测试 Chat / Work 提速，要求：
+
+- 已挂载/完整加载目标可尽量减少不必要 hydration；
+- 不绕过 post-settle；
+- 不破坏 Local Work restore；
+- 不改变 tail verification、ActiveTracker、TurnIndex 或 Cache 的正确性；
+- 任一快路径验证失败立即回退稳定 Navigation。

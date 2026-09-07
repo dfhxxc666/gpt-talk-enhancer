@@ -65,8 +65,9 @@ export class TimelineRail {
       button.dataset.turnOrder = String(order);
       button.style.top = `${(ratio * 100).toFixed(3)}%`;
       const displayText = normalizeQuestionDisplayText(turn.text);
-      button.title = `Q${order + 1} ${displayText}`.trim();
-      button.setAttribute("aria-label", button.title);
+      const shortText = compactRailTooltip(displayText);
+      button.title = shortText ? `Q${order + 1} · ${shortText}` : `Q${order + 1}`;
+      button.setAttribute("aria-label", displayText ? `Q${order + 1} ${displayText}` : `Q${order + 1}`);
       button.addEventListener("click", () => this.onSelect(turn.id));
       this.markers.append(button);
     }
@@ -108,4 +109,10 @@ export class TimelineRail {
     this.toggle = null;
     this.pendingTurnId = null;
   }
+}
+
+function compactRailTooltip(value, maxLength = 18) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}…`;
 }
