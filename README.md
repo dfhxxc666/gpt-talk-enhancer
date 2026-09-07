@@ -1,0 +1,233 @@
+# GPT TalkEnhancer
+
+GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定版为 **v0.4.5**。
+
+它专注于两个核心能力：
+
+- **Conversation Timeline / Question List**：为长对话建立问题索引、当前位置高亮和可验证跳转。
+- **Prompt Picker / Prompt Library**：保存、搜索、编辑并插入常用提示词，不会自动发送。
+
+> **v0.4.5 是 0.4.x 的冻结稳定基线。** 已完成真实 Codex Desktop / Work 验收；后续新增能力进入 0.5.x，除非出现可复现回归，否则不再调整 0.4.x 的 Navigation / TurnIndex / Cache 核心。
+
+## 功能
+
+| 能力 | 说明 |
+| --- | --- |
+| Timeline Rail | 在会话右侧显示稀疏时间轴，长会话自动采样并保留首尾与当前问题 |
+| Question List | 展开问题列表，按 `Q1 / Q2 / ...` 查看并跳转 |
+| Long-history Navigation | 适配 Codex Desktop 虚拟化长对话、`column-reverse` 与动态历史加载 |
+| Stable Local Thread | 支持 `local:<UUID>` 稳定会话身份与 Local UUIDv7 Turn 全局重编号 |
+| Active Tracking | 以宿主滚动容器激活线判断当前问题，并处理最后一问 physical-tail 边界 |
+| Timeline Cache | 缓存已发现的问题索引，重新打开长会话时可快速恢复已知历史 |
+| Prompt Library | 新建、编辑、收藏、搜索并插入常用提示词 |
+| Desktop UI Integration | Shadow DOM 隔离 UI，支持媒体页隐藏、右侧 pane 避让和 conversation viewport 布局 |
+
+## 当前状态
+
+**v0.4.5 / stable**
+
+- 自动测试：`151 / 151 PASS`
+- `npm run check`：PASS
+- `npm run build`：PASS
+- 真实 Codex Desktop / Work：PASS
+- Desktop bundle SHA-256：
+  `6FA4E8DA773642402BED9666AF6465E684ABF58BAA9BAB1CF0F24A06422EF117`
+
+详细冻结验收见 [`docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md)。
+
+## 环境要求
+
+当前主目标是 Windows 桌面端：
+
+- Windows 11
+- Codex / ChatGPT Desktop
+- Codex++，已确认可工作的版本：`1.2.56`
+- Codex++ User Scripts 功能已启用
+
+> `1.2.56` 是当前已验证版本，不代表严格的最低兼容版本。
+
+## 安装
+
+### 方式一：使用仓库中的稳定构建
+
+1. 下载或克隆 `v0.4.5` 对应源码。
+2. 找到：
+
+```text
+dist/v3/
+├─ 00-gpt-talk-enhancer.v3.bundle.js
+└─ 10-gpt-talk-enhancer.v3.loader.js
+```
+
+3. 将两个文件复制到 Codex++ User Scripts 目录：
+
+```text
+%APPDATA%\Codex++\user_scripts
+```
+
+PowerShell 示例，在仓库根目录运行：
+
+```powershell
+$target = Join-Path $env:APPDATA 'Codex++\user_scripts'
+New-Item -ItemType Directory -Force -Path $target | Out-Null
+Copy-Item 'dist\v3\00-gpt-talk-enhancer.v3.bundle.js' $target -Force
+Copy-Item 'dist\v3\10-gpt-talk-enhancer.v3.loader.js' $target -Force
+```
+
+4. 在 Codex++ 中确认两个 User Script 均已启用。
+5. 重启 Codex Desktop，或使用 Codex++ 提供的 User Scripts reload 机制重新加载。
+
+两个文件的数字前缀是必要的。Codex++ 按文件名排序加载 User Scripts，bundle 必须先于 loader 执行。
+
+### 方式二：从源码构建
+
+```powershell
+npm run build:v3
+```
+
+构建完成后按上面的方式复制 `dist/v3/` 中两个文件。
+
+## 验证安装
+
+打开 Codex Desktop DevTools 后可检查：
+
+```js
+window.__GPTTalkEnhancerDebug
+```
+
+正常情况下应至少能看到：
+
+```text
+version: 0.4.5
+hostContract.status: ready
+```
+
+Capture 是可选增强项。即使 Desktop 环境中没有捕获到 conversation API，Timeline 仍应能够通过 DOM Progressive 模式工作。
+
+## 使用
+
+### Timeline / Question List
+
+- 右侧时间轴节点对应用户问题。
+- 点击节点或 Question List 中的 `Qxx` 可跳转到对应问题。
+- 长 Work / Local Thread 会在需要时逐步加载虚拟化历史。
+- 最后一问位于 physical tail 时允许直接完成 verified navigation，并同步 active marker。
+
+### Prompt Library
+
+- 通过 Composer 附近的 Prompt 按钮打开。
+- 支持新建、编辑、收藏、搜索、删除和插入。
+- Prompt 只插入输入框，**永不自动发送**。
+
+## 隐私与安全边界
+
+GPT TalkEnhancer 不依赖以下方式工作：
+
+- 不读取 credentials / token
+- 不读取 Codex / ChatGPT 私有数据库或 IndexedDB
+- 不使用 React Fiber / React 私有实例
+- 不调用 `thread/list`、`thread/read` 或其他私有 internal RPC
+- 不自动发送 Prompt
+- 不上传对话数据到第三方服务
+
+唯一允许的网络捕获范围是：
+
+```text
+GET /backend-api/conversation/{conversationId}
+```
+
+并且只能对成功响应执行 `response.clone()` 后只读解析；不得修改、阻塞或替换宿主原请求/响应。Desktop 主路径不依赖该 Capture 成功。
+
+## 架构
+
+```text
+Codex++ User Script injection
+        │
+        ├─ 00-gpt-talk-enhancer.v3.bundle.js
+        └─ 10-gpt-talk-enhancer.v3.loader.js
+                  │
+                  ▼
+          GPT TalkEnhancer
+          ├─ core/
+          │  ├─ ConversationStore
+          │  ├─ TurnIndex
+          │  ├─ TimelineState / Cache
+          │  ├─ PromptStore
+          │  └─ SettingsStore
+          ├─ host/codex-desktop/
+          │  ├─ ConversationAdapter
+          │  ├─ TurnAdapter
+          │  ├─ ComposerAdapter
+          │  ├─ SurfaceDetector
+          │  ├─ NavigationAdapter
+          │  └─ ConversationCapture
+          └─ ui/
+             ├─ TimelineRail
+             ├─ QuestionList
+             ├─ PromptTrigger / Panel
+             └─ Toast
+```
+
+Codex++ 仅作为 renderer User Script 的注入/启动载体，GPT TalkEnhancer 不修改 Codex++ 本体。
+
+## 开发
+
+要求 Node.js 20+。
+
+```powershell
+npm test
+npm run build:v3
+npm run build
+npm run check
+```
+
+主要构建输出：
+
+```text
+dist/v3/                          # 当前 Desktop 主构建
+dist/gpt-talk-enhancer.user.js   # 历史 userscript / prototype 输出
+dist/extension/                   # 历史浏览器扩展 prototype 输出
+```
+
+v0.4.5 的正式 Desktop 验收以 `dist/v3/` 两文件注入路径为准。
+
+## 已知限制
+
+- Timeline Cache 只能保存已经由 DOM 或允许的 Capture 路径发现过的问题；首次打开从未探索的超长对话时，仍需随着宿主虚拟化逐步加载历史。
+- v0.4.5 的正式目标是 Codex / ChatGPT Desktop + Codex++，不是浏览器 Web 正式版。
+- Codex Desktop / Codex++ 更新可能改变宿主 DOM 或滚动行为；出现回归时应以可复现运行时证据为准。
+
+## 上游贡献与致谢
+
+GPT TalkEnhancer 的 Timeline / Question List 交互基线、部分视觉与实现细节，以及早期浏览器扩展 prototype 的部分代码，适配自：
+
+- **Timeline - AI Chat Enhancer / chatgpt-gemini-timeline**
+- 作者：houyanchao / hou
+- 仓库：https://github.com/houyanchao/chatgpt-gemini-timeline
+- 许可证：GNU GPL v3.0 or later
+
+上游项目自身注明其基于 `chatgpt-conversation-timeline`，Copyright (C) 2025 Reborn14，原始版本采用 MIT License。
+
+GPT TalkEnhancer 对这些部分做了大量针对 Codex Desktop 的改造，包括 Host Adapter、Shadow DOM、稳定 Conversation / Turn identity、虚拟化 Navigation、Timeline Cache、Prompt UI 和 Desktop 布局适配。
+
+本项目**不将这些派生部分描述为 clean-room 或完全原创实现**。完整归属说明见 [`NOTICE.md`](NOTICE.md) 与 [`reference/NOTICE-GPL.md`](reference/NOTICE-GPL.md)。
+
+## License
+
+GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详见 [`LICENSE`](LICENSE)。
+
+第三方归属与对应许可证文本见：
+
+- [`NOTICE.md`](NOTICE.md)
+- [`reference/NOTICE-GPL.md`](reference/NOTICE-GPL.md)
+- [`reference/THIRD_PARTY_GPL-3.0.txt`](reference/THIRD_PARTY_GPL-3.0.txt)
+
+## 文档
+
+- [`docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md)：0.4.x 最终冻结基线
+- [`docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md`](docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md)：0.4.4 长 Work / Local Thread 调试与验收记录
+- [`docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md)：0.3 Desktop 架构基线
+
+## Roadmap
+
+0.4.x 已冻结。新的产品能力与架构演进进入 **0.5.x** 规划，不回填到 0.4.x。
