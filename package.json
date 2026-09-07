@@ -10,7 +10,8 @@
     "check": "npm test && npm run build",
     "build:userscript": "node scripts/build.mjs",
     "build:extension": "node scripts/build-extension.mjs",
-    "build:v3": "node scripts/build-v3.mjs"
+    "build:v3": "node scripts/build-v3.mjs",
+    "build:market": "npm run build:v3 && node scripts/build-market.mjs"
   },
   "engines": {
     "node": ">=20"

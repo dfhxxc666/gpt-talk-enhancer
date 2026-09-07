@@ -48,7 +48,30 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ## 安装
 
-### 方式一：使用仓库中的稳定构建
+### 方式一：AI 一键安装（推荐）
+
+如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。提示词固定到 `v0.4.5` tag，并要求核对 SHA-256，不会覆盖或删除其他 Codex++ User Scripts。
+
+```text
+请为我安装 GPT TalkEnhancer v0.4.5 到当前 Windows 用户的 Codex++ User Scripts。
+
+要求：
+1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.4.5 tag 获取以下两个文件，不要使用 main 上的开发版本：
+   - dist/v3/00-gpt-talk-enhancer.v3.bundle.js
+   - dist/v3/10-gpt-talk-enhancer.v3.loader.js
+2. 安装目标目录必须是 %APPDATA%\Codex++\user_scripts；如果目录不存在可以创建。
+3. 只新增或更新上面两个 GPT TalkEnhancer 文件，不要删除、覆盖或修改其他 User Scripts，也不要修改 Codex++ 本体。
+4. 下载后核对 SHA-256：
+   - 00-gpt-talk-enhancer.v3.bundle.js = 6FA4E8DA773642402BED9666AF6465E684ABF58BAA9BAB1CF0F24A06422EF117
+   - 10-gpt-talk-enhancer.v3.loader.js = 2DDBD127C0DFB14EC3B36184765AB72CE84F1343B823AC3AFBC540B37978400C
+5. 如果本机有 Node.js，对两个已安装文件执行 node --check。
+6. 不要直接编辑 Codex++ 的 user_scripts.json；如果脚本尚未启用，只告诉我在 Codex++ UI 中启用这两个文件。
+7. 完成后报告安装路径、两个文件的实际 SHA-256、语法检查结果，以及是否需要重启 Codex Desktop。
+```
+
+这个方法适合 Codex、Claude Code、ChatGPT Work 等具备本机文件/终端操作能力的环境。普通网页聊天无法直接写入你的 `%APPDATA%` 时，请使用下面的手动安装。
+
+### 方式二：使用仓库中的稳定构建
 
 1. 下载或克隆 `v0.4.5` 对应源码。
 2. 找到：
@@ -79,14 +102,13 @@ Copy-Item 'dist\v3\10-gpt-talk-enhancer.v3.loader.js' $target -Force
 
 两个文件的数字前缀是必要的。Codex++ 按文件名排序加载 User Scripts，bundle 必须先于 loader 执行。
 
-### 方式二：从源码构建
+### 方式三：从源码构建
 
 ```powershell
 npm run build:v3
 ```
 
 构建完成后按上面的方式复制 `dist/v3/` 中两个文件。
-
 ## 验证安装
 
 打开 Codex Desktop DevTools 后可检查：
@@ -227,6 +249,10 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 - [`docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md)：0.4.x 最终冻结基线
 - [`docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md`](docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md)：0.4.4 长 Work / Local Thread 调试与验收记录
 - [`docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md)：0.3 Desktop 架构基线
+
+## 已知问题
+
+当前待处理问题见 [docs/KNOWN-ISSUES.zh-CN.md](docs/KNOWN-ISSUES.zh-CN.md)。0.4.x 已冻结，非阻塞问题统一进入 0.5.x。
 
 ## Roadmap
 
