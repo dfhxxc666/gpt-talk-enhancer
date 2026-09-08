@@ -1,13 +1,13 @@
 # GPT TalkEnhancer
 
-GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定版为 **v0.5.0**。
+GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定版为 **v0.5.1**。
 
 它专注于两个核心能力：
 
 - **Conversation Timeline / Question List**：为长对话建立问题索引、当前位置高亮和可验证跳转。
 - **Prompt Picker / Prompt Library**：保存、搜索、编辑并插入常用提示词，不会自动发送。
 
-> **v0.5.0 是当前稳定基线。** `v0.4.5` tag 继续保留为冻结的 0.4.x 历史基线；后续 Chat / Work Navigation 提速实验不得回归 0.5.0 已验收的正确性与 Restore 语义。
+> **v0.5.1 是当前稳定性能基线。** `v0.5.0` tag 保留为上一版正确性/发行基线，`v0.4.5` tag 继续保留为冻结的 0.4.x 历史基线。
 
 ## 功能
 
@@ -24,20 +24,20 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ## 当前状态
 
-**v0.5.0 / stable**
+**v0.5.1 / stable**
 
-- 自动测试：`158 / 158 PASS`
+- 自动测试：`173 / 173 PASS`
 - `npm run check`：PASS
 - `npm run build`：PASS
 - `npm run build:market`：PASS
 - 真实 Codex Desktop Chat / Work：PASS
 - Codex++ 单文件安装：PASS
-- 正式单文件 SHA-256：`2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA`
-- Desktop bundle SHA-256：`4668A17637BD88DC7EA2F6EB217CA90B9151C2F3BCFFF95A0D8EFFA1421C1E6D`
+- 正式单文件 SHA-256：`C38332911D1DE554559B3760FA7B80D368A00985EE265078CE899876A8E0FB03`
+- Desktop bundle SHA-256：`D7A8522237F126E1633462AE7A2A07754EEE9432FF99311BECB4062D538C3FC2`
 
-详细收口验收见 [`docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md)。
+详细收口验收见 [`docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md)。
 
-`v0.4.5` 仍保留为 0.4.x 冻结历史基线，不移动原 tag。
+`v0.5.0` 与 `v0.4.5` 均保留原 tag，不移动历史基线。
 
 ## 环境要求
 
@@ -54,19 +54,19 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ### 方式一：AI 一键安装（推荐）
 
-如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。v0.5.0 的推荐安装形态已经收敛为 **一个 User Script 文件**。
+如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。v0.5.1 的推荐安装形态继续为 **一个 User Script 文件**。
 
 ```text
-请为我安装 GPT TalkEnhancer v0.5.0 到当前 Windows 用户的 Codex++ User Scripts。
+请为我安装 GPT TalkEnhancer v0.5.1 到当前 Windows 用户的 Codex++ User Scripts。
 
 要求：
-1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.5.0 tag 获取：
+1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.5.1 tag 获取：
    - dist/market/gpt-talk-enhancer.js
    不要使用 main 上的开发版本。
 2. 安装目标为 %APPDATA%\Codex++\user_scripts\gpt-talk-enhancer.js；目录不存在时可以创建。
 3. 只新增或更新这个 GPT TalkEnhancer 文件，不要删除、覆盖或修改其他 User Scripts，也不要修改 Codex++ 本体。
 4. 下载后核对 SHA-256：
-   - gpt-talk-enhancer.js = 2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA
+   - gpt-talk-enhancer.js = C38332911D1DE554559B3760FA7B80D368A00985EE265078CE899876A8E0FB03
 5. 如果本机有 Node.js，对已安装文件执行 node --check。
 6. 不要直接编辑 Codex++ 的 user_scripts.json；如旧版 0.4.x 双文件仍处于启用状态，请告诉我在 Codex++ UI 中禁用旧的 00-gpt-talk-enhancer.v3.bundle.js 与 10-gpt-talk-enhancer.v3.loader.js，避免重复加载，不要擅自删除其他文件。
 7. 完成后报告安装路径、实际 SHA-256、语法检查结果，以及是否需要重启 Codex Desktop。
@@ -76,7 +76,7 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ### 方式二：使用稳定单文件
 
-1. 下载或克隆 `v0.5.0` 对应源码。
+1. 下载或克隆 `v0.5.1` 对应源码。
 2. 找到：
 
 ```text
@@ -108,7 +108,7 @@ npm run build:market
 
 推荐安装 `dist/market/gpt-talk-enhancer.js`。
 
-`dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 与 `dist/v3/10-gpt-talk-enhancer.v3.loader.js` 继续保留为开发/兼容构建，但不再是 v0.5.0 推荐安装形态。
+`dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 与 `dist/v3/10-gpt-talk-enhancer.v3.loader.js` 继续保留为开发/兼容构建，但不再是 v0.5.1 推荐安装形态。
 
 ## 验证安装
 
@@ -121,7 +121,7 @@ window.__GPTTalkEnhancerDebug
 正常情况下应至少能看到：
 
 ```text
-version: 0.5.0
+version: 0.5.1
 hostContract.status: ready
 ```
 
@@ -247,14 +247,16 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 
 ## 文档
 
+- [`docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md)：0.5.1 Navigation 性能与可靠性最终验收
+- [`docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.0-FINAL-ACCEPTANCE.zh-CN.md)：0.5.0 Compatibility & Distribution 正确性基线
 - [`docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.4.5-FINAL-ACCEPTANCE.zh-CN.md)：0.4.x 最终冻结基线
 - [`docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md`](docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md)：0.4.4 长 Work / Local Thread 调试与验收记录
 - [`docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md)：0.3 Desktop 架构基线
 
 ## 已知问题
 
-当前待处理问题见 [docs/KNOWN-ISSUES.zh-CN.md](docs/KNOWN-ISSUES.zh-CN.md)。0.4.x 已冻结，非阻塞问题统一进入 0.5.x。
+当前问题与历史修复记录见 [docs/KNOWN-ISSUES.zh-CN.md](docs/KNOWN-ISSUES.zh-CN.md)。0.5.1 已完成 Navigation 性能收口，新的产品功能候选继续留到 0.6.0。
 
 ## Roadmap
 
-0.4.x 已冻结。**0.5.0** 定位为 Compatibility & Distribution Release：关闭 UI-001 / UI-002，并把 Codex++ Market 正式发行形态收敛为单文件；本轮不新增产品功能。新的产品功能候选推迟到 0.6.0。
+0.4.x 已冻结。**0.5.0** 完成 Compatibility & Distribution 基线；**0.5.1** 在不新增产品功能的前提下完成 Chat / Work Navigation 性能与首次会话 UI 可靠性收口。新的产品功能候选推迟到 0.6.0。

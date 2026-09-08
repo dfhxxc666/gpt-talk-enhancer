@@ -8,11 +8,17 @@ import { SettingsStore } from "./core/settings-store.js";
 import { TimelineCache } from "./core/timeline-cache.js";
 import { SURFACE } from "./host/host-interface.js";
 import { CodexDesktopHost } from "./host/codex-desktop/codex-host.js";
+import { parseSidebarConversationKey } from "./host/codex-desktop/conversation-adapter.js";
 import { AppShell } from "./ui/app-shell.js";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
+const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
+const NAVIGATION_HISTORY_LIMIT = 5;
+const NAVIGATION_STEP_LIMIT = 16;
+const SLOW_NAVIGATION_HISTORY_LIMIT = 10;
+const SLOW_NAVIGATION_STORAGE_KEY = "gte.v3.navigation-diagnostics";
 
 export class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -30,6 +36,12 @@ export class TalkEnhancerV3App {
     this.currentConversationId = null;
     this.lastNavigation = { target: null, verified: false, reason: "none" };
     this.navigationRequestId = 0;
+    this.navigationRunSequence = 0;
+    this.activeNavigation = null;
+    this.navigationHistory = [];
+    this.slowNavigationHistory = sanitizeSlowNavigationHistory(
+      this.storage?.read?.(SLOW_NAVIGATION_STORAGE_KEY, [])
+    );
     this.navigationUxTimer = null;
     this.navigationUx = { state: "idle", target: null, targetOrder: null, pendingVisible: false };
     this.captureStatus = { status: "unavailable", turnCount: 0, lastError: "" };
@@ -83,19 +95,38 @@ export class TalkEnhancerV3App {
       "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]"
     );
     if (!row) return;
-    const localThreadSelected = Boolean(row?.getAttribute?.("data-app-action-sidebar-thread-id"));
+    const localId = row?.getAttribute?.("data-app-action-sidebar-thread-id") ?? null;
+    const chatKey = row?.getAttribute?.("data-sidebar-chatgpt-conversation-key") ?? null;
+    const expectedChatId = chatKey ? parseSidebarConversationKey(chatKey) : null;
+    const localThreadSelected = Boolean(localId);
     this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
-    if (this.conversationSelectTimer != null) {
-      const clear = this.window?.clearTimeout ?? clearTimeout;
-      clear(this.conversationSelectTimer);
+    this.clearConversationSelectTimer();
+    if (localThreadSelected || !expectedChatId) {
+      this.scheduleConversationSelectRetry({ expectedChatId: null, attempt: 0, delays: [240] });
+      return;
     }
+    this.scheduleConversationSelectRetry({ expectedChatId, attempt: 0, delays: CHAT_CONVERSATION_SETTLE_DELAYS_MS });
+  }
+
+  clearConversationSelectTimer() {
+    if (this.conversationSelectTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.conversationSelectTimer);
+    this.conversationSelectTimer = null;
+  }
+
+  scheduleConversationSelectRetry({ expectedChatId = null, attempt = 0, delays = CHAT_CONVERSATION_SETTLE_DELAYS_MS } = {}) {
+    if (this.destroyed || attempt >= delays.length) return;
     const set = this.window?.setTimeout ?? setTimeout;
     this.conversationSelectTimer = set(() => {
       this.conversationSelectTimer = null;
       this.refresh("conversation-select-settled");
-    }, 240);
+      if (expectedChatId && this.host.getConversationId?.() !== expectedChatId) {
+        this.scheduleConversationSelectRetry({ expectedChatId, attempt: attempt + 1, delays });
+      }
+    }, delays[attempt]);
   }
   scheduleRefresh(reason = "event") {
     if (this.destroyed || this.refreshFrame != null) return;
@@ -235,6 +266,96 @@ export class TalkEnhancerV3App {
     this.updateDebug(reason);
   }
 
+  beginNavigationRun({ targetOrder, identity }) {
+    const startedAtMs = Date.now();
+    const run = {
+      runId: ++this.navigationRunSequence,
+      targetOrder,
+      targetLabel: Number.isFinite(targetOrder) ? `Q${Number(targetOrder) + 1}` : null,
+      host: identity?.host ?? null,
+      source: identity?.source ?? null,
+      status: "running",
+      startedAt: new Date(startedAtMs).toISOString(),
+      startedAtMs,
+      currentStep: null,
+      steps: []
+    };
+    this.activeNavigation = run;
+    this.publishNavigationDiagnostics();
+    return run;
+  }
+
+  recordNavigationStep(run, entry, steps = null) {
+    if (!run) return;
+    run.steps = (Array.isArray(steps) ? steps : [...(run.steps ?? []), entry]).slice(-NAVIGATION_STEP_LIMIT);
+    run.currentStep = entry ?? null;
+    if (this.activeNavigation?.runId === run.runId) {
+      this.activeNavigation = run;
+      this.publishNavigationDiagnostics();
+    }
+  }
+
+  completeNavigationRun(run, result = {}) {
+    if (!run) return;
+    const finishedAtMs = Date.now();
+    const steps = Array.isArray(result?.steps) && result.steps.length ? result.steps.slice(-NAVIGATION_STEP_LIMIT) : (run.steps ?? []).slice(-NAVIGATION_STEP_LIMIT);
+    const slowestStep = steps.reduce((best, step) => Number(step?.elapsedMs ?? -1) > Number(best?.elapsedMs ?? -1) ? step : best, null);
+    const completed = {
+      ...run,
+      status: result?.reason === "superseded" ? "superseded" : result?.ok ? "success" : "failed",
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      totalElapsedMs: Math.max(0, finishedAtMs - Number(run.startedAtMs || finishedAtMs)),
+      resultElapsedMs: Number.isFinite(result?.elapsedMs) ? Number(result.elapsedMs) : null,
+      reason: result?.reason ?? (result?.ok ? "ok" : "unknown"),
+      ok: Boolean(result?.ok),
+      verified: Boolean(result?.verified),
+      slowestStep,
+      currentStep: null,
+      steps
+    };
+    delete completed.startedAtMs;
+    this.navigationHistory = [...this.navigationHistory, completed].slice(-NAVIGATION_HISTORY_LIMIT);
+    const slowSteps = steps.filter(isSlowNavigationStep);
+    if (slowSteps.length > 0) {
+      const slowRecord = sanitizeSlowNavigationRecord({
+        runId: completed.runId,
+        targetOrder: completed.targetOrder,
+        targetLabel: completed.targetLabel,
+        host: completed.host,
+        source: completed.source,
+        startedAt: completed.startedAt,
+        finishedAt: completed.finishedAt,
+        totalElapsedMs: completed.totalElapsedMs,
+        resultElapsedMs: completed.resultElapsedMs,
+        status: completed.status,
+        reason: completed.reason,
+        ok: completed.ok,
+        verified: completed.verified,
+        slowestStep: completed.slowestStep,
+        slowSteps,
+        steps
+      });
+      if (slowRecord) {
+        this.slowNavigationHistory = [...this.slowNavigationHistory, slowRecord].slice(-SLOW_NAVIGATION_HISTORY_LIMIT);
+        this.storage?.write?.(SLOW_NAVIGATION_STORAGE_KEY, this.slowNavigationHistory);
+      }
+    }
+    if (this.activeNavigation?.runId === run.runId) this.activeNavigation = null;
+    this.publishNavigationDiagnostics();
+  }
+
+  publishNavigationDiagnostics() {
+    if (!this.window) return;
+    const current = this.window.__GPTTalkEnhancerDebug ?? {};
+    this.window.__GPTTalkEnhancerDebug = {
+      ...current,
+      activeNavigation: this.activeNavigation ? { ...this.activeNavigation, steps: [...(this.activeNavigation.steps ?? [])] } : null,
+      navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
+      slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
+      lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null
+    };
+  }
+
   async navigate(turnId) {
     const conversationId = this.currentConversationId;
     const index = conversationId ? this.getTurnIndex(conversationId) : null;
@@ -242,6 +363,8 @@ export class TalkEnhancerV3App {
     const record = index.get(turnId);
     const targetOrder = Number.isFinite(record?.order) ? Number(record.order) : null;
     const requestId = ++this.navigationRequestId;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    const navigationRun = this.beginNavigationRun({ targetOrder, identity });
     this.clearNavigationUxTimer();
     this.setNavigationUx({ state: "pending", target: turnId, targetOrder, pendingVisible: false }, "navigate-start");
 
@@ -256,16 +379,32 @@ export class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
-    const identity = this.host.getConversationIdentity?.() ?? null;
     if (identity?.host === "local") {
       const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
       if (remainingSettleMs > 0) {
         await waitMs(this.window, remainingSettleMs);
-        if (!isCurrent()) return { ok: false, target: turnId, verified: false, reason: "superseded" };
+        if (!isCurrent()) {
+          const superseded = { ok: false, target: turnId, verified: false, reason: "superseded" };
+          this.completeNavigationRun(navigationRun, superseded);
+          return superseded;
+        }
       }
     }
-    const result = await this.host.navigateToTurn(turnId, { turns: index.getOrdered(), getTurns: () => index.getOrdered(), isCurrent });
-    if (requestId !== this.navigationRequestId) return result;
+    const allowMountedFastSettle = Boolean(identity?.stable && (identity.host === "chatgpt" || identity.host === "local"));
+    const result = await this.host.navigateToTurn(turnId, {
+      turns: index.getOrdered(),
+      getTurns: () => index.getOrdered(),
+      isCurrent,
+      allowMountedFastSettle,
+      onTraceStep: (entry, steps) => this.recordNavigationStep(navigationRun, entry, steps)
+    });
+    if (requestId !== this.navigationRequestId) {
+      const supersededResult = result?.reason === "superseded"
+        ? result
+        : { ...result, ok: false, verified: false, reason: "superseded" };
+      this.completeNavigationRun(navigationRun, supersededResult);
+      return result;
+    }
     this.clearNavigationUxTimer();
     const latestRecord = index.get(turnId);
     const latestTargetOrder = Number.isFinite(latestRecord?.order) ? Number(latestRecord.order) : targetOrder;
@@ -285,8 +424,11 @@ export class TalkEnhancerV3App {
       logicalPosition: Number.isFinite(result?.logicalPosition) ? result.logicalPosition : null,
       domId: result?.domId ?? null,
       settleChecks: Number.isFinite(result?.settleChecks) ? result.settleChecks : null,
+      settleMode: result?.settleMode ?? null,
+      steps: Array.isArray(result?.steps) ? result.steps : [],
       targetOrder: latestTargetOrder
     };
+    this.completeNavigationRun(navigationRun, this.lastNavigation);
     if (result?.reason === "superseded") {
       this.setNavigationUx({ state: "idle", target: null, targetOrder: null, pendingVisible: false }, "navigate-superseded");
     } else if (result?.ok) {
@@ -335,6 +477,10 @@ export class TalkEnhancerV3App {
       prompt: { composerDetected: Boolean(this.host?.getComposer?.()), mounted: Boolean(shell.promptMounted), panelOpen: Boolean(shell.promptPanelOpen) },
       overlayBlocked: surface === SURFACE.MEDIA_VIEWER,
       navigation: { ...this.lastNavigation },
+      activeNavigation: this.activeNavigation ? { ...this.activeNavigation, steps: [...(this.activeNavigation.steps ?? [])] } : null,
+      navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
+      slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
+      lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
       hostContract,
@@ -358,11 +504,7 @@ export class TalkEnhancerV3App {
     this.window?.removeEventListener?.("popstate", this.boundRoute);
     this.window?.removeEventListener?.("hashchange", this.boundRoute);
     this.document?.removeEventListener?.("click", this.boundConversationSelect, true);
-    if (this.conversationSelectTimer != null) {
-      const clear = this.window?.clearTimeout ?? clearTimeout;
-      clear(this.conversationSelectTimer);
-      this.conversationSelectTimer = null;
-    }
+    this.clearConversationSelectTimer();
     if (this.refreshFrame != null && typeof this.window?.cancelAnimationFrame === "function") this.window.cancelAnimationFrame(this.refreshFrame);
     this.host?.destroy?.();
     this.shell?.destroy?.();
@@ -383,6 +525,67 @@ export function registerBundle(windowRef = globalThis.window) {
 }
 
 if (typeof window !== "undefined") registerBundle(window);
+
+function isSlowNavigationStep(step = {}) {
+  const elapsedMs = Number(step?.elapsedMs) || 0;
+  const waitMs = Number(step?.waitMs) || 0;
+  if (step?.mode === "chat-progressive") return elapsedMs >= 100;
+  if (step?.mode === "work-wheel") return elapsedMs >= Math.max(180, waitMs * 1.5);
+  return elapsedMs >= Math.max(100, waitMs * 1.5);
+}
+
+function sanitizeSlowNavigationHistory(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(sanitizeSlowNavigationRecord).filter(Boolean).slice(-SLOW_NAVIGATION_HISTORY_LIMIT);
+}
+
+function sanitizeSlowNavigationRecord(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const cleanStep = (step) => step && typeof step === "object" ? {
+    mode: String(step.mode ?? "unknown"),
+    direction: Number(step.direction) || 0,
+    elapsedMs: Math.round(Number(step.elapsedMs) || 0),
+    jumpPx: Math.round(Number(step.jumpPx) || 0),
+    waitMs: Math.round(Number(step.waitMs) || 0),
+    targetOrder: Number.isFinite(step.targetOrder) ? Number(step.targetOrder) : null,
+    progressKind: String(step.progressKind ?? "none"),
+    before: sanitizeTraceSnapshot(step.before),
+    after: sanitizeTraceSnapshot(step.after)
+  } : null;
+  return {
+    runId: Number(value.runId) || 0,
+    targetOrder: Number.isFinite(value.targetOrder) ? Number(value.targetOrder) : null,
+    targetLabel: typeof value.targetLabel === "string" ? value.targetLabel : null,
+    host: typeof value.host === "string" ? value.host : null,
+    source: typeof value.source === "string" ? value.source : null,
+    startedAt: typeof value.startedAt === "string" ? value.startedAt : null,
+    finishedAt: typeof value.finishedAt === "string" ? value.finishedAt : null,
+    totalElapsedMs: Math.round(Number(value.totalElapsedMs) || 0),
+    resultElapsedMs: Number.isFinite(value.resultElapsedMs) ? Math.round(Number(value.resultElapsedMs)) : null,
+    status: typeof value.status === "string" ? value.status : null,
+    reason: typeof value.reason === "string" ? value.reason : null,
+    ok: Boolean(value.ok),
+    verified: Boolean(value.verified),
+    slowestStep: cleanStep(value.slowestStep),
+    slowSteps: (Array.isArray(value.slowSteps) ? value.slowSteps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT),
+    steps: (Array.isArray(value.steps) ? value.steps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT)
+  };
+}
+
+function sanitizeTraceSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  return {
+    visibleRange: snapshot.visibleRange && Number.isFinite(snapshot.visibleRange.min) && Number.isFinite(snapshot.visibleRange.max)
+      ? { min: Number(snapshot.visibleRange.min), max: Number(snapshot.visibleRange.max) }
+      : null,
+    scrollHeight: Math.round(Number(snapshot.scrollHeight) || 0),
+    logicalPosition: Math.round(Number(snapshot.logicalPosition) || 0)
+  };
+}
+
+function cloneSlowNavigationRecord(record) {
+  return record ? JSON.parse(JSON.stringify(record)) : null;
+}
 
 function appNowMs(windowRef = globalThis.window) {
   const value = Number(windowRef?.performance?.now?.());

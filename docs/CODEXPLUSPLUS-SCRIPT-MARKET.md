@@ -1,12 +1,12 @@
 # CodexPlusPlusScriptMarket 投稿准备
 
-状态：**Stable candidate prepared / Not submitted**。GPT TalkEnhancer v0.5.0 已完成单文件真实 Codex++ 验收，但按当前决定暂不 fork、不创建 PR、不修改 `BigPizzaV3/CodexPlusPlusScriptMarket`。
+状态：**Stable candidate prepared / Not submitted**。GPT TalkEnhancer v0.5.1 已完成单文件真实 Codex++ 验收，但按当前决定暂不 fork、不创建 PR、不修改 `BigPizzaV3/CodexPlusPlusScriptMarket`。
 
 目标仓库：`https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket`
 
 ## 市场兼容策略
 
-v0.5.0 的推荐发行格式已经固定为单文件：
+v0.5.1 的推荐发行格式已经固定为单文件：
 
 ```text
 dist/market/gpt-talk-enhancer.js
@@ -27,9 +27,9 @@ dist/v3/00-gpt-talk-enhancer.v3.bundle.js
 dist/v3/10-gpt-talk-enhancer.v3.loader.js
 ```
 
-继续保留为开发/兼容构建，不作为 v0.5.0 市场推荐形态。
+继续保留为开发/兼容构建，不作为 v0.5.1 市场推荐形态。
 
-当前 v0.5.0 正式候选单文件 SHA-256：`2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA`。
+当前 v0.5.1 正式候选单文件 SHA-256：`C38332911D1DE554559B3760FA7B80D368A00985EE265078CE899876A8E0FB03`。
 
 ## 拟投稿元数据
 
@@ -38,12 +38,12 @@ dist/v3/10-gpt-talk-enhancer.v3.loader.js
   "id": "gpt-talk-enhancer",
   "name": "GPT TalkEnhancer",
   "description": "为 Codex Desktop 提供 Conversation Timeline / Question List 与 Prompt Library，支持长对话虚拟化导航、当前位置高亮和提示词快捷插入。",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": "dfhxxc666",
   "tags": ["codex", "timeline", "history", "prompt", "productivity", "ui"],
   "homepage": "https://github.com/dfhxxc666/gpt-talk-enhancer",
   "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/gpt-talk-enhancer.js",
-  "sha256": "2A52982C51C128C195DED830724C067E7FBC62A27941187AC00674F6A197B6BA",
+  "sha256": "C38332911D1DE554559B3760FA7B80D368A00985EE265078CE899876A8E0FB03",
   "requirements": ["Codex++ 用户脚本环境", "Codex / ChatGPT Desktop"],
   "limitations": ["当前主目标为 Desktop；未规划 Web 版", "首次从未探索的长对话需要随宿主虚拟化逐步建立索引"]
 }
@@ -51,7 +51,7 @@ dist/v3/10-gpt-talk-enhancer.v3.loader.js
 
 ## 投稿前检查
 
-v0.5.0 收口已经完成：
+v0.5.1 收口已经完成：
 
 - `npm run check` PASS；
 - `npm run build:market` PASS；
@@ -62,7 +62,7 @@ v0.5.0 收口已经完成：
 
 真正投稿前仍需：
 
-1. 确认届时准备提交的单文件与本仓库 v0.5.0 正式产物一致；
+1. 确认届时准备提交的单文件与本仓库 v0.5.1 正式产物一致；
 2. 再计算一次 SHA-256 并填入目标仓库 `index.json`；
 3. fork `BigPizzaV3/CodexPlusPlusScriptMarket`；
 4. 新增 `scripts/gpt-talk-enhancer.js`；
@@ -72,4 +72,4 @@ v0.5.0 收口已经完成：
 
 ## 当前决定
 
-**暂不投稿。** 后续先基于冻结的 v0.5.0 测试 Chat / Work Navigation 提速；性能实验不得修改 v0.5.0 tag 或破坏本次稳定基线。
+**暂不投稿。** v0.5.1 已完成 Chat / Work Navigation 性能收口；继续暂不投稿。后续若决定投稿，以冻结的 v0.5.1 tag 与本文件记录的正式 SHA-256 为准。

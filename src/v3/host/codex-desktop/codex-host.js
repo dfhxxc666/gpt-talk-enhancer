@@ -133,13 +133,15 @@ export class CodexDesktopHost extends HostInterface {
     });
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
     const requestId = ++this.navigationRequestId;
     const stillCurrent = () => requestId === this.navigationRequestId && isCurrent();
     const result = await this.navigation.navigateToTurn(turnId, {
       turns,
       getTurns,
-      isCurrent: stillCurrent
+      isCurrent: stillCurrent,
+      allowMountedFastSettle,
+      onTraceStep
     });
     if (result?.ok && result?.verified && stillCurrent()) this.persistLocalScrollPosition();
     return result;

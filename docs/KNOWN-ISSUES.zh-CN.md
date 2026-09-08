@@ -1,6 +1,6 @@
 # GPT TalkEnhancer Known Issues
 
-本文记录 GPT TalkEnhancer Desktop 已确认的问题、0.5.0 修复结果与后续优化项。`v0.4.5` 仍是冻结的 0.4.x 历史基线；以下 0.5.0 项均已在真实 Codex Desktop 中复测。
+本文记录 GPT TalkEnhancer Desktop 已确认的问题、0.5.0 修复结果与 0.5.1 性能收口。`v0.5.0` 保留为上一版正确性基线，`v0.4.5` 仍是冻结的 0.4.x 历史基线。
 
 ## UI-001：全屏 + 折叠左侧栏时 Timeline 跟随侧栏 hover 隐显
 
@@ -99,25 +99,31 @@
 
 最终真实复测未再出现回弹。
 
-## OPT-001：完整加载后的 Chat / Work Timeline 瞬时直达优化
+## OPT-001：Chat / Work Timeline Navigation 提速
 
 - 类型：Performance / UX Optimization
-- 状态：Backlog / Post-0.5.0
-- 优先级：Medium
+- 状态：**Resolved in v0.5.1 / residual host virtualization**
+- 优先级：Closed
 - 首次记录：2026-09-07
+- 收口：2026-09-08
 
-### 观察
+### v0.5.1 结果
 
-官方 Work 时间线在会话已经完整加载时，点击可以近乎瞬时直达。GPT TalkEnhancer 0.5.0 仍以正确性、三路一致性、Restore 和 fail-closed 为优先。
+在 v0.5.0 正确性基线上完成并真实验收：
 
-0.5.0 开发期间曾尝试 known-index 快探测，但真实 Work 出现刚进入会话后目标被宿主 restore 拉回等回归，因此该实验已撤回，不属于 0.5.0 正式实现。
+- 已挂载稳定目标使用 guarded mounted fast settle；
+- Chat Earlier 使用 8ms motion gate、自适应 jump scale、远距离 `chat-coalesced` 与 progress-renewed boundary hydration；
+- Work Earlier 保留独立 wheel / restore 语义，仅对长距离 wheel step 做保守自适应；
+- Local Work 500ms restore settle、`saveNow`、tail verification、post-settle 与 fail-closed 全部保留；
+- 自动慢导航诊断用于区分 GPT TalkEnhancer pacing 与宿主 virtualization / hydration。
 
-### 后续目标
+真实验收：
 
-在 0.5.0 稳定基线上继续单独测试 Chat / Work 提速，要求：
+- Chat `Q76 → Q1` 明显提速并正确定位；
+- Work 长距离 Earlier 提速；
+- Work 无回弹；
+- Chat 多次长距离尝试中偶尔仍可能出现 1～2 次宿主虚拟化卡顿，也可能全程无明显卡顿。该残余主要来自 Codex / ChatGPT 宿主窗口重建，不再通过继续压低脚本等待时间追求速度。
 
-- 已挂载/完整加载目标可尽量减少不必要 hydration；
-- 不绕过 post-settle；
-- 不破坏 Local Work restore；
-- 不改变 tail verification、ActiveTracker、TurnIndex 或 Cache 的正确性；
-- 任一快路径验证失败立即回退稳定 Navigation。
+### 结论
+
+0.5.1 以当前参数冻结 Navigation 性能基线。继续激进提速的边际收益已不足以抵消正确性与 Restore 回归风险。

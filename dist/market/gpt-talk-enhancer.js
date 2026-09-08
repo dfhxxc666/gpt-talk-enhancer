@@ -2,7 +2,7 @@
 @codex-plus-script
 name: GPT TalkEnhancer
 description: Conversation Timeline / Question List and Prompt Library for Codex Desktop.
-version: 0.5.0
+version: 0.5.1
 author: dfhxxc666
 homepage: https://github.com/dfhxxc666/gpt-talk-enhancer
 license: GPL-3.0-or-later
@@ -12,7 +12,7 @@ See the project NOTICE.md and LICENSE for attribution and license details.
 */
 
 /*
- * GPT TalkEnhancer 0.5.0 Desktop bundle
+ * GPT TalkEnhancer 0.5.1 Desktop bundle
  * Includes GPL-3.0-or-later derived Timeline UI material.
  * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.
  */
@@ -1338,6 +1338,7 @@ Object.assign(exports, { clamp, getMaxLogicalPosition, logicalFromScrollTop, scr
 const { clamp, createScrollModel, scrollTopFromLogical } = __require("src/v3/core/scroll-model.js");
 
 const FALLBACK_TURN = /^fallback-turn-(\d+)$/;
+const NAVIGATION_TRACE_LIMIT = 16;
 const HYDRATION_ATTRIBUTES = [
   "data-turn-key",
   "data-content-search-turn-key",
@@ -1355,13 +1356,17 @@ class NavigationAdapter {
     maxConsecutiveStalls = 4,
     hydrationWaitMs = 900,
     workWheelStepPx = 720,
-    workWheelWaitMs = 220,
+    workWheelWaitMs = 120,
     inactivityNavigationMs = 5000,
     absoluteMaxNavigationMs = 45000,
     maxNavigationMs = null,
     motionProgressWaitMs = 45,
+    chatMotionProgressWaitMs = 8,
+    chatEarlierJumpScale = 1.35,
+    chatBoundaryHydrationWaitMs = 1800,
     maxAlignFrames = 8,
     postSettleWaitMs = 160,
+    mountedFastSettleWaitMs = 120,
     maxPostSettleCorrections = 2
   } = {}) {
     this.window = window ?? globalThis.window;
@@ -1378,15 +1383,26 @@ class NavigationAdapter {
       ? Number(maxNavigationMs)
       : Number(absoluteMaxNavigationMs);
     this.motionProgressWaitMs = motionProgressWaitMs;
+    this.chatMotionProgressWaitMs = chatMotionProgressWaitMs;
+    this.chatEarlierJumpScale = Math.max(1, Number(chatEarlierJumpScale) || 1);
+    this.chatBoundaryHydrationWaitMs = Math.max(this.hydrationWaitMs, Number(chatBoundaryHydrationWaitMs) || 0);
     this.maxAlignFrames = maxAlignFrames;
     this.postSettleWaitMs = postSettleWaitMs;
+    this.mountedFastSettleWaitMs = mountedFastSettleWaitMs;
     this.maxPostSettleCorrections = maxPostSettleCorrections;
     this.compatibility = createNavigationCompatibility();
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true } = {}) {
-    if (!turnId) return failure("missing-turn-id", turnId);
-    if (!isCurrent()) return failure("superseded", turnId);
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+    const steps = [];
+    const finish = (result) => ({ ...result, steps: steps.slice() });
+    const recordStep = (entry) => {
+      steps.push(entry);
+      if (steps.length > NAVIGATION_TRACE_LIMIT) steps.splice(0, steps.length - NAVIGATION_TRACE_LIMIT);
+      try { onTraceStep?.(entry, steps.slice()); } catch {}
+    };
+    if (!turnId) return finish(failure("missing-turn-id", turnId));
+    if (!isCurrent()) return finish(failure("superseded", turnId));
     const readTurns = () => {
       try {
         const current = typeof getTurns === "function" ? getTurns() : turns;
@@ -1397,12 +1413,12 @@ class NavigationAdapter {
     };
     const getIndexState = () => createNavigationIndex(turnId, readTurns());
     let indexState = getIndexState();
-    if (indexState.targetIndex < 0) return failure("unknown-turn", turnId);
+    if (indexState.targetIndex < 0) return finish(failure("unknown-turn", turnId));
 
     const container = this.conversationAdapter.getScrollContainer();
-    if (!container) return failure("missing-scroll-container", turnId);
+    if (!container) return finish(failure("missing-scroll-container", turnId));
     const isNavigationCurrent = () => isCurrent() && this.conversationAdapter.getScrollContainer() === container;
-    if (!isNavigationCurrent()) return failure("superseded", turnId);
+    if (!isNavigationCurrent()) return finish(failure("superseded", turnId));
 
     this.compatibility = createNavigationCompatibility();
     const startedAt = nowMs(this.window);
@@ -1410,14 +1426,17 @@ class NavigationAdapter {
     let probes = 0;
     let consecutiveStalls = 0;
     let workCompatibilityNotified = false;
+    let chatBoundaryWaitAvailable = true;
     let snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
     let candidate = this.resolveCandidate(turnId, indexState.targetOrder);
     const readTargetOrder = () => getIndexState().targetOrder;
     const readMaxKnownOrder = () => getIndexState().maxKnownOrder;
     if (candidate) {
       lastProgressAt = nowMs(this.window);
-      const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+      const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder, {
+        mountedFastSettle: Boolean(allowMountedFastSettle)
+      });
+      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
       indexState = getIndexState();
       snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
     }
@@ -1429,15 +1448,15 @@ class NavigationAdapter {
       && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
       const loopNow = nowMs(this.window);
       if (loopNow - lastProgressAt >= this.inactivityNavigationMs) {
-        return this.navigationFailure("navigation-inactive", turnId, {
+        return finish(this.navigationFailure("navigation-inactive", turnId, {
           probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
           inactiveMs: Math.round(loopNow - lastProgressAt)
-        });
+        }));
       }
-      if (!isNavigationCurrent()) return failure("superseded", turnId);
+      if (!isNavigationCurrent()) return finish(failure("superseded", turnId));
 
       const refreshedIndex = getIndexState();
-      if (refreshedIndex.targetIndex < 0) return failure("unknown-turn", turnId);
+      if (refreshedIndex.targetIndex < 0) return finish(failure("unknown-turn", turnId));
       if (refreshedIndex.signature !== indexState.signature) {
         indexState = refreshedIndex;
         snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
@@ -1452,7 +1471,7 @@ class NavigationAdapter {
       if (candidate) {
         lastProgressAt = nowMs(this.window);
         const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
         consecutiveStalls = 0;
         indexState = getIndexState();
         snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
@@ -1481,6 +1500,7 @@ class NavigationAdapter {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
         }
+        const stepStartedAt = nowMs(this.window);
         const outcome = await this.performWorkWheelHydrationStep({
           turnId,
           targetOrder,
@@ -1491,7 +1511,18 @@ class NavigationAdapter {
           turnCount: indexState.turns.length,
           getIndexState
         });
-        if (outcome.state === "superseded") return failure("superseded", turnId);
+        recordStep(createNavigationTraceStep({
+          mode: "work-wheel",
+          direction: -1,
+          elapsedMs: nowMs(this.window) - stepStartedAt,
+          jumpPx: outcome.step,
+          waitMs: outcome.waitMs,
+          targetOrder,
+          before: currentSnapshot,
+          after: outcome.snapshot,
+          outcome
+        }));
+        if (outcome.state === "superseded") return finish(failure("superseded", turnId));
         probes += outcome.moved ? 1 : 0;
         const nextIndex = getIndexState();
         if (nextIndex.signature !== indexState.signature) {
@@ -1503,7 +1534,7 @@ class NavigationAdapter {
         if (outcome.candidate) {
           lastProgressAt = nowMs(this.window);
           const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
           consecutiveStalls = 0;
           indexState = getIndexState();
           snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
@@ -1514,15 +1545,33 @@ class NavigationAdapter {
           lastProgressAt = nowMs(this.window);
           continue;
         }
-        return this.navigationFailure("work-wheel-stalled", turnId, {
+        return finish(this.navigationFailure("work-wheel-stalled", turnId, {
           probes, stalls: 1, container, startedAt, getIndexState
-        });
+        }));
       }
 
       const computedJump = hydrationStepSize(model, visibleOrders, targetOrder);
       const nudgeScale = consecutiveStalls > 0 ? 0.42 : 1;
+      const hostJumpScale = hydrationJumpScale({
+        host: conversationIdentity?.host,
+        direction,
+        targetBeforeVisible,
+        targetDistance: currentSnapshot.targetDistance,
+        chatEarlierJumpScale: this.chatEarlierJumpScale
+      });
+      const baseJump = computedJump * nudgeScale * hostJumpScale;
+      const coalescedJump = chatFarCoalescedJump({
+        baseJump,
+        host: conversationIdentity?.host,
+        direction,
+        targetBeforeVisible,
+        targetDistance: currentSnapshot.targetDistance,
+        logicalPosition: model.logicalPosition,
+        minLogicalPosition: model.minLogicalPosition,
+        stalled: consecutiveStalls > 0
+      });
       const jump = Math.max(
-        Math.min(computedJump * nudgeScale, model.maxLogicalPosition || computedJump),
+        Math.min(coalescedJump.jumpPx, model.maxLogicalPosition || computedJump),
         Math.min(180, model.clientHeight || 180)
       );
       const regularNextLogical = clamp(
@@ -1534,7 +1583,17 @@ class NavigationAdapter {
         ? model.maxLogicalPosition
         : null;
       const nextLogical = endpointLogical == null ? regularNextLogical : endpointLogical;
-      const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
+      const remainingJumpPx = Math.abs(nextLogical - model.logicalPosition);
+      const moved = remainingJumpPx >= 1;
+      const chatEarlierBoundary = chatBoundaryWaitAvailable
+        && conversationIdentity?.host === "chatgpt"
+        && direction < 0
+        && targetBeforeVisible
+        && nextLogical <= model.minLogicalPosition + 1
+        && remainingJumpPx <= 1;
+      const motionWaitMs = conversationIdentity?.host === "chatgpt" ? this.chatMotionProgressWaitMs : this.motionProgressWaitMs;
+      const stepWaitMs = chatEarlierBoundary ? this.chatBoundaryHydrationWaitMs : this.hydrationWaitMs;
+      const stepStartedAt = nowMs(this.window);
       const outcome = await this.awaitHydrationProgress({
         turnId,
         targetOrder,
@@ -1544,11 +1603,26 @@ class NavigationAdapter {
         isCurrent: isNavigationCurrent,
         orderById,
         getIndexState,
-        waitMs: this.hydrationWaitMs,
-        allowMotionProgress: true,
+        waitMs: stepWaitMs,
+        allowMotionProgress: !chatEarlierBoundary,
+        motionProgressWaitMs: motionWaitMs,
         scrollAction: moved ? () => setLogicalScrollPosition(container, nextLogical, model) : null
       });
-      if (outcome.state === "superseded") return failure("superseded", turnId);
+      if (chatEarlierBoundary) {
+        chatBoundaryWaitAvailable = Boolean(outcome.candidate || outcome.progressed);
+      }
+      recordStep(createNavigationTraceStep({
+        mode: chatEarlierBoundary ? "chat-boundary" : coalescedJump.coalesced ? "chat-coalesced" : conversationIdentity?.host === "chatgpt" ? "chat-progressive" : "regular-progressive",
+        direction,
+        elapsedMs: nowMs(this.window) - stepStartedAt,
+        jumpPx: remainingJumpPx,
+        waitMs: chatEarlierBoundary ? stepWaitMs : motionWaitMs,
+        targetOrder,
+        before: currentSnapshot,
+        after: outcome.snapshot,
+        outcome
+      }));
+      if (outcome.state === "superseded") return finish(failure("superseded", turnId));
       probes += moved ? 1 : 0;
       const nextIndex = getIndexState();
       if (nextIndex.signature !== indexState.signature) {
@@ -1561,7 +1635,7 @@ class NavigationAdapter {
       if (outcome.candidate) {
         lastProgressAt = nowMs(this.window);
         const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
         consecutiveStalls = 0;
         indexState = getIndexState();
         snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
@@ -1579,11 +1653,11 @@ class NavigationAdapter {
         candidate = this.resolveCandidate(turnId, indexState.targetOrder);
         if (candidate) {
           const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
         }
-        return this.navigationFailure("hydration-stalled", turnId, {
+        return finish(this.navigationFailure("hydration-stalled", turnId, {
           probes, stalls: consecutiveStalls, container, startedAt, getIndexState
-        });
+        }));
       }
     }
 
@@ -1591,12 +1665,12 @@ class NavigationAdapter {
     candidate = this.resolveCandidate(turnId, indexState.targetOrder);
     if (candidate) {
       const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return aligned;
+      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
     }
-    return this.navigationFailure("navigation-hard-limit", turnId, {
+    return finish(this.navigationFailure("navigation-hard-limit", turnId, {
       probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
       budgetLimit: probes >= this.maxHydrationSteps && !allowFirstTurnProbeOverrun ? "probes" : "absolute-time"
-    });
+    }));
   }
 
   navigationFailure(reason, turnId, { probes = 0, stalls = 0, targetOrder = -1, orderById = null, container, startedAt, getIndexState = null, ...extra } = {}) {
@@ -1617,7 +1691,7 @@ class NavigationAdapter {
     };
   }
 
-  async awaitHydrationProgress({ turnId, targetOrder, previousSnapshot, direction, container, isCurrent, orderById = null, getIndexState = null, waitMs = this.hydrationWaitMs, allowMotionProgress = true, scrollAction = null }) {
+  async awaitHydrationProgress({ turnId, targetOrder, previousSnapshot, direction, container, isCurrent, orderById = null, getIndexState = null, waitMs = this.hydrationWaitMs, allowMotionProgress = true, motionProgressWaitMs = this.motionProgressWaitMs, scrollAction = null }) {
     const initialIndex = typeof getIndexState === "function" ? getIndexState() : null;
     const initialTargetOrder = Number.isFinite(initialIndex?.targetOrder) ? Number(initialIndex.targetOrder) : targetOrder;
     const initialOrderById = initialIndex?.orderById ?? orderById;
@@ -1705,7 +1779,7 @@ class NavigationAdapter {
       motionTimer = setTimer(this.window, () => {
         motionTimer = null;
         evaluate({ allowMotionProgress: true });
-      }, this.motionProgressWaitMs);
+      }, motionProgressWaitMs);
     }
 
     timer = setTimer(this.window, () => {
@@ -1733,10 +1807,18 @@ class NavigationAdapter {
     const model = readScrollModel(container, this.window);
     const viewport = Math.max(240, Number(model.clientHeight) || 737);
     const configuredStep = Math.min(Math.max(240, Number(this.workWheelStepPx) || 720), viewport);
-    const step = Number(currentTurnCount) <= 12 ? Math.max(180, Math.min(configuredStep, viewport * 0.5)) : configuredStep;
+    const step = workWheelStepSize({
+      configuredStep,
+      viewport,
+      turnCount: currentTurnCount,
+      targetDistance: previousSnapshot?.targetDistance,
+      logicalPosition: model.logicalPosition,
+      minLogicalPosition: model.minLogicalPosition
+    });
     const nextLogical = clamp(model.logicalPosition - step, model.minLogicalPosition, model.maxLogicalPosition);
     const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
     dispatchWheelEvent(container, this.window, -step);
+    const waitMs = moved ? this.workWheelWaitMs : this.hydrationWaitMs;
     const outcome = await this.awaitHydrationProgress({
       turnId,
       targetOrder: currentTargetOrder,
@@ -1746,11 +1828,11 @@ class NavigationAdapter {
       isCurrent,
       orderById: currentOrderById,
       getIndexState,
-      waitMs: moved ? this.workWheelWaitMs : this.hydrationWaitMs,
+      waitMs,
       allowMotionProgress: false,
       scrollAction: moved ? () => setLogicalScrollPosition(container, nextLogical, model) : null
     });
-    return { ...outcome, moved };
+    return { ...outcome, moved, step, waitMs };
   }
 
   notifyCodexPlusScrollIntent(container, isCurrent = () => true) {
@@ -1805,7 +1887,7 @@ class NavigationAdapter {
     return null;
   }
 
-  async verifyAndAlign(turnId, candidateOrElement, isCurrent, probes, targetOrder = -1, maxKnownOrder = null) {
+  async verifyAndAlign(turnId, candidateOrElement, isCurrent, probes, targetOrder = -1, maxKnownOrder = null, options = {}) {
     if (!isCurrent()) return failure("superseded", turnId);
     const readTargetOrder = typeof targetOrder === "function" ? targetOrder : () => targetOrder;
     const readMaxKnownOrder = typeof maxKnownOrder === "function" ? maxKnownOrder : () => maxKnownOrder;
@@ -1844,6 +1926,58 @@ class NavigationAdapter {
 
     const firstAlignmentFailure = await alignCandidate();
     if (firstAlignmentFailure) return firstAlignmentFailure;
+
+    if (options?.mountedFastSettle && this.mountedFastSettleWaitMs > 0) {
+      candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+      const fastRectBefore = candidate?.element?.getBoundingClientRect?.();
+      const fastContainerBefore = container.getBoundingClientRect?.();
+      const fastSnapshotBefore = readMountedSettleSnapshot(this.turnAdapter, container, this.window, fastRectBefore);
+      if (candidate?.element
+        && this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)
+        && fastRectBefore
+        && fastContainerBefore
+        && (rectInActivationZone(fastRectBefore, fastContainerBefore, this.activationOffset)
+          || isVerifiedTailEndpoint({
+            targetOrder: readTargetOrder(),
+            maxKnownOrder: readMaxKnownOrder(),
+            rect: fastRectBefore,
+            containerRect: fastContainerBefore,
+            model: readScrollModel(container, this.window)
+          }))) {
+        await delay(this.window, this.mountedFastSettleWaitMs);
+        await nextFrame(this.window);
+        if (!isCurrent()) return failure("superseded", turnId);
+        candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+        const fastRectAfter = candidate?.element?.getBoundingClientRect?.();
+        const fastContainerAfter = container.getBoundingClientRect?.();
+        const fastModelAfter = readScrollModel(container, this.window);
+        const fastSnapshotAfter = readMountedSettleSnapshot(this.turnAdapter, container, this.window, fastRectAfter);
+        if (candidate?.element
+          && this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)
+          && fastRectAfter
+          && fastContainerAfter
+          && mountedSettleSnapshotStable(fastSnapshotBefore, fastSnapshotAfter)) {
+          if (isVerifiedTailEndpoint({
+            targetOrder: readTargetOrder(),
+            maxKnownOrder: readMaxKnownOrder(),
+            rect: fastRectAfter,
+            containerRect: fastContainerAfter,
+            model: fastModelAfter
+          })) {
+            return {
+              ok: true, target: turnId, targetOrder: readTargetOrder(), verified: true, probes,
+              domId: candidate.domId, settleChecks: 1, settleMode: "mounted-fast", endpoint: "tail"
+            };
+          }
+          if (rectInActivationZone(fastRectAfter, fastContainerAfter, this.activationOffset)) {
+            return {
+              ok: true, target: turnId, targetOrder: readTargetOrder(), verified: true, probes,
+              domId: candidate.domId, settleChecks: 1, settleMode: "mounted-fast"
+            };
+          }
+        }
+      }
+    }
 
     for (let settleCheck = 0; settleCheck <= this.maxPostSettleCorrections; settleCheck += 1) {
       await nextFrame(this.window);
@@ -1956,6 +2090,69 @@ function isVerifiedTailEndpoint({ targetOrder, maxKnownOrder, rect, containerRec
   return Number(rect.bottom) > Number(containerRect.top) && Number(rect.top) < Number(containerRect.bottom);
 }
 
+function readMountedSettleSnapshot(turnAdapter, container, windowRef, rect) {
+  const model = readScrollModel(container, windowRef);
+  const visibleSignature = (turnAdapter?.getVisibleTurns?.() ?? [])
+    .map((turn) => String(turn?.id ?? ""))
+    .join("|");
+  return {
+    visibleSignature,
+    scrollHeight: Number(model.scrollHeight) || 0,
+    maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+    logicalPosition: Number(model.logicalPosition) || 0,
+    rectTop: Number(rect?.top),
+    rectBottom: Number(rect?.bottom)
+  };
+}
+
+function mountedSettleSnapshotStable(before, after, tolerance = 2) {
+  if (!before || !after) return false;
+  if (before.visibleSignature !== after.visibleSignature) return false;
+  if (Math.abs(after.scrollHeight - before.scrollHeight) > tolerance) return false;
+  if (Math.abs(after.maxLogicalPosition - before.maxLogicalPosition) > tolerance) return false;
+  if (Math.abs(after.logicalPosition - before.logicalPosition) > tolerance) return false;
+  if (!Number.isFinite(before.rectTop) || !Number.isFinite(after.rectTop)) return false;
+  if (!Number.isFinite(before.rectBottom) || !Number.isFinite(after.rectBottom)) return false;
+  if (Math.abs(after.rectTop - before.rectTop) > tolerance) return false;
+  if (Math.abs(after.rectBottom - before.rectBottom) > tolerance) return false;
+  return true;
+}
+
+function createNavigationTraceStep({ mode, direction, elapsedMs, jumpPx, waitMs, targetOrder, before, after, outcome } = {}) {
+  return {
+    mode: String(mode ?? "unknown"),
+    direction: Number(direction) || 0,
+    elapsedMs: Math.round(Number(elapsedMs) || 0),
+    jumpPx: Math.round(Number(jumpPx) || 0),
+    waitMs: Math.round(Number(waitMs) || 0),
+    targetOrder: Number.isFinite(targetOrder) ? Number(targetOrder) : null,
+    progressKind: classifyNavigationStepProgress({ targetOrder, before, after, outcome, direction }),
+    before: compactTraceSnapshot(before),
+    after: compactTraceSnapshot(after)
+  };
+}
+
+function compactTraceSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    visibleRange: snapshot.visibleRange ?? visibleOrderRange(snapshot.visibleOrders ?? []),
+    scrollHeight: Math.round(Number(snapshot.scrollHeight) || 0),
+    logicalPosition: Math.round(Number(snapshot.logicalPosition) || 0)
+  };
+}
+
+function classifyNavigationStepProgress({ targetOrder, before, after, outcome, direction } = {}) {
+  if (outcome?.candidate || outcome?.state === "target") return "target";
+  if (outcome?.indexChanged) return "index";
+  if (!after) return outcome?.progressed ? "progress" : "none";
+  if (turnWindowDistance(targetOrder, after.visibleOrders ?? []) < turnWindowDistance(targetOrder, before?.visibleOrders ?? [])) return "window";
+  if ((Number(after.scrollHeight) || 0) > (Number(before?.scrollHeight) || 0) + 1
+    || (Number(after.maxLogicalPosition) || 0) > (Number(before?.maxLogicalPosition) || 0) + 1) return "extent";
+  if (direction < 0 && (Number(after.logicalPosition) || 0) < (Number(before?.logicalPosition) || 0) - 1) return "motion";
+  if (direction > 0 && (Number(after.logicalPosition) || 0) > (Number(before?.logicalPosition) || 0) + 1) return "motion";
+  return outcome?.progressed ? "progress" : "none";
+}
+
 function rectInActivationZone(rect, containerRect = null, activationOffset = 120) {
   if (!rect) return false;
   const bounds = containerRect ?? { top: 0, bottom: 800, height: 800 };
@@ -2008,6 +2205,39 @@ function hydrationStepSize(model = {}, visibleOrders = [], targetOrder = -1) {
   }
   const proportional = Math.min(3200, Math.max(900, span * 0.06));
   return Math.min(span, Math.max(viewport * multiplier, proportional));
+}
+
+function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0 } = {}) {
+  const safeViewport = Math.max(240, Number(viewport) || 737);
+  const base = Math.min(Math.max(240, Number(configuredStep) || 720), safeViewport);
+  if (Number(turnCount) <= 12) return Math.round(Math.max(180, Math.min(base, safeViewport * 0.5)));
+  const distance = Math.max(0, Number(targetDistance) || 0);
+  const scale = distance > 40 ? 1.35 : distance > 20 ? 1.2 : 1;
+  const desired = Math.min(base * scale, safeViewport * 1.35);
+  const remaining = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  return Math.round(remaining > 0 ? Math.min(desired, remaining) : desired);
+}
+
+function hydrationJumpScale({ host = null, direction = 0, targetBeforeVisible = false, targetDistance = 0, chatEarlierJumpScale = 1.35 } = {}) {
+  if (host !== "chatgpt" || direction >= 0 || !targetBeforeVisible) return 1;
+  const base = Math.max(1, Number(chatEarlierJumpScale) || 1);
+  const distance = Math.max(0, Number(targetDistance) || 0);
+  if (distance > 40) return Math.max(base, 1.75);
+  if (distance > 20) return Math.max(base, 1.55);
+  return base;
+}
+
+function chatFarCoalescedJump({ baseJump = 0, host = null, direction = 0, targetBeforeVisible = false, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0, stalled = false } = {}) {
+  const base = Math.max(0, Number(baseJump) || 0);
+  const availableEarlier = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  const eligible = host === "chatgpt"
+    && direction < 0
+    && targetBeforeVisible
+    && Number(targetDistance) > 40
+    && !stalled
+    && availableEarlier > base * 1.6;
+  if (!eligible) return { jumpPx: base, coalesced: false };
+  return { jumpPx: Math.round(Math.min(base * 1.35, 7600, availableEarlier)), coalesced: true };
 }
 
 function turnWindowDistance(targetOrder, orders = []) {
@@ -2118,7 +2348,7 @@ function failure(reason, target) {
   return { ok: false, reason, target, verified: false };
 }
 
-Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
+Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
 
 },
 "src/v3/host/codex-desktop/host-contract.js": (module, exports, __require) => {
@@ -2451,13 +2681,15 @@ class CodexDesktopHost extends HostInterface {
     });
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
     const requestId = ++this.navigationRequestId;
     const stillCurrent = () => requestId === this.navigationRequestId && isCurrent();
     const result = await this.navigation.navigateToTurn(turnId, {
       turns,
       getTurns,
-      isCurrent: stillCurrent
+      isCurrent: stillCurrent,
+      allowMountedFastSettle,
+      onTraceStep
     });
     if (result?.ok && result?.verified && stillCurrent()) this.persistLocalScrollPosition();
     return result;
@@ -3614,11 +3846,17 @@ const { SettingsStore } = __require("src/v3/core/settings-store.js");
 const { TimelineCache } = __require("src/v3/core/timeline-cache.js");
 const { SURFACE } = __require("src/v3/host/host-interface.js");
 const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js");
+const { parseSidebarConversationKey } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
+const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
+const NAVIGATION_HISTORY_LIMIT = 5;
+const NAVIGATION_STEP_LIMIT = 16;
+const SLOW_NAVIGATION_HISTORY_LIMIT = 10;
+const SLOW_NAVIGATION_STORAGE_KEY = "gte.v3.navigation-diagnostics";
 
 class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -3636,6 +3874,12 @@ class TalkEnhancerV3App {
     this.currentConversationId = null;
     this.lastNavigation = { target: null, verified: false, reason: "none" };
     this.navigationRequestId = 0;
+    this.navigationRunSequence = 0;
+    this.activeNavigation = null;
+    this.navigationHistory = [];
+    this.slowNavigationHistory = sanitizeSlowNavigationHistory(
+      this.storage?.read?.(SLOW_NAVIGATION_STORAGE_KEY, [])
+    );
     this.navigationUxTimer = null;
     this.navigationUx = { state: "idle", target: null, targetOrder: null, pendingVisible: false };
     this.captureStatus = { status: "unavailable", turnCount: 0, lastError: "" };
@@ -3689,19 +3933,38 @@ class TalkEnhancerV3App {
       "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]"
     );
     if (!row) return;
-    const localThreadSelected = Boolean(row?.getAttribute?.("data-app-action-sidebar-thread-id"));
+    const localId = row?.getAttribute?.("data-app-action-sidebar-thread-id") ?? null;
+    const chatKey = row?.getAttribute?.("data-sidebar-chatgpt-conversation-key") ?? null;
+    const expectedChatId = chatKey ? parseSidebarConversationKey(chatKey) : null;
+    const localThreadSelected = Boolean(localId);
     this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
-    if (this.conversationSelectTimer != null) {
-      const clear = this.window?.clearTimeout ?? clearTimeout;
-      clear(this.conversationSelectTimer);
+    this.clearConversationSelectTimer();
+    if (localThreadSelected || !expectedChatId) {
+      this.scheduleConversationSelectRetry({ expectedChatId: null, attempt: 0, delays: [240] });
+      return;
     }
+    this.scheduleConversationSelectRetry({ expectedChatId, attempt: 0, delays: CHAT_CONVERSATION_SETTLE_DELAYS_MS });
+  }
+
+  clearConversationSelectTimer() {
+    if (this.conversationSelectTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.conversationSelectTimer);
+    this.conversationSelectTimer = null;
+  }
+
+  scheduleConversationSelectRetry({ expectedChatId = null, attempt = 0, delays = CHAT_CONVERSATION_SETTLE_DELAYS_MS } = {}) {
+    if (this.destroyed || attempt >= delays.length) return;
     const set = this.window?.setTimeout ?? setTimeout;
     this.conversationSelectTimer = set(() => {
       this.conversationSelectTimer = null;
       this.refresh("conversation-select-settled");
-    }, 240);
+      if (expectedChatId && this.host.getConversationId?.() !== expectedChatId) {
+        this.scheduleConversationSelectRetry({ expectedChatId, attempt: attempt + 1, delays });
+      }
+    }, delays[attempt]);
   }
   scheduleRefresh(reason = "event") {
     if (this.destroyed || this.refreshFrame != null) return;
@@ -3841,6 +4104,96 @@ class TalkEnhancerV3App {
     this.updateDebug(reason);
   }
 
+  beginNavigationRun({ targetOrder, identity }) {
+    const startedAtMs = Date.now();
+    const run = {
+      runId: ++this.navigationRunSequence,
+      targetOrder,
+      targetLabel: Number.isFinite(targetOrder) ? `Q${Number(targetOrder) + 1}` : null,
+      host: identity?.host ?? null,
+      source: identity?.source ?? null,
+      status: "running",
+      startedAt: new Date(startedAtMs).toISOString(),
+      startedAtMs,
+      currentStep: null,
+      steps: []
+    };
+    this.activeNavigation = run;
+    this.publishNavigationDiagnostics();
+    return run;
+  }
+
+  recordNavigationStep(run, entry, steps = null) {
+    if (!run) return;
+    run.steps = (Array.isArray(steps) ? steps : [...(run.steps ?? []), entry]).slice(-NAVIGATION_STEP_LIMIT);
+    run.currentStep = entry ?? null;
+    if (this.activeNavigation?.runId === run.runId) {
+      this.activeNavigation = run;
+      this.publishNavigationDiagnostics();
+    }
+  }
+
+  completeNavigationRun(run, result = {}) {
+    if (!run) return;
+    const finishedAtMs = Date.now();
+    const steps = Array.isArray(result?.steps) && result.steps.length ? result.steps.slice(-NAVIGATION_STEP_LIMIT) : (run.steps ?? []).slice(-NAVIGATION_STEP_LIMIT);
+    const slowestStep = steps.reduce((best, step) => Number(step?.elapsedMs ?? -1) > Number(best?.elapsedMs ?? -1) ? step : best, null);
+    const completed = {
+      ...run,
+      status: result?.reason === "superseded" ? "superseded" : result?.ok ? "success" : "failed",
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      totalElapsedMs: Math.max(0, finishedAtMs - Number(run.startedAtMs || finishedAtMs)),
+      resultElapsedMs: Number.isFinite(result?.elapsedMs) ? Number(result.elapsedMs) : null,
+      reason: result?.reason ?? (result?.ok ? "ok" : "unknown"),
+      ok: Boolean(result?.ok),
+      verified: Boolean(result?.verified),
+      slowestStep,
+      currentStep: null,
+      steps
+    };
+    delete completed.startedAtMs;
+    this.navigationHistory = [...this.navigationHistory, completed].slice(-NAVIGATION_HISTORY_LIMIT);
+    const slowSteps = steps.filter(isSlowNavigationStep);
+    if (slowSteps.length > 0) {
+      const slowRecord = sanitizeSlowNavigationRecord({
+        runId: completed.runId,
+        targetOrder: completed.targetOrder,
+        targetLabel: completed.targetLabel,
+        host: completed.host,
+        source: completed.source,
+        startedAt: completed.startedAt,
+        finishedAt: completed.finishedAt,
+        totalElapsedMs: completed.totalElapsedMs,
+        resultElapsedMs: completed.resultElapsedMs,
+        status: completed.status,
+        reason: completed.reason,
+        ok: completed.ok,
+        verified: completed.verified,
+        slowestStep: completed.slowestStep,
+        slowSteps,
+        steps
+      });
+      if (slowRecord) {
+        this.slowNavigationHistory = [...this.slowNavigationHistory, slowRecord].slice(-SLOW_NAVIGATION_HISTORY_LIMIT);
+        this.storage?.write?.(SLOW_NAVIGATION_STORAGE_KEY, this.slowNavigationHistory);
+      }
+    }
+    if (this.activeNavigation?.runId === run.runId) this.activeNavigation = null;
+    this.publishNavigationDiagnostics();
+  }
+
+  publishNavigationDiagnostics() {
+    if (!this.window) return;
+    const current = this.window.__GPTTalkEnhancerDebug ?? {};
+    this.window.__GPTTalkEnhancerDebug = {
+      ...current,
+      activeNavigation: this.activeNavigation ? { ...this.activeNavigation, steps: [...(this.activeNavigation.steps ?? [])] } : null,
+      navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
+      slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
+      lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null
+    };
+  }
+
   async navigate(turnId) {
     const conversationId = this.currentConversationId;
     const index = conversationId ? this.getTurnIndex(conversationId) : null;
@@ -3848,6 +4201,8 @@ class TalkEnhancerV3App {
     const record = index.get(turnId);
     const targetOrder = Number.isFinite(record?.order) ? Number(record.order) : null;
     const requestId = ++this.navigationRequestId;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    const navigationRun = this.beginNavigationRun({ targetOrder, identity });
     this.clearNavigationUxTimer();
     this.setNavigationUx({ state: "pending", target: turnId, targetOrder, pendingVisible: false }, "navigate-start");
 
@@ -3862,16 +4217,32 @@ class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
-    const identity = this.host.getConversationIdentity?.() ?? null;
     if (identity?.host === "local") {
       const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
       if (remainingSettleMs > 0) {
         await waitMs(this.window, remainingSettleMs);
-        if (!isCurrent()) return { ok: false, target: turnId, verified: false, reason: "superseded" };
+        if (!isCurrent()) {
+          const superseded = { ok: false, target: turnId, verified: false, reason: "superseded" };
+          this.completeNavigationRun(navigationRun, superseded);
+          return superseded;
+        }
       }
     }
-    const result = await this.host.navigateToTurn(turnId, { turns: index.getOrdered(), getTurns: () => index.getOrdered(), isCurrent });
-    if (requestId !== this.navigationRequestId) return result;
+    const allowMountedFastSettle = Boolean(identity?.stable && (identity.host === "chatgpt" || identity.host === "local"));
+    const result = await this.host.navigateToTurn(turnId, {
+      turns: index.getOrdered(),
+      getTurns: () => index.getOrdered(),
+      isCurrent,
+      allowMountedFastSettle,
+      onTraceStep: (entry, steps) => this.recordNavigationStep(navigationRun, entry, steps)
+    });
+    if (requestId !== this.navigationRequestId) {
+      const supersededResult = result?.reason === "superseded"
+        ? result
+        : { ...result, ok: false, verified: false, reason: "superseded" };
+      this.completeNavigationRun(navigationRun, supersededResult);
+      return result;
+    }
     this.clearNavigationUxTimer();
     const latestRecord = index.get(turnId);
     const latestTargetOrder = Number.isFinite(latestRecord?.order) ? Number(latestRecord.order) : targetOrder;
@@ -3891,8 +4262,11 @@ class TalkEnhancerV3App {
       logicalPosition: Number.isFinite(result?.logicalPosition) ? result.logicalPosition : null,
       domId: result?.domId ?? null,
       settleChecks: Number.isFinite(result?.settleChecks) ? result.settleChecks : null,
+      settleMode: result?.settleMode ?? null,
+      steps: Array.isArray(result?.steps) ? result.steps : [],
       targetOrder: latestTargetOrder
     };
+    this.completeNavigationRun(navigationRun, this.lastNavigation);
     if (result?.reason === "superseded") {
       this.setNavigationUx({ state: "idle", target: null, targetOrder: null, pendingVisible: false }, "navigate-superseded");
     } else if (result?.ok) {
@@ -3941,6 +4315,10 @@ class TalkEnhancerV3App {
       prompt: { composerDetected: Boolean(this.host?.getComposer?.()), mounted: Boolean(shell.promptMounted), panelOpen: Boolean(shell.promptPanelOpen) },
       overlayBlocked: surface === SURFACE.MEDIA_VIEWER,
       navigation: { ...this.lastNavigation },
+      activeNavigation: this.activeNavigation ? { ...this.activeNavigation, steps: [...(this.activeNavigation.steps ?? [])] } : null,
+      navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
+      slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
+      lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
       hostContract,
@@ -3964,11 +4342,7 @@ class TalkEnhancerV3App {
     this.window?.removeEventListener?.("popstate", this.boundRoute);
     this.window?.removeEventListener?.("hashchange", this.boundRoute);
     this.document?.removeEventListener?.("click", this.boundConversationSelect, true);
-    if (this.conversationSelectTimer != null) {
-      const clear = this.window?.clearTimeout ?? clearTimeout;
-      clear(this.conversationSelectTimer);
-      this.conversationSelectTimer = null;
-    }
+    this.clearConversationSelectTimer();
     if (this.refreshFrame != null && typeof this.window?.cancelAnimationFrame === "function") this.window.cancelAnimationFrame(this.refreshFrame);
     this.host?.destroy?.();
     this.shell?.destroy?.();
@@ -3989,6 +4363,67 @@ function registerBundle(windowRef = globalThis.window) {
 }
 
 if (typeof window !== "undefined") registerBundle(window);
+
+function isSlowNavigationStep(step = {}) {
+  const elapsedMs = Number(step?.elapsedMs) || 0;
+  const waitMs = Number(step?.waitMs) || 0;
+  if (step?.mode === "chat-progressive") return elapsedMs >= 100;
+  if (step?.mode === "work-wheel") return elapsedMs >= Math.max(180, waitMs * 1.5);
+  return elapsedMs >= Math.max(100, waitMs * 1.5);
+}
+
+function sanitizeSlowNavigationHistory(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(sanitizeSlowNavigationRecord).filter(Boolean).slice(-SLOW_NAVIGATION_HISTORY_LIMIT);
+}
+
+function sanitizeSlowNavigationRecord(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const cleanStep = (step) => step && typeof step === "object" ? {
+    mode: String(step.mode ?? "unknown"),
+    direction: Number(step.direction) || 0,
+    elapsedMs: Math.round(Number(step.elapsedMs) || 0),
+    jumpPx: Math.round(Number(step.jumpPx) || 0),
+    waitMs: Math.round(Number(step.waitMs) || 0),
+    targetOrder: Number.isFinite(step.targetOrder) ? Number(step.targetOrder) : null,
+    progressKind: String(step.progressKind ?? "none"),
+    before: sanitizeTraceSnapshot(step.before),
+    after: sanitizeTraceSnapshot(step.after)
+  } : null;
+  return {
+    runId: Number(value.runId) || 0,
+    targetOrder: Number.isFinite(value.targetOrder) ? Number(value.targetOrder) : null,
+    targetLabel: typeof value.targetLabel === "string" ? value.targetLabel : null,
+    host: typeof value.host === "string" ? value.host : null,
+    source: typeof value.source === "string" ? value.source : null,
+    startedAt: typeof value.startedAt === "string" ? value.startedAt : null,
+    finishedAt: typeof value.finishedAt === "string" ? value.finishedAt : null,
+    totalElapsedMs: Math.round(Number(value.totalElapsedMs) || 0),
+    resultElapsedMs: Number.isFinite(value.resultElapsedMs) ? Math.round(Number(value.resultElapsedMs)) : null,
+    status: typeof value.status === "string" ? value.status : null,
+    reason: typeof value.reason === "string" ? value.reason : null,
+    ok: Boolean(value.ok),
+    verified: Boolean(value.verified),
+    slowestStep: cleanStep(value.slowestStep),
+    slowSteps: (Array.isArray(value.slowSteps) ? value.slowSteps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT),
+    steps: (Array.isArray(value.steps) ? value.steps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT)
+  };
+}
+
+function sanitizeTraceSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  return {
+    visibleRange: snapshot.visibleRange && Number.isFinite(snapshot.visibleRange.min) && Number.isFinite(snapshot.visibleRange.max)
+      ? { min: Number(snapshot.visibleRange.min), max: Number(snapshot.visibleRange.max) }
+      : null,
+    scrollHeight: Math.round(Number(snapshot.scrollHeight) || 0),
+    logicalPosition: Math.round(Number(snapshot.logicalPosition) || 0)
+  };
+}
+
+function cloneSlowNavigationRecord(record) {
+  return record ? JSON.parse(JSON.stringify(record)) : null;
+}
 
 function appNowMs(windowRef = globalThis.window) {
   const value = Number(windowRef?.performance?.now?.());

@@ -161,7 +161,8 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
     visibleRange: { min: 4, max: 9 },
     scrollHeight: 42000,
     maxLogicalPosition: 41000,
-    logicalPosition: 3800
+    logicalPosition: 3800,
+    steps: [{ mode: "chat-progressive", elapsedMs: 184, jumpPx: 3200, waitMs: 8, progressKind: "extent", before: { visibleRange: { min: 20, max: 25 } }, after: { visibleRange: { min: 17, max: 22 } } }]
   });
   await app.navigate("q1");
   assert.equal(app.lastNavigation.reason, "navigation-hard-limit");
@@ -170,11 +171,14 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
   assert.equal(app.lastNavigation.budgetLimit, "absolute-time");
   assert.deepEqual(app.lastNavigation.visibleRange, { min: 4, max: 9 });
   assert.equal(app.status().navigation.scrollHeight, 42000);
+  assert.equal(app.lastNavigation.steps.length, 1);
+  assert.equal(app.lastNavigation.steps[0].mode, "chat-progressive");
+  assert.equal(app.lastNavigation.steps[0].elapsedMs, 184);
 });
 test("debug status exposes requested v3 runtime fields", () => {
   const { app } = createHarness();
   const status = app.status();
-  assert.equal(status.version, "0.5.0");
+  assert.equal(status.version, "0.5.1");
   assert.deepEqual(status.conversationIdentity, { id: "A", source: "test", host: "test", kind: "conversation", stable: true });
   assert.equal(status.host, "codex-desktop");
   assert.equal(status.hostContract.revision, "codex-desktop-v1");
@@ -285,6 +289,91 @@ test("sidebar conversation click settles after Desktop selection transition", ()
   app.handleConversationSelect({ target: { closest: () => ({ getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? "local:test" : null }) } });
   assert.deepEqual(calls, ["conversation-select", "conversation-select-settled"]);
   assert.equal(app.localNavigationSettleUntil, 1500);
+});
+
+test("ChatGPT sidebar click retries delayed identity before restoring Timeline cache", () => {
+  const storage = new MemoryStorageAdapter();
+  const cache = new TimelineCache({ storage });
+  cache.save("B", Array.from({ length: 76 }, (_, order) => ({ id: `q${order + 1}`, order, text: `Cached B ${order + 1}` })));
+  const { app, host, shellState, setConversationId } = createHarness({ storage });
+  const timers = [];
+  const delays = [];
+  app.window = {
+    performance: { now: () => 1000 },
+    requestAnimationFrame(callback) { callback(); return 99; },
+    setTimeout(callback, delay) { timers.push(callback); delays.push(delay); return timers.length; },
+    clearTimeout() {}
+  };
+  const row = {
+    getAttribute(name) {
+      if (name === "data-sidebar-chatgpt-conversation-key") return "chatgpt:conversation:B";
+      return null;
+    }
+  };
+  app.handleConversationSelect({ target: { closest: () => row } });
+  assert.equal(app.currentConversationId, "A");
+  assert.deepEqual(delays, [240]);
+
+  timers.shift()();
+  assert.equal(app.currentConversationId, "A");
+  assert.deepEqual(delays, [240, 600]);
+
+  setConversationId("B");
+  timers.shift()();
+  assert.equal(app.currentConversationId, "B");
+  assert.equal(shellState.turns.length, 76);
+  assert.equal(app.status().timeline.cacheRestoredTurns, 76);
+  assert.deepEqual(delays, [240, 600]);
+});
+
+test("stable ChatGPT identity authorizes mounted fast settle", async () => {
+  const { app, host } = createHarness();
+  host.getConversationIdentity = () => ({ id: "chatgpt-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true });
+  let received = null;
+  host.navigateToTurn = async (_turnId, context) => { received = context; return { ok: true, verified: true, target: "q22", settleMode: "mounted-fast" }; };
+  await app.navigate("q22");
+  assert.equal(received.allowMountedFastSettle, true);
+  assert.equal(app.status().navigation.settleMode, "mounted-fast");
+});
+
+test("slow navigation diagnostics persist automatically without conversation identifiers", async () => {
+  const storage = new MemoryStorageAdapter();
+  const { app, host } = createHarness({ storage });
+  host.getConversationIdentity = () => ({ id: "private-conversation-id", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true });
+  const step = {
+    mode: "chat-progressive", direction: -1, elapsedMs: 181, jumpPx: 4320, waitMs: 8, targetOrder: 21, progressKind: "window",
+    before: { visibleRange: { min: 12, max: 17 }, scrollHeight: 50000, logicalPosition: 12000 },
+    after: { visibleRange: { min: 9, max: 14 }, scrollHeight: 53000, logicalPosition: 7680 }
+  };
+  host.navigateToTurn = async (_turnId, context) => {
+    context.onTraceStep?.(step, [step]);
+    return { ok: true, verified: true, reason: "ok", steps: [step] };
+  };
+  await app.navigate("q22");
+  const saved = storage.read("gte.v3.navigation-diagnostics", []);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].host, "chatgpt");
+  assert.equal(saved[0].targetOrder, 21);
+  assert.equal(saved[0].targetLabel, "Q22");
+  assert.equal(saved[0].slowSteps[0].elapsedMs, 181);
+  assert.equal("conversationId" in saved[0], false);
+  assert.equal("target" in saved[0], false);
+  assert.equal(app.status().lastSlowNavigation.slowestStep.elapsedMs, 181);
+
+  const { app: restored } = createHarness({ storage });
+  assert.equal(restored.status().slowNavigationHistory.length, 1);
+  assert.equal(restored.status().lastSlowNavigation.targetLabel, "Q22");
+});
+
+test("fast navigation does not pollute persisted slow diagnostics", async () => {
+  const storage = new MemoryStorageAdapter();
+  const { app, host } = createHarness({ storage });
+  host.getConversationIdentity = () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true });
+  const step = { mode: "chat-progressive", direction: -1, elapsedMs: 62, jumpPx: 4320, waitMs: 8, targetOrder: 0, progressKind: "window", before: null, after: null };
+  host.navigateToTurn = async (_turnId, context) => { context.onTraceStep?.(step, [step]); return { ok: true, verified: true, reason: "ok", steps: [step] }; };
+  await app.navigate("q1");
+  assert.deepEqual(storage.read("gte.v3.navigation-diagnostics", []), []);
+  assert.equal(app.status().lastSlowNavigation, null);
 });
 
 test("Local Work navigation waits for the short host restore settle window", async () => {

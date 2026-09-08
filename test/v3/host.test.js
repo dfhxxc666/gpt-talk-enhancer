@@ -7,7 +7,7 @@ import { ConversationAdapter, isStableLocalThreadIdentity, parseSidebarConversat
 import { CodexDesktopHost, computeTailActiveTurnId } from "../../src/v3/host/codex-desktop/codex-host.js";
 import { SurfaceDetector } from "../../src/v3/host/codex-desktop/surface-detector.js";
 import { ComposerAdapter } from "../../src/v3/host/codex-desktop/composer-adapter.js";
-import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
+import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, hydrationJumpScale, chatFarCoalescedJump, workWheelStepSize, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
 import { evaluateHostContract, classifyTurnIdMode, HOST_CONTRACT_REVISION } from "../../src/v3/host/codex-desktop/host-contract.js";
 import { FakeDocument, FakeElement, fakeWindow } from "./fake-dom.js";
 
@@ -275,6 +275,287 @@ test("rendered navigation verifies live UUID", async () => {
   const result = await nav.navigateToTurn("q17", { turns: [{ id: "q17", order: 16 }] });
   assert.equal(result.ok, true);
   assert.equal(result.verified, true);
+});
+
+test("already-mounted stable target uses guarded fast settle", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 250, left: 0, right: 800, width: 800, height: 90 };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 5000;
+  container.scrollTop = 1200;
+  const turnAdapter = {
+    resolveTurn: (id) => id === "q17" ? target : null,
+    verifyTurnElement: (id, element) => id === "q17" && element === target,
+    getVisibleTurns: () => [{ id: "q17", order: 16 }]
+  };
+  const nav = new NavigationAdapter({
+    window, turnAdapter, conversationAdapter: { getScrollContainer: () => container },
+    mountedFastSettleWaitMs: 5, postSettleWaitMs: 30, maxPostSettleCorrections: 2
+  });
+  const started = Date.now();
+  const result = await nav.navigateToTurn("q17", { turns: [{ id: "q17", order: 16 }], allowMountedFastSettle: true });
+  const wallMs = Date.now() - started;
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.settleMode, "mounted-fast");
+  assert.equal(result.settleChecks, 1);
+  assert.ok(wallMs < 45, "expected fast settle to avoid two 30ms waits, got " + wallMs + "ms");
+});
+
+test("mounted fast settle falls back to full correction when drift appears", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 260, left: 0, right: 800, width: 800, height: 100 };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 5000;
+  let physicalScrollTop = 1200;
+  let corrections = 0;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalScrollTop,
+    set: (value) => { physicalScrollTop = value; corrections += 1; target.rect = { top: 160, bottom: 260, left: 0, right: 800, width: 800, height: 100 }; },
+    configurable: true
+  });
+  const turnAdapter = {
+    resolveTurn: (id) => id === "q4" ? target : null,
+    verifyTurnElement: (id, element) => id === "q4" && element === target,
+    getVisibleTurns: () => [{ id: "q4", order: 3 }]
+  };
+  window.setTimeout(() => { target.rect = { top: 310, bottom: 410, left: 0, right: 800, width: 800, height: 100 }; }, 2);
+  const nav = new NavigationAdapter({
+    window, turnAdapter, conversationAdapter: { getScrollContainer: () => container },
+    mountedFastSettleWaitMs: 8, postSettleWaitMs: 8, maxPostSettleCorrections: 2
+  });
+  const result = await nav.navigateToTurn("q4", { turns: [{ id: "q4", order: 3 }], allowMountedFastSettle: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.notEqual(result.settleMode, "mounted-fast");
+  assert.ok(corrections >= 1);
+});
+
+test("target discovered by hydration keeps the full settle path", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 250, left: 0, right: 800, width: 800, height: 90 };
+  let stage = 0;
+  const turnAdapter = {
+    resolveTurn: (id) => stage >= 1 && id === "q1" ? target : null,
+    verifyTurnElement: (id, element) => id === "q1" && element === target,
+    getVisibleTurns: () => stage >= 1 ? [{ id: "q1", order: 0 }] : [{ id: "q2", order: 1 }]
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 3000;
+  let top = 1600;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => top,
+    set: (value) => { top = value; stage = 1; },
+    configurable: true
+  });
+  const nav = new NavigationAdapter({
+    window, turnAdapter, conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "chatgpt" }) },
+    mountedFastSettleWaitMs: 5, postSettleWaitMs: 2, maxPostSettleCorrections: 1, hydrationWaitMs: 5
+  });
+  const result = await nav.navigateToTurn("q1", { turns: [{ id: "q1", order: 0 }, { id: "q2", order: 1 }], allowMountedFastSettle: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.notEqual(result.settleMode, "mounted-fast");
+});
+
+test("ChatGPT Earlier boundary renews only after structural progress", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const delays = [];
+  let boundaryCalls = 0;
+  let targetReady = false;
+  const realSetTimeout = globalThis.setTimeout;
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 5000;
+  container.scrollTop = -4199;
+  window.setTimeout = (callback, ms) => {
+    delays.push(ms);
+    return realSetTimeout(() => {
+      if (ms === 1800) {
+        boundaryCalls += 1;
+        if (boundaryCalls === 1) container.scrollHeight = 8000;
+        if (boundaryCalls === 2) targetReady = true;
+      }
+      callback();
+    }, 0);
+  };
+  window.clearTimeout = clearTimeout;
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 250, left: 0, right: 800, width: 800, height: 90 };
+  const turnAdapter = {
+    resolveTurn: (id) => targetReady && id === "q1" ? target : null,
+    verifyTurnElement: (id, element) => id === "q1" && element === target,
+    getVisibleTurns: () => targetReady ? [{ id: "q1", order: 0 }, { id: "q2", order: 1 }] : [{ id: "q2", order: 1 }, { id: "q3", order: 2 }]
+  };
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "chatgpt", source: "sidebar-chatgpt" }) },
+    chatMotionProgressWaitMs: 8, chatBoundaryHydrationWaitMs: 1800, hydrationWaitMs: 900, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const result = await nav.navigateToTurn("q1", { turns: [{ id: "q1", order: 0 }, { id: "q2", order: 1 }, { id: "q3", order: 2 }] });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(delays.filter((ms) => ms === 1800).length, 2);
+  const boundaries = result.steps.filter((step) => step.mode === "chat-boundary");
+  assert.equal(boundaries.length, 2);
+  assert.equal(boundaries[0]?.progressKind, "extent");
+  assert.equal(boundaries[1]?.progressKind, "target");
+});
+
+test("ChatGPT Earlier boundary does not renew without structural progress", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const delays = [];
+  const realSetTimeout = globalThis.setTimeout;
+  window.setTimeout = (callback, ms) => { delays.push(ms); return realSetTimeout(callback, 0); };
+  window.clearTimeout = clearTimeout;
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 5000;
+  container.scrollTop = -4199;
+  const turnAdapter = {
+    resolveTurn: () => null,
+    verifyTurnElement: () => false,
+    getVisibleTurns: () => [{ id: "q2", order: 1 }, { id: "q3", order: 2 }]
+  };
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "chatgpt", source: "sidebar-chatgpt" }) },
+    chatMotionProgressWaitMs: 8, chatBoundaryHydrationWaitMs: 1800, hydrationWaitMs: 900,
+    maxConsecutiveStalls: 1, absoluteMaxNavigationMs: 10000, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const result = await nav.navigateToTurn("q1", { turns: [{ id: "q1", order: 0 }, { id: "q2", order: 1 }, { id: "q3", order: 2 }] });
+  assert.equal(result.ok, false);
+  assert.equal(delays.filter((ms) => ms === 1800).length, 1);
+  assert.equal(result.steps.filter((step) => step.mode === "chat-boundary").length, 1);
+});
+
+test("ChatGPT regular hydration uses the shorter motion gate", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const delays = [];
+  let motionReady = false;
+  const realSetTimeout = globalThis.setTimeout;
+  window.setTimeout = (callback, ms) => {
+    delays.push(ms);
+    return realSetTimeout(() => { if (ms === 7) motionReady = true; callback(); }, 0);
+  };
+  window.clearTimeout = clearTimeout;
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 250, left: 0, right: 800, width: 800, height: 90 };
+  const turnAdapter = {
+    resolveTurn: (id) => motionReady && id === "q1" ? target : null,
+    verifyTurnElement: (id, element) => id === "q1" && element === target,
+    getVisibleTurns: () => [{ id: "q2", order: 1 }]
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 4000;
+  container.scrollTop = 2200;
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "chatgpt", source: "sidebar-chatgpt" }) },
+    motionProgressWaitMs: 45, chatMotionProgressWaitMs: 7, hydrationWaitMs: 200, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const result = await nav.navigateToTurn("q1", { turns: [{ id: "q1", order: 0 }, { id: "q2", order: 1 }] });
+  assert.equal(result.ok, true);
+  assert.ok(delays.includes(7));
+  assert.equal(delays.includes(45), false);
+  assert.ok(Array.isArray(result.steps));
+  assert.equal(result.steps.at(-1)?.mode, "chat-progressive");
+  assert.equal(result.steps.at(-1)?.waitMs, 7);
+  assert.equal(result.steps.at(-1)?.progressKind, "target");
+  assert.equal(typeof result.steps.at(-1)?.elapsedMs, "number");
+});
+
+test("Local regular hydration keeps the default motion gate", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const delays = [];
+  let motionReady = false;
+  const realSetTimeout = globalThis.setTimeout;
+  window.setTimeout = (callback, ms) => {
+    delays.push(ms);
+    return realSetTimeout(() => { if (ms === 45) motionReady = true; callback(); }, 0);
+  };
+  window.clearTimeout = clearTimeout;
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 250, left: 0, right: 800, width: 800, height: 90 };
+  const turnAdapter = {
+    resolveTurn: (id) => motionReady && id === "q5" ? target : null,
+    verifyTurnElement: (id, element) => id === "q5" && element === target,
+    getVisibleTurns: () => [{ id: "q1", order: 0 }, { id: "q2", order: 1 }]
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 4000;
+  container.scrollTop = -1200;
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "local", source: "sidebar-local" }) },
+    motionProgressWaitMs: 45, chatMotionProgressWaitMs: 7, hydrationWaitMs: 200, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const turns = Array.from({ length: 8 }, (_, order) => ({ id: "q" + (order + 1), order }));
+  const result = await nav.navigateToTurn("q5", { turns });
+  assert.equal(result.ok, true);
+  assert.ok(delays.includes(45));
+  assert.equal(delays.includes(7), false);
+  assert.equal(result.steps.at(-1)?.mode, "regular-progressive");
+  assert.equal(result.steps.at(-1)?.waitMs, 45);
+});
+
+test("ChatGPT Earlier jump adapts to target distance without affecting Work", () => {
+  assert.equal(hydrationJumpScale({ host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 8, chatEarlierJumpScale: 1.35 }), 1.35);
+  assert.equal(hydrationJumpScale({ host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 28, chatEarlierJumpScale: 1.35 }), 1.55);
+  assert.equal(hydrationJumpScale({ host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 60, chatEarlierJumpScale: 1.35 }), 1.75);
+  assert.equal(hydrationJumpScale({ host: "chatgpt", direction: 1, targetBeforeVisible: false, targetDistance: 60, chatEarlierJumpScale: 1.35 }), 1);
+  assert.equal(hydrationJumpScale({ host: "local", direction: -1, targetBeforeVisible: true, targetDistance: 60, chatEarlierJumpScale: 1.35 }), 1);
+});
+
+test("ChatGPT far Earlier coalesces only while far from target and boundary", () => {
+  const far = chatFarCoalescedJump({ baseJump: 5600, host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000, minLogicalPosition: 0, stalled: false });
+  assert.equal(far.coalesced, true);
+  assert.equal(far.jumpPx, 7560);
+  const capped = chatFarCoalescedJump({ baseJump: 7000, host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000, minLogicalPosition: 0, stalled: false });
+  assert.equal(capped.jumpPx, 7600);
+  assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 20, logicalPosition: 40000 }).coalesced, false);
+  assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 8000 }).coalesced, false);
+  assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "chatgpt", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000, stalled: true }).coalesced, false);
+  assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "local", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000 }).coalesced, false);
+});
+
+test("Work Earlier wheel step adapts to distance while preserving short-history and boundary safety", () => {
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 10, targetDistance: 60, logicalPosition: 5000 }), 400);
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 10, logicalPosition: 5000 }), 720);
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 30, logicalPosition: 5000 }), 864);
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 5000 }), 972);
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 500 }), 500);
+});
+
+test("accelerated Work cadence keeps the conservative boundary wait", () => {
+  const nav = new NavigationAdapter({ window: fakeWindow(), turnAdapter: {}, conversationAdapter: {} });
+  assert.equal(nav.workWheelWaitMs, 120);
+  assert.equal(nav.hydrationWaitMs, 900);
 });
 
 test("navigation resolves canonical capture id through fallback-turn order", async () => {
