@@ -5,3 +5,6 @@ coverage/
 Thumbs.db
 .env*
 !.env.example
+
+# Project Relay local test fixtures
+runtime/context/test-fixtures/

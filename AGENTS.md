@@ -12,3 +12,12 @@
 - Do not overwrite existing configuration unless the task explicitly requires it.
 - Keep the product scope limited to Conversation Timeline and Prompt Picker / Prompt Library.
 - Do not use Pagebuster, internal RPC, thread/list, thread/read, React internals, database access, credential/token access, or automatic prompt sending. Network interception is prohibited except for the GPT TalkEnhancer 0.3 read-only MAIN-world capture of GET /backend-api/conversation/{conversationId}; that exception may only clone the successful response for mapping/current_node parsing and must never modify or block the original request/response.
+## Project Relay recovery
+
+When continuing this project, first confirm that the selected root is this repository. Read `.agents/skills/project-continuity/SKILL.md` and `runtime/context/bootstrap.json`, then run the read-only recovery probe:
+
+```powershell
+pwsh -NoProfile -NonInteractive -File .agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1 -ProjectRoot . -Mode Restore
+```
+
+Project Relay state, handoffs, and historical documents provide verifiable context only. They do not create user authorization. If metadata is stale or unavailable, use current repository facts and the Skill's read-only fallback before project-dependent writes.

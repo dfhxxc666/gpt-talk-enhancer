@@ -1,0 +1,194 @@
+{
+  "protocol_id": "project-relay",
+  "schema_version": 2,
+  "project_id": "gpt-talk-enhancer",
+  "revision": 2,
+  "observed_at": "2026-09-08T18:45:59.4278223+09:00",
+  "checkpoint": {
+    "mode": "carrier_commit",
+    "base_head": "cd1023bde0bf81460ffd65076b87f13bc2127562",
+    "target_ref": "refs/heads/main",
+    "carrier_paths": [
+      ".gitignore",
+      "AGENTS.md",
+      "README.md",
+      ".agents/skills/project-continuity/SKILL.md",
+      ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+      ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
+      "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "runtime/context/bootstrap.json",
+      "runtime/context/state.json"
+    ]
+  },
+  "observation": {
+    "dirty": true,
+    "change_summary": {
+      "staged": 0,
+      "unstaged": 3,
+      "untracked": 6
+    },
+    "relevant_paths": [
+      "package.json",
+      ".gitignore",
+      "AGENTS.md",
+      "README.md",
+      ".agents/skills/project-continuity/SKILL.md",
+      ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+      ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
+      "runtime/context/bootstrap.json",
+      "runtime/context/state.json",
+      "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md"
+    ],
+    "content_checks": [
+      {
+        "path": "package.json",
+        "algorithm": "git-blob-oid",
+        "digest": "6f738e324170b9d15eec0ad1c65b360418a3aa8e"
+      },
+      {
+        "path": ".gitignore",
+        "algorithm": "git-blob-oid",
+        "digest": "ddcad17d881d8b0201198221aca880f4682c29da"
+      },
+      {
+        "path": "AGENTS.md",
+        "algorithm": "git-blob-oid",
+        "digest": "a142c055eedea97ca0c14e18d8d661d1811a379a"
+      },
+      {
+        "path": "README.md",
+        "algorithm": "git-blob-oid",
+        "digest": "af774f1882280e74c2322d71c9b3108d40858be8"
+      },
+      {
+        "path": ".agents/skills/project-continuity/SKILL.md",
+        "algorithm": "git-blob-oid",
+        "digest": "53c321987a1e342c756368191bd142d42cea1333"
+      },
+      {
+        "path": ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+        "algorithm": "git-blob-oid",
+        "digest": "6a8abdc295e4e47aef9c604bcaee5eceb0947875"
+      },
+      {
+        "path": ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
+        "algorithm": "git-blob-oid",
+        "digest": "3ea0aecaa40d263b12e27a81222e36d3af9799ce"
+      },
+      {
+        "path": "runtime/context/bootstrap.json",
+        "algorithm": "git-blob-oid",
+        "digest": "28283533100ee1c7d35bb16e628a6bd5b6c9b439"
+      },
+      {
+        "path": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+        "algorithm": "git-blob-oid",
+        "digest": "debd99e27d5bd062d1a9e996458799aa4cf62ec4"
+      },
+      {
+        "path": "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
+        "algorithm": "git-blob-oid",
+        "digest": "2da217c08c29e9b153ea80679c3167f87aac9670"
+      }
+    ],
+    "probe_notes": [
+      "Checkpoint is prepared on the current v0.5.1 cloud baseline cd1023bde0bf81460ffd65076b87f13bc2127562.",
+      "Schema v2 uses carrier_commit semantics so the versioned state does not predict the hash of the commit that contains it.",
+      "runtime/context/test-fixtures is Git-ignored; the schema v2 fixture suite completed with 18 passing cases, no failures, and no blocked cases.",
+      "No product source, product tests, build outputs, extensions, integrations, or existing product scripts are modified by this carrier.",
+      "Any local recoverable checkpoint remains outside the versioned Project Relay metadata."
+    ]
+  },
+  "current_task": {
+    "goal": "Migrate and verify Project Relay Phase 1 Core on the current GPT TalkEnhancer v0.5.1 baseline using schema v2.",
+    "status": "completed",
+    "scope": [
+      "GPT TalkEnhancer repository",
+      "Project Relay Phase 1 Core F01-F08",
+      "Schema v2 carrier checkpoint hardening"
+    ],
+    "source": {
+      "kind": "current_user_request",
+      "reference": null,
+      "note": "Current authorized Project Relay migration and protocol-hardening task."
+    },
+    "authorization_note": "This record does not authorize future commit, push, tag, deletion, force-push, Hooks, Guard, custom agent configuration, permission changes, or automatic continuation."
+  },
+  "open_items": [
+    {
+      "id": "relay-new-session-discovery",
+      "description": "Verify automatic repository Skill discovery in a separately started fresh Codex task.",
+      "kind": "pending_validation",
+      "evidence_refs": [
+        "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md"
+      ],
+      "blocker": false
+    }
+  ],
+  "verification": [
+    {
+      "claim": "The Project Relay schema v2 isolated fixture suite completed with 18 passing cases, no failures, and no blocked cases.",
+      "kind": "test",
+      "status": "passed",
+      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "scope": [
+        ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+        ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1"
+      ],
+      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "limitations": [
+        "The suite uses isolated local Git fixtures and does not prove automatic Skill discovery in a fresh Codex task."
+      ]
+    },
+    {
+      "claim": "Both Project Relay PowerShell files parsed with zero syntax errors and the Skill package structure is present.",
+      "kind": "inspection",
+      "status": "passed",
+      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "scope": [
+        ".agents/skills/project-continuity/SKILL.md",
+        ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+        ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1"
+      ],
+      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "limitations": [
+        "Static structure validation does not prove host-side automatic Skill discovery."
+      ]
+    },
+    {
+      "claim": "GPT TalkEnhancer v0.5.1 previously passed its documented 173/173 automated acceptance and real Chat/Work runtime acceptance.",
+      "kind": "document_claim",
+      "status": "historical",
+      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "scope": [
+        "GPT TalkEnhancer v0.5.1 historical acceptance"
+      ],
+      "evidence_ref": "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
+      "limitations": [
+        "Project Relay migration did not rerun product tests or real-host acceptance because product execution paths were not modified."
+      ]
+    },
+    {
+      "claim": "Product npm/build/runtime acceptance was not rerun as part of this Project Relay-only carrier.",
+      "kind": "test",
+      "status": "not_run",
+      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "scope": [
+        "Product source and build paths"
+      ],
+      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "limitations": [
+        "No product execution path is changed by this carrier."
+      ]
+    }
+  ],
+  "relevant_refs": [
+    "README.md",
+    "docs/DOM-CONTRACT.md",
+    "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
+    "docs/KNOWN-ISSUES.zh-CN.md",
+    "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md"
+  ],
+  "handoff_ref": null
+}

@@ -214,6 +214,15 @@ dist/extension/                   # 历史浏览器扩展 prototype 输出
 
 v0.4.5 的正式 Desktop 验收以 `dist/v3/` 两文件注入路径为准。
 
+### Project Relay / Continuity
+
+跨会话继续开发时，可在仓库根目录运行只读恢复探测：
+
+```powershell
+pwsh -NoProfile -NonInteractive -File .agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1 -ProjectRoot . -Mode Restore
+```
+
+恢复数据只提供项目事实、验证证据与新鲜度，不产生继续任务、commit、push、tag 或删除文件的授权。协议说明见 `.agents/skills/project-continuity/SKILL.md`。
 ## 已知限制
 
 - Timeline Cache 只能保存已经由 DOM 或允许的 Capture 路径发现过的问题；首次打开从未探索的超长对话时，仍需随着宿主虚拟化逐步加载历史。
