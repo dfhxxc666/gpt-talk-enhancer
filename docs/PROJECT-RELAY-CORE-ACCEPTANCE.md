@@ -1,7 +1,7 @@
 # Project Relay Phase 1 Core 验收记录
 
-日期：2026-09-08
-状态：**PASS / SCHEMA V2 CARRIER CHECKPOINT**
+日期：2026-09-09
+状态：**PASS / SEALED / SCHEMA V2 + FRESH CODEX DISCOVERY**
 产品基线：**GPT TalkEnhancer v0.5.1 / `cd1023bde0bf81460ffd65076b87f13bc2127562`**
 
 ## 1. 验收结论
@@ -95,6 +95,21 @@ Schema v2 最终结果：**PASS=18、FAIL=0、BLOCKED=0**。
 
 测试 fixture 生成在 `runtime/context/test-fixtures/`，该目录已 Git ignore。测试本身不自动删除 fixture。
 
+### 4.3 Fresh Codex Skill 自动发现实机验收
+
+2026-09-09，用户在一个全新启动的 Codex 任务中，以当前仓库为工作目录执行只读恢复验收，未手工指定 Skill 路径。新任务报告：
+
+- `project-continuity` Skill：**自动发现并使用**；
+- branch / HEAD：`main` / `d3dfb60bc4662beb412ed7dbe68bb3f43261a441`；
+- staged / unstaged / untracked：`0 / 0 / 0`；
+- `metadata_status=valid`；
+- `checkpoint_state=committed`；
+- `freshness=matches`；
+- 当前任务状态正确恢复为 Project Relay Phase 1 Core / schema v2 迁移已完成；
+- 授权边界正确保持为只读恢复，没有把 state、handoff 或历史任务状态解释为新的写操作授权。
+
+该结果完成了此前唯一未覆盖的 Fresh Codex repository Skill 自动发现宿主集成检查。此项证据来自用户在独立新 Codex 任务中的实机验收报告，不冒充为隔离脚本或当前会话直接执行结果。
+
 ## 5. v0.5.1 产品基线
 
 当前公开产品基线为 v0.5.1，正式验收见 `docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md`：历史记录为 **173 / 173 PASS**，Chat/Work Navigation 性能与可靠性真实验收通过。
@@ -120,9 +135,8 @@ Project Relay 是事实与证据层，不是授权层。State、handoff、历史
 
 执行权限仍由当时用户请求和更高优先级规则决定。
 
-## 8. 未覆盖项和限制
+## 8. 剩余限制
 
-- 尚未在一个全新启动的 Codex 任务中验证仓库 Skill 的自动发现；这是独立宿主集成检查，不阻塞脚本、协议和 checkpoint 一致性。
 - 本次没有实施下一阶段 Hooks、Guard、自动写回或自定义 Agent。
 - 本次没有重新运行产品 `npm run check` 或真实宿主验收，因为产品代码、产品测试和构建路径未修改。
 

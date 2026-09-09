@@ -2,21 +2,14 @@
   "protocol_id": "project-relay",
   "schema_version": 2,
   "project_id": "gpt-talk-enhancer",
-  "revision": 2,
-  "observed_at": "2026-09-08T18:45:59.4278223+09:00",
+  "revision": 3,
+  "observed_at": "2026-09-09T11:13:10.3465128+09:00",
   "checkpoint": {
     "mode": "carrier_commit",
-    "base_head": "cd1023bde0bf81460ffd65076b87f13bc2127562",
+    "base_head": "d3dfb60bc4662beb412ed7dbe68bb3f43261a441",
     "target_ref": "refs/heads/main",
     "carrier_paths": [
-      ".gitignore",
-      "AGENTS.md",
-      "README.md",
-      ".agents/skills/project-continuity/SKILL.md",
-      ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
-      ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
       "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
-      "runtime/context/bootstrap.json",
       "runtime/context/state.json"
     ]
   },
@@ -24,8 +17,8 @@
     "dirty": true,
     "change_summary": {
       "staged": 0,
-      "unstaged": 3,
-      "untracked": 6
+      "unstaged": 2,
+      "untracked": 0
     },
     "relevant_paths": [
       "package.json",
@@ -84,7 +77,7 @@
       {
         "path": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
         "algorithm": "git-blob-oid",
-        "digest": "debd99e27d5bd062d1a9e996458799aa4cf62ec4"
+        "digest": "0db37cbd79f75c8921424f3cf373e1cf2da129ad"
       },
       {
         "path": "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
@@ -93,39 +86,28 @@
       }
     ],
     "probe_notes": [
-      "Checkpoint is prepared on the current v0.5.1 cloud baseline cd1023bde0bf81460ffd65076b87f13bc2127562.",
-      "Schema v2 uses carrier_commit semantics so the versioned state does not predict the hash of the commit that contains it.",
-      "runtime/context/test-fixtures is Git-ignored; the schema v2 fixture suite completed with 18 passing cases, no failures, and no blocked cases.",
-      "No product source, product tests, build outputs, extensions, integrations, or existing product scripts are modified by this carrier.",
-      "Any local recoverable checkpoint remains outside the versioned Project Relay metadata."
+      "Revision 3 seals Project Relay Phase 1 Core after Fresh Codex repository Skill auto-discovery acceptance.",
+      "The checkpoint is prepared directly on d3dfb60bc4662beb412ed7dbe68bb3f43261a441 and carries only the acceptance document plus state metadata.",
+      "A separately started Fresh Codex task reported automatic discovery and use of project-continuity with main at d3dfb60, a clean worktree, metadata_status=valid, checkpoint_state=committed, and freshness=matches.",
+      "Fresh Codex discovery evidence is recorded as a user-reported runtime acceptance result; it is not represented as an isolated-script result.",
+      "No product execution paths are changed by this sealing checkpoint."
     ]
   },
   "current_task": {
-    "goal": "Migrate and verify Project Relay Phase 1 Core on the current GPT TalkEnhancer v0.5.1 baseline using schema v2.",
+    "goal": "Seal Project Relay Phase 1 Core schema v2 after successful Fresh Codex Skill auto-discovery acceptance.",
     "status": "completed",
     "scope": [
-      "GPT TalkEnhancer repository",
-      "Project Relay Phase 1 Core F01-F08",
-      "Schema v2 carrier checkpoint hardening"
+      "Project Relay acceptance metadata",
+      "Fresh Codex repository Skill discovery closure"
     ],
     "source": {
       "kind": "current_user_request",
       "reference": null,
-      "note": "Current authorized Project Relay migration and protocol-hardening task."
+      "note": "User approved final Project Relay sealing after the independent Fresh Codex discovery acceptance passed."
     },
-    "authorization_note": "This record does not authorize future commit, push, tag, deletion, force-push, Hooks, Guard, custom agent configuration, permission changes, or automatic continuation."
+    "authorization_note": "This record documents completed work only and does not authorize future commit, push, tag, deletion, force-push, Hooks, Guard, custom agent configuration, permission changes, or automatic continuation."
   },
-  "open_items": [
-    {
-      "id": "relay-new-session-discovery",
-      "description": "Verify automatic repository Skill discovery in a separately started fresh Codex task.",
-      "kind": "pending_validation",
-      "evidence_refs": [
-        "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md"
-      ],
-      "blocker": false
-    }
-  ],
+  "open_items": [],
   "verification": [
     {
       "claim": "The Project Relay schema v2 isolated fixture suite completed with 18 passing cases, no failures, and no blocked cases.",
@@ -180,6 +162,20 @@
       "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
       "limitations": [
         "No product execution path is changed by this carrier."
+      ]
+    },
+    {
+      "claim": "A separately started Fresh Codex task automatically discovered and used the repository project-continuity Skill, then restored main at d3dfb60 with a clean worktree, metadata_status=valid, checkpoint_state=committed, and freshness=matches.",
+      "kind": "runtime",
+      "status": "passed",
+      "observed_at": "2026-09-09T11:13:10.3465128+09:00",
+      "scope": [
+        "Fresh Codex repository Skill auto-discovery",
+        "Project Relay read-only restore"
+      ],
+      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "limitations": [
+        "This runtime acceptance result was reported by the user from the separate fresh Codex task; it was not executed by the isolated fixture suite or by this sealing command."
       ]
     }
   ],
