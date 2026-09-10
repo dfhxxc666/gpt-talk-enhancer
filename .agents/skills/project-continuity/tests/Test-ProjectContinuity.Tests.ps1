@@ -12,8 +12,7 @@ $ErrorActionPreference = 'Stop'
 $results = [System.Collections.Generic.List[object]]::new()
 $resolvedProbe = (Resolve-Path -LiteralPath $ProbeScriptPath).Path
 $resolvedTestRoot = [IO.Path]::GetFullPath($TestRoot)
-$runRoot = Join-Path $resolvedTestRoot ("run-{0}-{1}" -f [DateTimeOffset]::Now.ToString('yyyyMMddTHHmmssfff'), [Guid]::NewGuid().ToString('N'))
-$null = New-Item -ItemType Directory -Path $runRoot -Force
+$script:testProjectRoot = $null
 
 function Add-TestResult {
     param([string]$Name, [ValidateSet('PASS','FAIL','BLOCKED')][string]$Status, [string]$Detail)
@@ -21,23 +20,59 @@ function Add-TestResult {
 }
 
 function Invoke-Native {
-    param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory)
+    param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory, [int]$TimeoutMs = 20000, [int]$MaxOutputChars = 1048576)
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $FilePath
     $start.WorkingDirectory = $WorkingDirectory
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $start.CreateNoWindow = $true
     foreach ($argument in $Arguments) { $null = $start.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start; $null = $process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd(); $process.WaitForExit()
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'PROCESS_START_FAILED|Test subprocess did not start.' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            try { $process.Kill($true) } catch { }
+            try { $null = $process.WaitForExit(2000) } catch { }
+            throw ('PROCESS_TIMEOUT|Test subprocess exceeded ' + $TimeoutMs + 'ms.')
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult(); $stderr = $stderrTask.GetAwaiter().GetResult()
+        if (($stdout.Length + $stderr.Length) -gt $MaxOutputChars) { throw ('PROCESS_OUTPUT_LIMIT|Test subprocess output exceeded ' + $MaxOutputChars + ' characters.') }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    } finally { $process.Dispose() }
 }
 
+$gitApplication = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$probeDirectory = Split-Path -Parent $resolvedProbe
+$projectRootProbe = Invoke-Native $gitApplication.Source @('-c','core.fsmonitor=false','--no-optional-locks','-C',$probeDirectory,'rev-parse','--show-toplevel') $probeDirectory
+if ($projectRootProbe.ExitCode -ne 0) { throw 'TEST_ROOT_PROJECT_UNKNOWN|Could not resolve the project root that owns the probe script.' }
+$script:testProjectRoot = [IO.Path]::GetFullPath($projectRootProbe.Stdout.Trim()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+$allowedTestRoot = [IO.Path]::GetFullPath((Join-Path $script:testProjectRoot 'runtime/context/test-fixtures')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+$allowedPrefix = $allowedTestRoot + [IO.Path]::DirectorySeparatorChar
+if (-not ($resolvedTestRoot.Equals($allowedTestRoot,[StringComparison]::OrdinalIgnoreCase) -or $resolvedTestRoot.StartsWith($allowedPrefix,[StringComparison]::OrdinalIgnoreCase))) {
+    throw 'TEST_ROOT_OUTSIDE_PROJECT|TestRoot must be runtime/context/test-fixtures or a child inside the selected project.'
+}
+$relativeTestRoot = [IO.Path]::GetRelativePath($script:testProjectRoot,$resolvedTestRoot)
+$currentTestPath = $script:testProjectRoot
+foreach ($part in ($relativeTestRoot -split '[\/]')) {
+    if ([string]::IsNullOrWhiteSpace($part) -or $part -eq '.') { continue }
+    $currentTestPath = Join-Path $currentTestPath $part
+    if (Test-Path -LiteralPath $currentTestPath) {
+        $item = Get-Item -LiteralPath $currentTestPath -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_ROOT_REPARSE_POINT|TestRoot crosses a reparse point.' }
+    }
+}
+$runRoot = Join-Path $resolvedTestRoot ('r-' + [Guid]::NewGuid().ToString('N').Substring(0,8))
+$null = New-Item -ItemType Directory -Path $runRoot -Force
+$script:fixtureCounter = 0
+
 function Invoke-Probe {
-    param([string]$ProjectRoot, [string]$Mode = 'Restore', [int]$MaxBootstrapBytes = 8192)
-    $args = @('-NoProfile','-NonInteractive','-File',$resolvedProbe,'-ProjectRoot',$ProjectRoot,'-Mode',$Mode,'-MaxBootstrapBytes',[string]$MaxBootstrapBytes)
+    param([string]$ProjectRoot, [string]$Mode = 'Restore', [int]$MaxBootstrapBytes = 8192, [int]$MaxProcessOutputChars = 1048576, [int]$ProcessTimeoutMs = 15000)
+    $args = @('-NoProfile','-NonInteractive','-File',$resolvedProbe,'-ProjectRoot',$ProjectRoot,'-Mode',$Mode,'-MaxBootstrapBytes',[string]$MaxBootstrapBytes,'-MaxProcessOutputChars',[string]$MaxProcessOutputChars,'-ProcessTimeoutMs',[string]$ProcessTimeoutMs)
     $call = Invoke-Native (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source $args $ProjectRoot
     $json = $null
     try { $json = $call.Stdout.Trim() | ConvertFrom-Json -Depth 40 }
@@ -80,7 +115,8 @@ function Complete-FixtureState {
 
 function New-Fixture {
     param([string]$Name, [switch]$Detached)
-    $root = Join-Path $runRoot $Name
+    $script:fixtureCounter++
+    $root = Join-Path $runRoot ('f{0:D2}' -f $script:fixtureCounter)
     $null = New-Item -ItemType Directory -Path $root
     $init = Invoke-Native (Get-Command git -CommandType Application | Select-Object -First 1).Source @('init','--initial-branch=main',$root) $runRoot
     if ($init.ExitCode -ne 0) { throw "git init failed: $($init.Stderr)" }
@@ -94,7 +130,10 @@ function New-Fixture {
     Write-Utf8Json (Join-Path $root 'package.json') ([ordered]@{ name = 'gpt-talk-enhancer' })
     [IO.File]::WriteAllText((Join-Path $root 'README.md'), "fixture baseline`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $root 'docs\DOM-CONTRACT.md'), "fixture`n", [Text.UTF8Encoding]::new($false))
-    $null = Invoke-FixtureGit $root @('add','package.json','README.md','docs/DOM-CONTRACT.md')
+    [IO.File]::WriteAllText((Join-Path $root 'docs\LESSONS-LEARNED.zh-CN.md'), "fixture lessons`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root 'docs\PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md'), "fixture relay issues`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root 'docs\path-source.txt'), "path source`n", [Text.UTF8Encoding]::new($false))
+    $null = Invoke-FixtureGit $root @('add','package.json','README.md','docs/DOM-CONTRACT.md','docs/LESSONS-LEARNED.zh-CN.md','docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md','docs/path-source.txt')
     $commit = Invoke-FixtureGit $root @('commit','-m','fixture baseline','--no-gpg-sign')
     if ($commit.ExitCode -ne 0) { throw "fixture baseline commit failed: $($commit.Stderr)" }
     $baseHead = (Invoke-FixtureGit $root @('rev-parse','HEAD')).Stdout.Trim()
@@ -110,7 +149,7 @@ function New-Fixture {
         protocol_id = 'project-relay'; schema_version = 2; project_id = 'gpt-talk-enhancer'
         identity_checks = @([ordered]@{ path = 'package.json'; json_pointer = '/name'; expected = 'gpt-talk-enhancer' })
         state_ref = 'runtime/context/state.json'
-        entry_refs = [ordered]@{ readme = 'README.md'; host_contract = 'docs/DOM-CONTRACT.md' }
+        entry_refs = [ordered]@{ readme = 'README.md'; lessons = 'docs/LESSONS-LEARNED.zh-CN.md'; relay_issues = 'docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md'; host_contract = 'docs/DOM-CONTRACT.md' }
     }
     Write-Utf8Json (Join-Path $root 'runtime\context\bootstrap.json') $bootstrap
 
@@ -124,7 +163,7 @@ function New-Fixture {
         observation = [ordered]@{
             dirty = $true
             change_summary = [ordered]@{ staged = 0; unstaged = 1; untracked = 2 }
-            relevant_paths = @('package.json','README.md','docs/DOM-CONTRACT.md','runtime/context/bootstrap.json','runtime/context/state.json')
+            relevant_paths = @('package.json','README.md','docs/DOM-CONTRACT.md','docs/LESSONS-LEARNED.zh-CN.md','docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md','runtime/context/bootstrap.json','runtime/context/state.json')
             content_checks = @(
                 [ordered]@{ path='README.md'; algorithm='git-blob-oid'; digest=(Get-GitBlobOid $root 'README.md') },
                 [ordered]@{ path='runtime/context/bootstrap.json'; algorithm='git-blob-oid'; digest=(Get-GitBlobOid $root 'runtime/context/bootstrap.json') }
@@ -136,7 +175,7 @@ function New-Fixture {
             source=[ordered]@{kind='current_user_request'; reference=$null; note='Synthetic fixture.'}
             authorization_note='Fixture metadata grants no authorization.'
         }
-        open_items=@(); verification=@(); relevant_refs=@('README.md','docs/DOM-CONTRACT.md'); handoff_ref=$null
+        open_items=@(); verification=@(); relevant_refs=@('README.md','docs/LESSONS-LEARNED.zh-CN.md','docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md','docs/DOM-CONTRACT.md'); handoff_ref=$null
     }
     Write-Utf8Json (Join-Path $root 'runtime\context\state.json') $state
     Complete-FixtureState $root $state
@@ -145,7 +184,9 @@ function New-Fixture {
 
 function Commit-Carrier {
     param([string]$Root)
-    $null = Invoke-FixtureGit $Root @('add','README.md','runtime/context/bootstrap.json','runtime/context/state.json')
+    $state = Get-Content -LiteralPath (Join-Path $Root 'runtime\context\state.json') -Raw | ConvertFrom-Json
+    $carrierPaths = @($state.checkpoint.carrier_paths)
+    $null = Invoke-FixtureGit $Root (@('add','--') + $carrierPaths)
     $commit = Invoke-FixtureGit $Root @('commit','-m','relay carrier','--no-gpg-sign')
     if ($commit.ExitCode -ne 0) { throw "carrier commit failed: $($commit.Stderr)" }
 }
@@ -239,6 +280,78 @@ Test-Case 'dirty categories are counted independently' {
     [IO.File]::WriteAllText((Join-Path $root 'another.txt'), "untracked`n", [Text.UTF8Encoding]::new($false))
     $probe = Invoke-Probe $root 'Probe'
     if ($probe.Result.git.change_summary.staged -lt 1 -or $probe.Result.git.change_summary.unstaged -lt 1 -or $probe.Result.git.change_summary.untracked -lt 1) { throw 'Staged, unstaged, and untracked categories were not all detected.' }
+}
+
+
+Test-Case 'Restore rejects the same checkpoint on a different attached branch' {
+    $root = New-Fixture 'wrong-target-branch'
+    $switch = Invoke-FixtureGit $root @('switch','-c','alternate')
+    if ($switch.ExitCode -ne 0) { throw "Could not create alternate branch: $($switch.Stderr)" }
+    $probe = Invoke-Probe $root
+    $codes = @($probe.Result.warnings | ForEach-Object { $_.code })
+    if ($probe.ExitCode -ne 2 -or $probe.Result.checkpoint_state -ne 'stale' -or $probe.Result.freshness -ne 'head_changed' -or $codes -notcontains 'TARGET_REF_MISMATCH') { throw 'Wrong target branch was not rejected.' }
+}
+
+Test-Case 'Restore rejects a detached checkpoint when target_ref requires main' {
+    $root = New-Fixture 'detached-target' -Detached
+    $probe = Invoke-Probe $root
+    $codes = @($probe.Result.warnings | ForEach-Object { $_.code })
+    if ($probe.ExitCode -ne 2 -or $probe.Result.checkpoint_state -ne 'stale' -or $probe.Result.freshness -ne 'head_changed' -or $codes -notcontains 'TARGET_REF_MISMATCH') { throw 'Detached target_ref mismatch was not rejected.' }
+}
+
+Test-Case 'active Git filter is refused before git-blob-oid content hashing' {
+    $root = New-Fixture 'filter-guard'
+    [IO.File]::WriteAllText((Join-Path $root '.gitattributes'), "README.md filter=relaytest`n", [Text.UTF8Encoding]::new($false))
+    $probe = Invoke-Probe $root
+    $codes = @($probe.Result.errors | ForEach-Object { $_.code })
+    if ($probe.ExitCode -ne 20 -or $codes -notcontains 'GIT_FILTER_NOT_ALLOWED') { throw 'Active Git filter did not fail closed.' }
+}
+
+Test-Case 'damaged branch ref is not reported as unborn' {
+    $root = New-Fixture 'damaged-head'
+    [IO.File]::WriteAllText((Join-Path $root '.git\refs\heads\main'), "not-a-valid-object`n", [Text.UTF8Encoding]::new($false))
+    $probe = Invoke-Probe $root 'Probe'
+    $codes = @($probe.Result.errors | ForEach-Object { $_.code })
+    if ($probe.ExitCode -ne 20 -or $codes -notcontains 'GIT_PROBE_FAILED') { throw 'Damaged HEAD was not classified as a Git probe failure.' }
+}
+
+Test-Case 'NUL path sets preserve Unicode spaces and rename carrier semantics' {
+    $root = New-Fixture 'nul-rename'
+    $newRelative = 'docs/路径 with space.txt'
+    Move-Item -LiteralPath (Join-Path $root 'docs\path-source.txt') -Destination (Join-Path $root ($newRelative -replace '/', '\'))
+    $statePath = Join-Path $root 'runtime\context\state.json'
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+    $state.checkpoint.carrier_paths = @('README.md','docs/path-source.txt',$newRelative,'runtime/context/bootstrap.json','runtime/context/state.json')
+    Complete-FixtureState $root $state
+    $prepared = Invoke-Probe $root
+    if ($prepared.ExitCode -ne 0 -or $prepared.Result.checkpoint_state -ne 'prepared' -or $prepared.Result.freshness -ne 'matches') { throw 'Prepared rename path set did not match.' }
+    Commit-Carrier $root
+    $committed = Invoke-Probe $root
+    if ($committed.ExitCode -ne 0 -or $committed.Result.checkpoint_state -ne 'committed' -or $committed.Result.freshness -ne 'matches') { throw 'Committed rename path set did not match.' }
+}
+
+Test-Case 'probe subprocess output limit fails closed with exit 20' {
+    $root = New-Fixture 'process-output-limit'
+    1..160 | ForEach-Object { [IO.File]::WriteAllText((Join-Path $root ('u{0:D3}.txt' -f $_)), 'x', [Text.UTF8Encoding]::new($false)) }
+    $probe = Invoke-Probe $root 'Probe' 8192 1024
+    $codes = @($probe.Result.errors | ForEach-Object { $_.code })
+    if ($probe.ExitCode -ne 20 -or $codes -notcontains 'PROCESS_OUTPUT_LIMIT') { throw 'Process output limit was not enforced.' }
+}
+
+Test-Case 'test subprocess helper times out without serial pipe deadlock' {
+    $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    $timeoutObserved = $false
+    try { $null = Invoke-Native $pwsh @('-NoProfile','-NonInteractive','-Command','[Console]::Error.Write(("x" * 200000)); Start-Sleep -Seconds 2') $runRoot 150 500000 }
+    catch { if ($_.Exception.Message -like 'PROCESS_TIMEOUT|*') { $timeoutObserved = $true } else { throw } }
+    if (-not $timeoutObserved) { throw 'Timeout was not observed.' }
+}
+
+Test-Case 'test runner rejects an outside TestRoot before creating it' {
+    $outside = Join-Path (Split-Path -Parent $script:testProjectRoot) ('relay-outside-' + [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $outside) { throw 'Synthetic outside path unexpectedly exists before test.' }
+    $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    $call = Invoke-Native $pwsh @('-NoProfile','-NonInteractive','-File',$PSCommandPath,'-TestRoot',$outside,'-ProbeScriptPath',$resolvedProbe) $script:testProjectRoot 5000 65536
+    if ($call.ExitCode -eq 0 -or $call.Stderr -notlike '*TEST_ROOT_OUTSIDE_PROJECT*' -or (Test-Path -LiteralPath $outside)) { throw 'Outside TestRoot was not rejected before filesystem creation.' }
 }
 
 Test-Case 'malformed JSON returns exit 10' {

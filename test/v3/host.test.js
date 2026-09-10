@@ -1485,6 +1485,71 @@ test("long forward Work uses wheel-progressive hydration for later history", asy
   assert.ok(trace.some((entry) => entry.mode === "work-wheel" && entry.direction === 1));
 });
 
+test("Local Work tail target backtracks from physical bottom when the final user turn is virtualized above a long assistant reply", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const ids = Array.from({ length: 71 }, (_, index) => `stable-${index}`);
+  let backtrackSignals = 0;
+  let compatCalls = 0;
+  const wheelDeltas = [];
+  const writes = [];
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
+  window.__codexThreadScrollHandlers = { markPointerIntent() { compatCalls += 1; } };
+  const turnAdapter = {
+    resolveTurn: (id) => backtrackSignals >= 3 && id === ids[70] ? target : null,
+    verifyTurnElement: (id, element) => id === ids[70] && element === target,
+    getVisibleTurns: () => (backtrackSignals >= 3 ? [67, 68, 69, 70] : [60, 61, 62, 63, 64, 65, 66, 67, 68, 69])
+      .map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
+  container.clientHeight = 200;
+  container.scrollHeight = 6400;
+  let physicalTop = 0;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; writes.push(value); },
+    configurable: true
+  });
+  container.dispatchEvent = (event) => {
+    if (event?.type === "wheel") {
+      wheelDeltas.push(event.deltaY);
+      if (event.deltaY < 0) backtrackSignals += 1;
+    }
+    return true;
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
+    },
+    workWheelStepPx: 200,
+    workWheelWaitMs: 2,
+    hydrationWaitMs: 20,
+    maxNavigationMs: 1000,
+    postSettleWaitMs: 0,
+    maxPostSettleCorrections: 0
+  });
+  const trace = [];
+  const result = await nav.navigateToTurn(ids[70], {
+    turns: ids.map((id, order) => ({ id, order })),
+    onTraceStep: (entry) => trace.push(entry)
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.targetOrder, 70);
+  assert.equal(backtrackSignals, 3);
+  assert.equal(compatCalls, 1);
+  assert.ok(wheelDeltas.length >= 3);
+  assert.ok(wheelDeltas.every((value) => value < 0));
+  assert.ok(writes.some((value) => value < 0));
+  assert.ok(trace.some((entry) => entry.mode === "work-tail-backtrack" && entry.direction === -1));
+});
+
 test("reverse Work keeps moving through delayed DOM updates instead of failing after two wheel steps", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);

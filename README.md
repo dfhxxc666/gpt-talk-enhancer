@@ -216,13 +216,17 @@ v0.4.5 的正式 Desktop 验收以 `dist/v3/` 两文件注入路径为准。
 
 ### Project Relay / Continuity
 
-跨会话继续开发时，可在仓库根目录运行只读恢复探测：
+跨会话继续开发时，先确认当前实际项目 root / worktree / branch / HEAD / dirty，再读取本项目 `project-continuity` Skill 与 Bootstrap：
 
 ```powershell
 pwsh -NoProfile -NonInteractive -File .agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1 -ProjectRoot . -Mode Restore
 ```
 
-恢复数据只提供项目事实、验证证据与新鲜度，不产生继续任务、commit、push、tag 或删除文件的授权。协议说明见 `.agents/skills/project-continuity/SKILL.md`。
+恢复入口：`.agents/skills/project-continuity/SKILL.md`。错题索引：`docs/LESSONS-LEARNED.zh-CN.md`。项目 Relay 实施问题：`docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md`。
+
+日常恢复按需读取 State 摘要、命中错题与必要证据，不要求每次重读完整历史。`freshness=matches` 只说明所选本地 checkpoint 匹配；远端正式版本和实际 Codex++ 安装状态在任务需要时分别核实。CWapi durable 与本地 checkout 并存时不得拼接两边状态。
+
+恢复数据只提供项目事实、验证证据与新鲜度，不产生继续任务、commit、push、tag、删除文件或选择执行器的授权。CWapi Runtime Policy 仅在 CWapi 已被明确选择后按其正式入口加载。
 ## 已知限制
 
 - Timeline Cache 只能保存已经由 DOM 或允许的 Capture 路径发现过的问题；首次打开从未探索的超长对话时，仍需随着宿主虚拟化逐步加载历史。
@@ -256,6 +260,9 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 
 ## 文档
 
+- [`docs/LESSONS-LEARNED.zh-CN.md`](docs/LESSONS-LEARNED.zh-CN.md)：项目错题索引与冻结路线/防错经验
+- [`docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md`](docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md)：Project Relay v1.2 增量升级问题与验收范围
+- [`docs/PROJECT-RELAY-CORE-ACCEPTANCE.md`](docs/PROJECT-RELAY-CORE-ACCEPTANCE.md)：Project Relay Core / schema v2 验收与后续架构增量记录
 - [docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md](docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md)：0.5.2 稳定性与快路径最终验收
 - [docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md](docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md)：0.5.2 Navigation 快路径冻结检查点
 - [`docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md)：0.5.1 Navigation 性能与可靠性最终验收

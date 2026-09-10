@@ -183,3 +183,26 @@ const L3_RUNTIME_ENABLED = false;
 ```
 
 正常 Timeline 点击不自动运行这些研究扫描；只保留手动 one-shot 研究入口。详细基线见 `V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md`。
+## WORK-003：物理最底部点击最后一问仍提示未能定位
+
+状态：**修复完成 / 自动回归 PASS / 宿主复验待安装后确认**。
+
+### 现象
+
+Local Work 长会话已经位于整段对话最底部，Questions 中最后一问仍存在，例如 Q71；点击 Q71 后不应再向下加载，但旧逻辑会提示“未能定位 Q71，请再试一次”。
+
+### 根因
+
+最后一问和整段对话的 physical tail 不是同一个几何位置。最后一条 user turn 后面可能跟着很长的 assistant 回复，导致 user turn 位于当前视口上方甚至被宿主虚拟化卸载。旧 Later 逻辑只要 `targetOrder === maxKnownOrder && direction > 0` 就无条件把目标 logical position 设为 physical tail。已经处在 tail 时，这个动作不会让目标 user turn 重新挂载，最终进入 stall/failure。
+
+### 修复
+
+Local Work + column-reverse + 目标为最后一问 + 当前已在 physical tail + 目标 DOM 未挂载时，进入有界 `work-tail-backtrack`：使用负方向 Work wheel 向上回探，最多 32 步；目标重新挂载后立即交回现有 `verifyAndAlign()`，仍使用真实 geometry / activation line / post-settle verification。普通 Work Later、Earlier、已可见的 tail endpoint 和非最后一问严格验证保持不变。
+
+新增回归：
+
+```text
+Local Work tail target backtracks from physical bottom when the final user turn is virtualized above a long assistant reply
+```
+
+定向 `host.test.js`：74/74 PASS；完整 `npm run check`：234/234 PASS。

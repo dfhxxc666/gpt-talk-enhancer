@@ -1426,6 +1426,7 @@ const { clamp, createScrollModel, scrollTopFromLogical } = __require("src/v3/cor
 
 const FALLBACK_TURN = /^fallback-turn-(\d+)$/;
 const NAVIGATION_TRACE_LIMIT = 16;
+const WORK_TAIL_BACKTRACK_MAX_STEPS = 32;
 const HYDRATION_ATTRIBUTES = [
   "data-turn-key",
   "data-content-search-turn-key",
@@ -1522,6 +1523,8 @@ class NavigationAdapter {
     let probes = 0;
     let consecutiveStalls = 0;
     let workCompatibilityNotified = false;
+    let tailTargetBacktrackActive = false;
+    let tailTargetBacktrackSteps = 0;
     let chatBoundaryWaitAvailable = true;
     let snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
     let candidate = this.resolveCandidate(turnId, indexState.targetOrder);
@@ -1681,25 +1684,49 @@ class NavigationAdapter {
       const model = readScrollModel(container, this.window);
       const visibleOrders = this.readVisibleOrders(orderById);
       const currentSnapshot = createHydrationSnapshot(targetOrder, visibleOrders, model);
-      const direction = chooseHydrationDirection(targetOrder, visibleOrders, model);
+      const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
+      const targetAfterVisible = visibleOrders.length > 0 && targetOrder > visibleOrders[visibleOrders.length - 1];
+      const localWorkColumnReverse = conversationIdentity?.host === "local"
+        && conversationIdentity?.source === "sidebar-local"
+        && model.isColumnReverse;
+      const atPhysicalTail = Math.abs(Number(model.maxLogicalPosition) - Number(model.logicalPosition)) <= 2;
+      if (tailTargetBacktrackActive && (targetOrder !== maxKnownOrder || !targetAfterVisible)) {
+        tailTargetBacktrackActive = false;
+      }
+      if (!tailTargetBacktrackActive
+        && localWorkColumnReverse
+        && targetOrder === maxKnownOrder
+        && targetAfterVisible
+        && atPhysicalTail) {
+        tailTargetBacktrackActive = true;
+        tailTargetBacktrackSteps = 0;
+      }
+      if (tailTargetBacktrackActive && tailTargetBacktrackSteps >= WORK_TAIL_BACKTRACK_MAX_STEPS) {
+        return finish(this.navigationFailure("tail-target-backtrack-limit", turnId, {
+          probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
+          tailBacktrackSteps: tailTargetBacktrackSteps
+        }));
+      }
+      const direction = tailTargetBacktrackActive
+        ? -1
+        : chooseHydrationDirection(targetOrder, visibleOrders, model);
       if (hasHydrationProgress(targetOrder, snapshot, currentSnapshot, direction)) {
         consecutiveStalls = 0;
         lastProgressAt = nowMs(this.window);
       }
       snapshot = currentSnapshot;
 
-      const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
-      const targetAfterVisible = visibleOrders.length > 0 && targetOrder > visibleOrders[visibleOrders.length - 1];
-      const localWorkWheel = conversationIdentity?.host === "local"
-        && conversationIdentity?.source === "sidebar-local"
-        && model.isColumnReverse
-        && ((direction < 0 && targetBeforeVisible) || (direction > 0 && targetAfterVisible));
+      const localWorkWheel = localWorkColumnReverse
+        && ((direction < 0 && (targetBeforeVisible || tailTargetBacktrackActive))
+          || (direction > 0 && targetAfterVisible));
 
       if (localWorkWheel) {
         if (!workCompatibilityNotified) {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
         }
+        const tailBacktrackThisStep = tailTargetBacktrackActive;
+        if (tailBacktrackThisStep) tailTargetBacktrackSteps += 1;
         const stepStartedAt = nowMs(this.window);
         const outcome = await this.performWorkWheelHydrationStep({
           turnId,
@@ -1713,7 +1740,7 @@ class NavigationAdapter {
           getIndexState
         });
         recordStep(createNavigationTraceStep({
-          mode: "work-wheel",
+          mode: tailBacktrackThisStep ? "work-tail-backtrack" : "work-wheel",
           direction,
           elapsedMs: nowMs(this.window) - stepStartedAt,
           jumpPx: outcome.step,
@@ -6014,9 +6041,6 @@ function dedupePaths(values) {
     return true;
   });
 }
-
-
-
 
 Object.assign(exports, { collectHostInternalDepthProbe, collectL3ExactKeyJoinDryRunMap });
 

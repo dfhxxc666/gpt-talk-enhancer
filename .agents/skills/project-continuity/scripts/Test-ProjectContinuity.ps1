@@ -12,7 +12,13 @@ param(
     [int]$MaxBootstrapBytes = 8192,
 
     [ValidateRange(1, [int]::MaxValue)]
-    [int]$MaxStateBytes = 32768
+    [int]$MaxStateBytes = 32768,
+
+    [ValidateRange(100, [int]::MaxValue)]
+    [int]$ProcessTimeoutMs = 15000,
+
+    [ValidateRange(1024, [int]::MaxValue)]
+    [int]$MaxProcessOutputChars = 1048576
 )
 
 Set-StrictMode -Version Latest
@@ -56,15 +62,30 @@ function Invoke-CapturedProcess {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $startInfo.CreateNoWindow = $true
     foreach ($argument in $ArgumentList) { $null = $startInfo.ArgumentList.Add($argument) }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    $null = $process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    try {
+        if (-not $process.Start()) { throw 'PROCESS_START_FAILED|Subprocess did not start.' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($ProcessTimeoutMs)) {
+            try { $process.Kill($true) } catch { }
+            try { $null = $process.WaitForExit(2000) } catch { }
+            throw ('PROCESS_TIMEOUT|Subprocess exceeded ' + $ProcessTimeoutMs + 'ms.')
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if (($stdout.Length + $stderr.Length) -gt $MaxProcessOutputChars) {
+            throw ('PROCESS_OUTPUT_LIMIT|Subprocess output exceeded ' + $MaxProcessOutputChars + ' characters.')
+        }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    } finally {
+        $process.Dispose()
+    }
 }
 
 function Invoke-RelayGit {
@@ -160,17 +181,22 @@ function Get-JsonString {
 
 function Convert-RepoPath {
     param([string]$Path)
-    return ($Path.Trim() -replace '\\','/')
+    return ($Path -replace '\\','/')
+}
+
+function Convert-NulSeparatedPaths {
+    param([string]$Output)
+    return @($Output -split "`0" | Where-Object { $_.Length -gt 0 } | ForEach-Object { Convert-RepoPath $_ })
 }
 
 function Get-LiveChangePaths {
     $paths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $tracked = Invoke-RelayGit @('diff','--name-only','HEAD','--')
+    $tracked = Invoke-RelayGit @('diff','--no-renames','--name-only','-z','HEAD','--')
     if ($tracked.ExitCode -ne 0) { throw 'GIT_DIFF_FAILED|Could not inspect changed tracked paths.' }
-    foreach ($line in ($tracked.Stdout -split "`r?`n")) { if (-not [string]::IsNullOrWhiteSpace($line)) { $null = $paths.Add((Convert-RepoPath $line)) } }
-    $untracked = Invoke-RelayGit @('ls-files','--others','--exclude-standard')
+    foreach ($item in (Convert-NulSeparatedPaths $tracked.Stdout)) { $null = $paths.Add($item) }
+    $untracked = Invoke-RelayGit @('ls-files','-z','--others','--exclude-standard')
     if ($untracked.ExitCode -ne 0) { throw 'GIT_STATUS_FAILED|Could not inspect untracked paths.' }
-    foreach ($line in ($untracked.Stdout -split "`r?`n")) { if (-not [string]::IsNullOrWhiteSpace($line)) { $null = $paths.Add((Convert-RepoPath $line)) } }
+    foreach ($item in (Convert-NulSeparatedPaths $untracked.Stdout)) { $null = $paths.Add($item) }
     return @($paths | Sort-Object)
 }
 
@@ -180,9 +206,9 @@ function Get-CommitCarrierInfo {
     if ($parentsProbe.ExitCode -ne 0) { throw 'GIT_PROBE_FAILED|Could not inspect checkpoint commit parents.' }
     $parts = @($parentsProbe.Stdout.Trim() -split '\s+')
     $parent = if ($parts.Count -eq 2) { $parts[1] } else { $null }
-    $pathProbe = Invoke-RelayGit @('diff-tree','--no-commit-id','--name-only','-r',$Commit)
+    $pathProbe = Invoke-RelayGit @('diff-tree','--no-renames','--no-commit-id','--name-only','-z','-r',$Commit)
     if ($pathProbe.ExitCode -ne 0) { throw 'GIT_DIFF_FAILED|Could not inspect checkpoint commit paths.' }
-    $paths = @($pathProbe.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { Convert-RepoPath $_ } | Sort-Object -Unique)
+    $paths = @(Convert-NulSeparatedPaths $pathProbe.Stdout | Sort-Object -Unique)
     return [pscustomobject]@{ SingleParent = ($parts.Count -eq 2); Parent = $parent; Paths = $paths }
 }
 
@@ -202,6 +228,14 @@ function Get-ContentCheckDigest {
         return (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     if ($Algorithm -eq 'git-blob-oid') {
+        $attributeProbe = Invoke-RelayGit @('check-attr','-z','filter','--',$RelativePath)
+        if ($attributeProbe.ExitCode -ne 0) { throw 'GIT_ATTR_FAILED|Could not inspect Git filter attributes for a content check.' }
+        $attributeParts = @($attributeProbe.Stdout -split "`0")
+        if ($attributeParts.Count -lt 3 -or $attributeParts[1] -ne 'filter') { throw 'GIT_ATTR_FAILED|Git returned an invalid filter-attribute result.' }
+        $filterValue = $attributeParts[2]
+        if ($filterValue -notin @('unspecified','unset')) {
+            throw ("GIT_FILTER_NOT_ALLOWED|git-blob-oid content check refuses active filter '" + $filterValue + "' for " + $RelativePath + '.')
+        }
         $probe = Invoke-RelayGit @('hash-object', "--path=$RelativePath", $fullPath)
         if ($probe.ExitCode -ne 0) { throw 'GIT_CONTENT_HASH_FAILED|Could not compute Git-canonical content identity.' }
         $oid = $probe.Stdout.Trim()
@@ -232,7 +266,7 @@ function Test-StateSchema {
     $carrierSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in $checkpoint.GetProperty('carrier_paths').EnumerateArray()) {
         $value = Convert-RepoPath $item.GetString()
-        $null = Assert-RelativeFileReference $value
+        $null = Assert-RelativeFileReference $value $false
         if (-not $carrierSeen.Add($value)) { throw 'SCHEMA_VALUE|checkpoint.carrier_paths must not contain duplicates' }
     }
 
@@ -328,12 +362,40 @@ try {
     $commonRaw = $commonProbe.Stdout.Trim()
     $commonDir = if ([IO.Path]::IsPathRooted($commonRaw)) { [IO.Path]::GetFullPath($commonRaw) } else { [IO.Path]::GetFullPath((Join-Path $script:resolvedRoot $commonRaw)) }
 
+    $branchRefProbe = Invoke-RelayGit @('symbolic-ref','--quiet','HEAD')
+    if ($branchRefProbe.ExitCode -eq 0) {
+        $branchState = 'attached'
+        $branchRef = $branchRefProbe.Stdout.Trim()
+        $branch = if ($branchRef.StartsWith('refs/heads/')) { $branchRef.Substring(11) } else { $branchRef }
+    } elseif ($branchRefProbe.ExitCode -eq 1) {
+        $branchState = 'detached'
+        $branchRef = $null
+        $branch = $null
+    } else {
+        Add-Diagnostic Error 'GIT_PROBE_FAILED' 'Could not determine whether HEAD is attached or detached.' $null
+        Complete-Result 20
+    }
+
     $headProbe = Invoke-RelayGit @('rev-parse','--verify','HEAD')
-    if ($headProbe.ExitCode -eq 0) { $headState = 'valid'; $head = $headProbe.Stdout.Trim() } else { $headState = 'unborn'; $head = $null }
-    $branchProbe = Invoke-RelayGit @('symbolic-ref','--quiet','--short','HEAD')
-    if ($branchProbe.ExitCode -eq 0) { $branchState = 'attached'; $branch = $branchProbe.Stdout.Trim() }
-    elseif ($headState -eq 'valid') { $branchState = 'detached'; $branch = $null }
-    else { $branchState = 'attached'; $branch = (Invoke-RelayGit @('symbolic-ref','--short','HEAD')).Stdout.Trim() }
+    if ($headProbe.ExitCode -eq 0) {
+        $headState = 'valid'
+        $head = $headProbe.Stdout.Trim()
+    } elseif ($branchState -eq 'attached') {
+        $refProbe = Invoke-RelayGit @('show-ref','--verify','--quiet',$branchRef)
+        if ($refProbe.ExitCode -eq 1) {
+            $headState = 'unborn'
+            $head = $null
+        } elseif ($refProbe.ExitCode -eq 0) {
+            Add-Diagnostic Error 'GIT_HEAD_INVALID' 'HEAD does not resolve even though its branch ref exists.' $null
+            Complete-Result 20
+        } else {
+            Add-Diagnostic Error 'GIT_PROBE_FAILED' 'Could not distinguish an unborn branch from a damaged/unavailable HEAD.' $null
+            Complete-Result 20
+        }
+    } else {
+        Add-Diagnostic Error 'GIT_HEAD_INVALID' 'Detached HEAD does not resolve to a valid commit.' $null
+        Complete-Result 20
+    }
 
     $statusProbe = Invoke-RelayGit @('status','--porcelain=v1','-z','--untracked-files=all')
     if ($statusProbe.ExitCode -ne 0) { Add-Diagnostic Error 'GIT_STATUS_FAILED' 'Could not inspect the working tree.' $null; Complete-Result 20 }
@@ -399,6 +461,7 @@ try {
 
     $checkpoint = $state.GetProperty('checkpoint')
     $baseHead = Get-JsonString $checkpoint 'base_head'
+    $targetRef = Get-JsonString $checkpoint 'target_ref'
     $carrierPaths = @($checkpoint.GetProperty('carrier_paths').EnumerateArray() | ForEach-Object { Convert-RepoPath $_.GetString() })
     $contentChanged = $false
     $observation = $state.GetProperty('observation')
@@ -410,7 +473,12 @@ try {
     if ($observation.GetProperty('content_checks').GetArrayLength() -eq 0) { Add-Diagnostic Warning 'NO_CONTENT_CHECKS' 'Freshness is limited because state has no content checks.' $stateRelativePath }
 
     $headChanged = $false; $worktreeChanged = $contentChanged
-    if ($headState -ne 'valid') {
+    $targetRefMatches = ($branchState -eq 'attached' -and $branchRef -eq $targetRef)
+    if (-not $targetRefMatches) {
+        $headChanged = $true
+        $result.checkpoint_state = 'stale'
+        Add-Diagnostic Warning 'TARGET_REF_MISMATCH' 'Saved checkpoint target_ref does not match the current attached branch.' $stateRelativePath
+    } elseif ($headState -ne 'valid') {
         $headChanged = $true
         $result.checkpoint_state = 'stale'
     } elseif ($head -eq $baseHead) {
@@ -439,6 +507,6 @@ try {
     $detail = if ($parts.Count -eq 2) { $parts[1] } else { $message }
     Add-Diagnostic Error $code $detail $null
     $result.metadata_status = if ($result.metadata_status -eq 'unassessed') { 'invalid' } else { $result.metadata_status }
-    $exitCode = if ($code -in @('PROJECT_ROOT_MISSING','PROJECT_ROOT_MISMATCH','PROJECT_ID_MISMATCH','PROJECT_IDENTITY_MISMATCH')) { 11 } elseif ($code -in @('REFERENCE_OUTSIDE_PROJECT','REPARSE_POINT_NOT_ALLOWED','MISSING_REFERENCE')) { 12 } elseif ($code -like 'GIT_*') { 20 } elseif ($code -eq 'INTERNAL_ERROR') { 22 } else { 10 }
+    $exitCode = if ($code -in @('PROJECT_ROOT_MISSING','PROJECT_ROOT_MISMATCH','PROJECT_ID_MISMATCH','PROJECT_IDENTITY_MISMATCH')) { 11 } elseif ($code -in @('REFERENCE_OUTSIDE_PROJECT','REPARSE_POINT_NOT_ALLOWED','MISSING_REFERENCE')) { 12 } elseif ($code -like 'GIT_*' -or $code -in @('PROCESS_START_FAILED','PROCESS_TIMEOUT','PROCESS_OUTPUT_LIMIT')) { 20 } elseif ($code -eq 'INTERNAL_ERROR') { 22 } else { 10 }
     Complete-Result $exitCode
 }

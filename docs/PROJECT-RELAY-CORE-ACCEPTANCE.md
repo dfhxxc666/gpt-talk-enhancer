@@ -1,8 +1,8 @@
 # Project Relay Phase 1 Core 验收记录
 
-日期：2026-09-09
-状态：**PASS / SEALED / SCHEMA V2 + FRESH CODEX DISCOVERY**
-产品基线：**GPT TalkEnhancer v0.5.1 / `cd1023bde0bf81460ffd65076b87f13bc2127562`**
+日期：2026-09-09；v1.2 架构增量验收：2026-09-10
+状态：**PASS / SCHEMA V2 CORE SEALED + V1.2 INCREMENTAL HARDENING**
+当前产品基线：**GPT TalkEnhancer v0.5.2 / `1bd2d02f42dc3586e052629ef4d2d0f8a22f1590`**
 
 ## 1. 验收结论
 
@@ -165,3 +165,95 @@ freshness=matches
 ```
 
 这两个状态都不产生任何写操作或后续任务授权。
+## 10. 2026-09-10 Project Relay v1.2 增量架构升级
+
+### 10.1 升级范围
+
+本轮依据 `my-tech-docs/docs/codex` 的 Project Relay 实施与持续优化方案 v1.2，对 GPT TalkEnhancer 已有 schema v2 做**增量升级**，没有重建协议、没有升级 `schema_version`，也没有把 Relay 接入产品运行依赖。
+
+新增/调整职责：
+
+- `AGENTS.md`：恢复前先绑定实际 executor / root / worktree / common dir / branch / HEAD / dirty；禁止拼接 CWapi durable 与本地 checkout 状态。
+- `.agents/skills/project-continuity/SKILL.md`：按需读取、三类新鲜度、错题索引、target branch 语义、CWapi executor-gated 边界和手工降级。
+- `runtime/context/bootstrap.json`：增加 `lessons` 与 `relay_issues` 稳定入口。
+- `docs/LESSONS-LEARNED.zh-CN.md`：建立项目错题本，只保存可复用防错动作与冻结路线。
+- `docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md`：保存本项目 v1.2 实施缺口、处理决定和未覆盖项。
+- README：恢复章节改为摘要/索引/按需证据路径，并明确 local / remote / runtime 三类新鲜度分开解释。
+
+当前产品 `src/`、`test/v3`、版本号与运行开关均未修改。
+
+### 10.2 Validator 硬化
+
+`.agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1` 保持 `Probe / Validate / Restore` 和 schema v2 默认接口，新增以下 fail-closed 边界：
+
+1. **target_ref**：Restore 现在要求当前 attached branch 的完整 ref 与 checkpoint `target_ref` 一致；错误分支或 detached 返回 `TARGET_REF_MISMATCH`，checkpoint stale。
+2. **HEAD / unborn**：不再把所有 `rev-parse HEAD` 失败都解释成 unborn；只有 attached branch ref 明确不存在时才认定合法 unborn，损坏/不可用 ref 返回 Git probe failure。
+3. **Git filter**：`git-blob-oid` 前先读取该路径实际 `filter` attribute。未设置/`unset` 可继续；有效 filter 值 fail closed，不自动执行未知 clean/process filter。
+4. **子进程边界**：stdout/stderr 并发异步读取，默认 15 秒 timeout，超时仅终止本次进程树；返回总输出超过默认 1,048,576 字符 fail closed。
+5. **路径集合**：changed/commit paths 使用 NUL 输出与 `--no-renames`，不再 Trim 合法路径；rename 按 delete + add 的精确 carrier path 集合处理。
+6. **删除路径**：carrier path 可表示已删除旧路径，因此 schema 安全校验不再要求每个 carrier path 当前仍是存在的叶子文件。
+
+限制：当前输出上限是在 `ReadToEndAsync()` 完成后检查，因此约束的是等待时间与返回结果大小，不是严格的流式内存硬上限。若未来需要处理不可信超大子进程输出，应另行实现流式 hard cap 并独立验收。
+
+### 10.3 隔离测试升级
+
+原 schema v2 18 项继续保留，并新增 8 项边界测试：
+
+- 同 HEAD 但错误 attached branch 拒绝；
+- detached checkpoint 与 `target_ref=main` 拒绝；
+- active Git filter 在 content hash 前 fail closed；
+- 损坏 branch ref 不误报 unborn；
+- Unicode + 空格路径与 rename carrier 的 NUL path set；
+- Probe 子进程输出上限；
+- 大量 stderr + sleep 的 subprocess timeout；
+- 项目外 TestRoot 在创建前拒绝。
+
+最终结果：
+
+```text
+Project Relay isolated suite
+PASS = 26
+FAIL = 0
+BLOCKED = 0
+```
+
+测试根被限制到项目内 `runtime/context/test-fixtures/`。第一次扩展运行沿用长时间戳/GUID/场景名，在 CWapi durable 的长 Windows 根路径下实际触发 `Filename too long`。该失败没有通过把夹具搬到项目外规避，而是缩短为：
+
+```text
+runtime/context/test-fixtures/r-xxxxxxxx/fNN
+```
+
+随后同一套测试 26/26 PASS。历史失败夹具和成功夹具都未自动删除，并由现有 `.gitignore` 精确忽略。
+
+### 10.4 产品层回归
+
+本轮架构修改完成后运行：
+
+```text
+npm run check
+234 / 234 PASS
+build PASS
+```
+
+产品源码范围在运行前为 clean，运行后源码仍 clean。构建发现一个既有可再现性小差异：当前源码重新生成 `dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 时会比 v0.5.2 已发布 bundle 少 3 个空白行，语义 diff 为零业务代码变化。该正式 bundle 已恢复到 v0.5.2 HEAD blob，未把产物差异并入本次 Relay 架构修改。本轮不把这一发现解释为产品功能回归。
+
+### 10.5 跨入口与工作区证据
+
+本次普通 Chat 中用户明确选择使用新架构更新 GPT TalkEnhancer，CWapi Coding 作为实际执行器。按 v1.2 要求补读了 committed `cwapi-runtime-policy` revision 3 和本任务所需 lazy refs，再操作项目。
+
+切换 `my-tech-docs → gpt-talk-enhancer` 时，实际观察到一次 CWapi active session / resolved commit 歧义。没有把另一仓库/旧 workspace 的状态继续用于写入，而是关闭目标句柄后按 GPT TalkEnhancer `main@1bd2d02...` 重新绑定并核实 root / common dir / HEAD / dirty。该案例已提炼为 `ENV-WORKSPACE-001`。
+
+因此本次可作为 **V13（普通 Chat + 明确选择 CWapi）与 V19（durable / checkout 绑定）部分真实证据**，但不宣称覆盖“未选择 CWapi”“策略不可用”“Fresh Codex 自动发现重测”“并发写入者”等完整矩阵。
+
+### 10.6 当前完成与未完成边界
+
+本轮已完成：入口架构、错题本、项目实施问题记录、主要 validator P1/P2 硬化、26 项隔离测试和产品自动回归。
+
+仍保留为非阻塞/后续验证：
+
+- token/读取量优化尚未在可比场景测量，不声明节省百分比；
+- subprocess 输出上限尚不是流式内存硬限；
+- V01–V19 并非整表全部重新实测，实际覆盖范围以项目实施问题记录为准；
+- v0.5.2 既有 Work 模型 popup 独立复现项与外部 Script Market 投稿决定保持原状态。
+
+本轮后续在用户要求“修一下这个再提交”后，又修复了 Local Work physical tail 点击最后一问失败（WORK-003）：增加 bounded `work-tail-backtrack`，完整产品回归更新为 234/234 PASS。该产品修复与本次 Relay 架构修改将由同一新的 carrier checkpoint 精确记录。`r`n`r`n本轮没有 push、tag、Hooks/Guard/Agent 安装或删除测试夹具；commit 仅在当前用户已明确授权的本次 carrier 范围内执行。

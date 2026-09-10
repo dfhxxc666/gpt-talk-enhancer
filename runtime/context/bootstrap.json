@@ -12,6 +12,8 @@
   "state_ref": "runtime/context/state.json",
   "entry_refs": {
     "readme": "README.md",
+    "lessons": "docs/LESSONS-LEARNED.zh-CN.md",
+    "relay_issues": "docs/PROJECT-RELAY-IMPLEMENTATION-ISSUES.zh-CN.md",
     "host_contract": "docs/DOM-CONTRACT.md"
   }
 }
