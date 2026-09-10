@@ -1,6 +1,6 @@
 import { HostInterface } from "../host-interface.js";
 import { ConversationAdapter, isStableLocalThreadIdentity } from "./conversation-adapter.js";
-import { TurnAdapter } from "./turn-adapter.js";
+import { TurnAdapter, cssEscape } from "./turn-adapter.js";
 import { ComposerAdapter } from "./composer-adapter.js";
 import { OverlayDetector } from "./overlay-detector.js";
 import { SurfaceDetector } from "./surface-detector.js";
@@ -94,6 +94,11 @@ export class CodexDesktopHost extends HostInterface {
     return this.surface.getSurface();
   }
 
+  isPromptOverlayBlocked() {
+    if (this.overlay.isBlockingDialogOpen?.()) return true;
+    return this.overlay.isPromptFloatingLayerOpen?.({ composerRect: this.getComposerRect?.() ?? null }) ?? false;
+  }
+
   getConversationId() {
     return this.conversation.getConversationId();
   }
@@ -110,6 +115,33 @@ export class CodexDesktopHost extends HostInterface {
     return this.turns.getVisibleTurns();
   }
 
+  resolveOfficialNavigationMarkerKey(markerKey) {
+    const key = String(markerKey ?? "").trim();
+    if (!key) return null;
+    const escaped = cssEscape(key);
+    const selectors = [
+      `[data-message-id="${escaped}"]`,
+      `[data-message-id-container="${escaped}"]`,
+      `[data-user-message-id="${escaped}"]`,
+      `[data-message-key="${escaped}"]`,
+      `[data-turn-id-container="${escaped}"]`,
+      `[data-turn-id="${escaped}"]`,
+      `[data-content-search-turn-key="${escaped}"]`,
+      `[data-turn-key="${escaped}"]`
+    ];
+    const resolved = new Set();
+    const collect = (node) => {
+      if (!node) return;
+      const container = this.turns.getTurnContainer?.(node) ?? node;
+      const turnId = this.turns.getTurnId?.(container) ?? this.turns.getTurnId?.(node);
+      if (turnId) resolved.add(String(turnId));
+    };
+    collect(this.document?.getElementById?.(key));
+    for (const selector of selectors) {
+      for (const node of this.document?.querySelectorAll?.(selector) ?? []) collect(node);
+    }
+    return resolved.size === 1 ? [...resolved][0] : null;
+  }
   resolveTurn(turnId) {
     return this.turns.resolveTurn(turnId);
   }
@@ -125,15 +157,17 @@ export class CodexDesktopHost extends HostInterface {
       windowRef: this.window
     });
     if (tailActiveTurnId) return tailActiveTurnId;
+    const identity = this.getConversationIdentity();
+    const activationOffset = identity?.stable && identity?.host === "local" && identity?.source === "sidebar-local" ? 132 : 120;
     return computeActiveTurnId({
       visibleTurns,
       resolveTurn,
       container,
-      activationOffset: 120
+      activationOffset
     });
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
     const requestId = ++this.navigationRequestId;
     const stillCurrent = () => requestId === this.navigationRequestId && isCurrent();
     const result = await this.navigation.navigateToTurn(turnId, {
@@ -141,10 +175,17 @@ export class CodexDesktopHost extends HostInterface {
       getTurns,
       isCurrent: stillCurrent,
       allowMountedFastSettle,
+      allowChatPredictiveFastPath,
       onTraceStep
     });
     if (result?.ok && result?.verified && stillCurrent()) this.persistLocalScrollPosition();
     return result;
+  }
+
+  notifyNavigationIntent() {
+    const container = this.getScrollContainer();
+    if (!container || container.isConnected === false) return false;
+    return this.navigation.notifyCodexPlusScrollIntent?.(container, () => true) ?? false;
   }
 
   persistLocalScrollPosition() {

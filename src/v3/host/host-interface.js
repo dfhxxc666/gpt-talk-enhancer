@@ -14,6 +14,7 @@ export class HostInterface {
   getVisibleTurns() { return []; }
   resolveTurn(_turnId) { return null; }
   navigateToTurn(_turnId, _context) { return Promise.resolve({ ok: false, reason: "not-implemented" }); }
+  notifyNavigationIntent() { return false; }
   getComposer() { return null; }
   getComposerRect() { return null; }
   getConversationViewportElement() { return null; }

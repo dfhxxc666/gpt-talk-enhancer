@@ -1,5 +1,5 @@
 /*
- * GPT TalkEnhancer 0.5.1 Desktop bundle
+ * GPT TalkEnhancer 0.5.2 Desktop bundle
  * Includes GPL-3.0-or-later derived Timeline UI material.
  * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.
  */
@@ -750,6 +750,7 @@ class HostInterface {
   getVisibleTurns() { return []; }
   resolveTurn(_turnId) { return null; }
   navigateToTurn(_turnId, _context) { return Promise.resolve({ ok: false, reason: "not-implemented" }); }
+  notifyNavigationIntent() { return false; }
   getComposer() { return null; }
   getComposerRect() { return null; }
   getConversationViewportElement() { return null; }
@@ -1045,11 +1046,22 @@ class ComposerAdapter {
 
   getComposerForm() {
     const composer = this.getComposer();
-    return composer?.closest?.("form") ?? composer?.parentElement ?? null;
+    if (!composer) return null;
+    const composerRect = composer.getBoundingClientRect?.() ?? null;
+    const form = composer.closest?.("form") ?? null;
+    if (form && isUsableComposerAnchor(form.getBoundingClientRect?.() ?? null, composerRect)) return form;
+    const parent = composer.parentElement ?? null;
+    if (parent && isUsableComposerAnchor(parent.getBoundingClientRect?.() ?? null, composerRect)) return parent;
+    return composer;
   }
 
   getComposerRect() {
-    return this.getComposerForm()?.getBoundingClientRect?.() ?? null;
+    const composer = this.getComposer();
+    if (!composer) return null;
+    const composerRect = composer.getBoundingClientRect?.() ?? null;
+    const anchor = this.getComposerForm();
+    const anchorRect = anchor?.getBoundingClientRect?.() ?? null;
+    return isUsableComposerAnchor(anchorRect, composerRect) ? anchorRect : composerRect;
   }
 
   insertText(text) {
@@ -1113,6 +1125,21 @@ function dispatchInput(composer, windowRef) {
   composer.dispatchEvent?.(new EventCtor("input", { bubbles: true }));
 }
 
+function isUsableComposerAnchor(anchorRect, composerRect) {
+  if (!isFiniteRect(anchorRect) || !isFiniteRect(composerRect)) return false;
+  const composerHeight = Math.max(1, Number(composerRect.height) || Number(composerRect.bottom) - Number(composerRect.top) || 1);
+  const anchorHeight = Math.max(0, Number(anchorRect.height) || Number(anchorRect.bottom) - Number(anchorRect.top) || 0);
+  const topGap = Math.abs(Number(anchorRect.top) - Number(composerRect.top));
+  const bottomGap = Math.abs(Number(anchorRect.bottom) - Number(composerRect.bottom));
+  const maxHeight = Math.max(240, composerHeight * 6);
+  return anchorHeight <= maxHeight && topGap <= 160 && bottomGap <= 180;
+}
+
+function isFiniteRect(rect) {
+  if (!rect) return false;
+  return [rect.left, rect.top, rect.right, rect.bottom].every((value) => Number.isFinite(Number(value)));
+}
+
 Object.assign(exports, { ComposerAdapter, readComposerText });
 
 },
@@ -1131,6 +1158,66 @@ class OverlayDetector {
     ];
     return selectors.some((selector) => Boolean(this.document?.querySelector?.(selector)));
   }
+
+  isBlockingDialogOpen() {
+    const selectors = ["[role='dialog']", "[aria-modal='true']"];
+    for (const selector of selectors) {
+      const nodes = Array.from(this.document?.querySelectorAll?.(selector) ?? []);
+      for (const node of nodes) {
+        if (!isVisibleHostOverlay(node)) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  isPromptFloatingLayerOpen({ composerRect = null } = {}) {
+    if (!isFiniteRect(composerRect)) return false;
+    const promptZone = {
+      left: Number(composerRect.left) - 56,
+      top: Number(composerRect.top) - 240,
+      right: Number(composerRect.right) + 24,
+      bottom: Number(composerRect.bottom) + 24
+    };
+    const selectors = [
+      "[data-radix-popper-content-wrapper]",
+      "[role='menu']",
+      "[role='listbox']",
+      "[role='tooltip']"
+    ];
+    for (const selector of selectors) {
+      const nodes = Array.from(this.document?.querySelectorAll?.(selector) ?? []);
+      for (const node of nodes) {
+        if (!isVisibleHostOverlay(node)) continue;
+        const rect = node.getBoundingClientRect?.() ?? null;
+        if (rectsIntersect(promptZone, rect)) return true;
+      }
+    }
+    return false;
+  }
+}
+function isVisibleHostOverlay(node) {
+  if (!node || node.hidden === true) return false;
+  if (String(node.getAttribute?.("aria-hidden") ?? "").toLowerCase() === "true") return false;
+  if (node.closest?.("#gte-root")) return false;
+  const rect = node.getBoundingClientRect?.() ?? null;
+  if (!isFiniteRect(rect)) return false;
+  const width = Number(rect.width) || Number(rect.right) - Number(rect.left);
+  const height = Number(rect.height) || Number(rect.bottom) - Number(rect.top);
+  return width > 0 && height > 0;
+}
+
+function isFiniteRect(rect) {
+  if (!rect) return false;
+  return [rect.left, rect.top, rect.right, rect.bottom].every((value) => Number.isFinite(Number(value)));
+}
+
+function rectsIntersect(a, b) {
+  if (!isFiniteRect(a) || !isFiniteRect(b)) return false;
+  return Number(a.left) < Number(b.right)
+    && Number(a.right) > Number(b.left)
+    && Number(a.top) < Number(b.bottom)
+    && Number(a.bottom) > Number(b.top);
 }
 
 Object.assign(exports, { OverlayDetector });
@@ -1351,6 +1438,7 @@ class NavigationAdapter {
     chatMotionProgressWaitMs = 8,
     chatEarlierJumpScale = 1.35,
     chatBoundaryHydrationWaitMs = 1800,
+    chatFastPathWaitMs = 220,
     maxAlignFrames = 8,
     postSettleWaitMs = 160,
     mountedFastSettleWaitMs = 120,
@@ -1373,6 +1461,7 @@ class NavigationAdapter {
     this.chatMotionProgressWaitMs = chatMotionProgressWaitMs;
     this.chatEarlierJumpScale = Math.max(1, Number(chatEarlierJumpScale) || 1);
     this.chatBoundaryHydrationWaitMs = Math.max(this.hydrationWaitMs, Number(chatBoundaryHydrationWaitMs) || 0);
+    this.chatFastPathWaitMs = Math.max(0, Number(chatFastPathWaitMs) || 0);
     this.maxAlignFrames = maxAlignFrames;
     this.postSettleWaitMs = postSettleWaitMs;
     this.mountedFastSettleWaitMs = mountedFastSettleWaitMs;
@@ -1380,9 +1469,16 @@ class NavigationAdapter {
     this.compatibility = createNavigationCompatibility();
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
     const steps = [];
-    const finish = (result) => ({ ...result, steps: steps.slice() });
+    const fastPath = { attempted: false, succeeded: false, fallbackReason: null };
+    const finish = (result) => ({
+      ...result,
+      fastAttempted: fastPath.attempted,
+      fastSucceeded: fastPath.succeeded,
+      fallbackReason: fastPath.fallbackReason,
+      steps: steps.slice()
+    });
     const recordStep = (entry) => {
       steps.push(entry);
       if (steps.length > NAVIGATION_TRACE_LIMIT) steps.splice(0, steps.length - NAVIGATION_TRACE_LIMIT);
@@ -1431,6 +1527,110 @@ class NavigationAdapter {
     const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
     const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
 
+    const initialFastPlan = planChatPredictiveFastPath({
+      allowed: allowChatPredictiveFastPath,
+      identity: conversationIdentity,
+      indexState,
+      snapshot
+    });
+    if (initialFastPlan.eligible) {
+      fastPath.attempted = true;
+      const fastStartedAt = nowMs(this.window);
+      const stability = await this.awaitChatFastPathStability({
+        container,
+        targetOrder: indexState.targetOrder,
+        orderById: indexState.orderById,
+        getIndexState,
+        isCurrent: isNavigationCurrent
+      });
+      snapshot = stability.after ?? snapshot;
+      if (stability.state === "superseded") {
+        fastPath.fallbackReason = "superseded";
+        recordStep(createNavigationTraceStep({
+          mode: "chat-fast", direction: -1,
+          elapsedMs: nowMs(this.window) - fastStartedAt,
+          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+          before: stability.before, after: stability.after,
+          outcome: { state: "superseded", progressed: false }
+        }));
+        return finish(failure("superseded", turnId));
+      }
+      if (!stability.stable) {
+        fastPath.fallbackReason = "unstable-extent";
+        recordStep(createNavigationTraceStep({
+          mode: "chat-fast", direction: -1,
+          elapsedMs: nowMs(this.window) - fastStartedAt,
+          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+          before: stability.before, after: stability.after,
+          outcome: { progressed: false }
+        }));
+      } else {
+        indexState = getIndexState();
+        const stablePlan = planChatPredictiveFastPath({
+          allowed: true,
+          identity: conversationIdentity,
+          indexState,
+          snapshot: stability.after
+        });
+        if (!stablePlan.eligible) {
+          fastPath.fallbackReason = stablePlan.reason;
+          recordStep(createNavigationTraceStep({
+            mode: "chat-fast", direction: -1,
+            elapsedMs: nowMs(this.window) - fastStartedAt,
+            jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+            before: stability.before, after: stability.after,
+            outcome: { progressed: false }
+          }));
+        } else {
+          const fastBefore = stability.after;
+          const predictedLogical = stablePlan.predictedLogical;
+          const fastJumpPx = Math.abs(Number(fastBefore.logicalPosition) - Number(predictedLogical));
+          const outcome = await this.awaitHydrationProgress({
+            turnId,
+            targetOrder: indexState.targetOrder,
+            previousSnapshot: fastBefore,
+            direction: -1,
+            container,
+            isCurrent: isNavigationCurrent,
+            orderById: indexState.orderById,
+            getIndexState,
+            waitMs: this.chatFastPathWaitMs,
+            allowMotionProgress: false,
+            scrollAction: () => setLogicalScrollPosition(container, predictedLogical, readScrollModel(container, this.window))
+          });
+          recordStep(createNavigationTraceStep({
+            mode: "chat-fast", direction: -1,
+            elapsedMs: nowMs(this.window) - fastStartedAt,
+            jumpPx: fastJumpPx, waitMs: this.chatFastPathWaitMs,
+            targetOrder: indexState.targetOrder,
+            before: fastBefore, after: outcome.snapshot, outcome
+          }));
+          if (outcome.state === "superseded") {
+            fastPath.fallbackReason = "superseded";
+            return finish(failure("superseded", turnId));
+          }
+          probes += fastJumpPx >= 1 ? 1 : 0;
+          indexState = getIndexState();
+          snapshot = outcome.snapshot ?? this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+          if (outcome.progressed) lastProgressAt = nowMs(this.window);
+          if (outcome.candidate) {
+            const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+            if (aligned.ok) {
+              fastPath.succeeded = true;
+              fastPath.fallbackReason = null;
+              return finish(aligned);
+            }
+            fastPath.fallbackReason = aligned.reason ?? "fast-verify-failed";
+            if (!retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+            indexState = getIndexState();
+            snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+          } else {
+            fastPath.fallbackReason = outcome.progressed ? "target-not-mounted" : "no-structural-progress";
+          }
+        }
+      }
+    }
+
     while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
       && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
       const loopNow = nowMs(this.window);
@@ -1476,13 +1676,13 @@ class NavigationAdapter {
       snapshot = currentSnapshot;
 
       const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
-      const localWorkEarlier = conversationIdentity?.host === "local"
+      const targetAfterVisible = visibleOrders.length > 0 && targetOrder > visibleOrders[visibleOrders.length - 1];
+      const localWorkWheel = conversationIdentity?.host === "local"
         && conversationIdentity?.source === "sidebar-local"
         && model.isColumnReverse
-        && direction < 0
-        && targetBeforeVisible;
+        && ((direction < 0 && targetBeforeVisible) || (direction > 0 && targetAfterVisible));
 
-      if (localWorkEarlier) {
+      if (localWorkWheel) {
         if (!workCompatibilityNotified) {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
@@ -1496,11 +1696,12 @@ class NavigationAdapter {
           isCurrent: isNavigationCurrent,
           orderById,
           turnCount: indexState.turns.length,
+          direction,
           getIndexState
         });
         recordStep(createNavigationTraceStep({
           mode: "work-wheel",
-          direction: -1,
+          direction,
           elapsedMs: nowMs(this.window) - stepStartedAt,
           jumpPx: outcome.step,
           waitMs: outcome.waitMs,
@@ -1785,7 +1986,26 @@ class NavigationAdapter {
     return promise;
   }
 
-  async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, getIndexState = null }) {
+  async awaitChatFastPathStability({ container, targetOrder, orderById = null, getIndexState = null, isCurrent = () => true } = {}) {
+    const readIndex = () => typeof getIndexState === "function" ? getIndexState() : null;
+    const firstIndex = readIndex();
+    const firstTargetOrder = Number.isFinite(firstIndex?.targetOrder) ? Number(firstIndex.targetOrder) : targetOrder;
+    const firstOrderById = firstIndex?.orderById ?? orderById;
+    const before = this.readHydrationSnapshot(container, firstTargetOrder, firstOrderById);
+    await nextFrame(this.window);
+    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
+    await nextFrame(this.window);
+    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
+    const lastIndex = readIndex();
+    const lastTargetOrder = Number.isFinite(lastIndex?.targetOrder) ? Number(lastIndex.targetOrder) : targetOrder;
+    const lastOrderById = lastIndex?.orderById ?? orderById;
+    const after = this.readHydrationSnapshot(container, lastTargetOrder, lastOrderById);
+    const sameIndex = firstIndex?.signature == null || lastIndex?.signature == null || firstIndex.signature === lastIndex.signature;
+    const stable = Boolean(sameIndex && chatFastSnapshotStable(before, after));
+    return { state: stable ? "stable" : "unstable", stable, before, after };
+  }
+
+  async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, direction = -1, getIndexState = null }) {
     if (!container || !isCurrent()) return { state: "superseded", progressed: false, moved: false };
     const indexState = typeof getIndexState === "function" ? getIndexState() : null;
     const currentTargetOrder = Number.isFinite(indexState?.targetOrder) ? Number(indexState.targetOrder) : targetOrder;
@@ -1800,17 +2020,19 @@ class NavigationAdapter {
       turnCount: currentTurnCount,
       targetDistance: previousSnapshot?.targetDistance,
       logicalPosition: model.logicalPosition,
-      minLogicalPosition: model.minLogicalPosition
+      minLogicalPosition: model.minLogicalPosition,
+      maxLogicalPosition: model.maxLogicalPosition,
+      direction
     });
-    const nextLogical = clamp(model.logicalPosition - step, model.minLogicalPosition, model.maxLogicalPosition);
+    const nextLogical = clamp(model.logicalPosition + direction * step, model.minLogicalPosition, model.maxLogicalPosition);
     const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
-    dispatchWheelEvent(container, this.window, -step);
+    dispatchWheelEvent(container, this.window, direction * step);
     const waitMs = moved ? this.workWheelWaitMs : this.hydrationWaitMs;
     const outcome = await this.awaitHydrationProgress({
       turnId,
       targetOrder: currentTargetOrder,
       previousSnapshot,
-      direction: -1,
+      direction,
       container,
       isCurrent,
       orderById: currentOrderById,
@@ -2194,14 +2416,54 @@ function hydrationStepSize(model = {}, visibleOrders = [], targetOrder = -1) {
   return Math.min(span, Math.max(viewport * multiplier, proportional));
 }
 
-function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0 } = {}) {
+function predictChatFastLogicalPosition({ targetOrder = null, maxKnownOrder = null, minLogicalPosition = 0, maxLogicalPosition = 0 } = {}) {
+  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || Number(maxKnownOrder) <= 0) return null;
+  const min = Number(minLogicalPosition) || 0;
+  const max = Math.max(min, Number(maxLogicalPosition) || 0);
+  const ratio = clamp(Number(targetOrder) / Number(maxKnownOrder), 0, 1);
+  return Math.round(min + (max - min) * ratio);
+}
+
+function chatFastSnapshotStable(before, after, tolerance = 2) {
+  if (!before || !after) return false;
+  const beforeOrders = (before.visibleOrders ?? []).join("|");
+  const afterOrders = (after.visibleOrders ?? []).join("|");
+  if (!beforeOrders || beforeOrders !== afterOrders) return false;
+  if (Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) > tolerance) return false;
+  if (Math.abs(Number(after.maxLogicalPosition) - Number(before.maxLogicalPosition)) > tolerance) return false;
+  if (Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition)) > tolerance) return false;
+  if (Math.abs(Number(after.clientHeight) - Number(before.clientHeight)) > tolerance) return false;
+  return Number(after.maxLogicalPosition) > Math.max(1, Number(after.clientHeight) || 0);
+}
+
+function planChatPredictiveFastPath({ allowed = false, identity = null, indexState = null, snapshot = null } = {}) {
+  if (!allowed) return { eligible: false, reason: "not-authorized", predictedLogical: null };
+  if (identity?.host !== "chatgpt" || identity?.stable !== true) return { eligible: false, reason: "unstable-identity", predictedLogical: null };
+  const targetOrder = Number(indexState?.targetOrder);
+  const maxKnownOrder = Number(indexState?.maxKnownOrder);
+  const visibleOrders = (snapshot?.visibleOrders ?? []).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || maxKnownOrder < 20) return { eligible: false, reason: "insufficient-index", predictedLogical: null };
+  const knownOrders = [...new Set([...(indexState?.orderById?.values?.() ?? [])].filter(Number.isFinite))].sort((a, b) => a - b);
+  if (knownOrders.length !== maxKnownOrder + 1 || knownOrders[0] !== 0 || knownOrders.at(-1) !== maxKnownOrder) return { eligible: false, reason: "non-contiguous-index", predictedLogical: null };
+  if (visibleOrders.length < 2 || targetOrder >= visibleOrders[0]) return { eligible: false, reason: "not-far-earlier", predictedLogical: null };
+  const distance = turnWindowDistance(targetOrder, visibleOrders);
+  if (!(distance > 20)) return { eligible: false, reason: "near-target", predictedLogical: null };
+  if (!(Number(snapshot?.maxLogicalPosition) > Math.max(1, Number(snapshot?.clientHeight) || 0))) return { eligible: false, reason: "insufficient-scroll-extent", predictedLogical: null };
+  const predictedLogical = predictChatFastLogicalPosition({ targetOrder, maxKnownOrder, minLogicalPosition: 0, maxLogicalPosition: snapshot.maxLogicalPosition });
+  if (!Number.isFinite(predictedLogical) || predictedLogical >= Number(snapshot.logicalPosition) - Math.max(180, Number(snapshot.clientHeight) || 180)) return { eligible: false, reason: "prediction-too-small", predictedLogical: null };
+  return { eligible: true, reason: null, predictedLogical };
+}
+
+function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0, maxLogicalPosition = Number.POSITIVE_INFINITY, direction = -1 } = {}) {
   const safeViewport = Math.max(240, Number(viewport) || 737);
   const base = Math.min(Math.max(240, Number(configuredStep) || 720), safeViewport);
   if (Number(turnCount) <= 12) return Math.round(Math.max(180, Math.min(base, safeViewport * 0.5)));
   const distance = Math.max(0, Number(targetDistance) || 0);
   const scale = distance > 40 ? 1.35 : distance > 20 ? 1.2 : 1;
   const desired = Math.min(base * scale, safeViewport * 1.35);
-  const remaining = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  const remaining = direction > 0
+    ? Math.max(0, Number(maxLogicalPosition) - Number(logicalPosition))
+    : Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
   return Math.round(remaining > 0 ? Math.min(desired, remaining) : desired);
 }
 
@@ -2335,7 +2597,7 @@ function failure(reason, target) {
   return { ok: false, reason, target, verified: false };
 }
 
-Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
+Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, predictChatFastLogicalPosition, chatFastSnapshotStable, planChatPredictiveFastPath, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
 
 },
 "src/v3/host/codex-desktop/host-contract.js": (module, exports, __require) => {
@@ -2535,7 +2797,7 @@ Object.assign(exports, { HOST_CONTRACT_REVISION, HOST_CONTRACT_STATUS, HostContr
 "src/v3/host/codex-desktop/codex-host.js": (module, exports, __require) => {
 const { HostInterface } = __require("src/v3/host/host-interface.js");
 const { ConversationAdapter, isStableLocalThreadIdentity } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
-const { TurnAdapter } = __require("src/v3/host/codex-desktop/turn-adapter.js");
+const { TurnAdapter, cssEscape } = __require("src/v3/host/codex-desktop/turn-adapter.js");
 const { ComposerAdapter } = __require("src/v3/host/codex-desktop/composer-adapter.js");
 const { OverlayDetector } = __require("src/v3/host/codex-desktop/overlay-detector.js");
 const { SurfaceDetector } = __require("src/v3/host/codex-desktop/surface-detector.js");
@@ -2629,6 +2891,11 @@ class CodexDesktopHost extends HostInterface {
     return this.surface.getSurface();
   }
 
+  isPromptOverlayBlocked() {
+    if (this.overlay.isBlockingDialogOpen?.()) return true;
+    return this.overlay.isPromptFloatingLayerOpen?.({ composerRect: this.getComposerRect?.() ?? null }) ?? false;
+  }
+
   getConversationId() {
     return this.conversation.getConversationId();
   }
@@ -2645,6 +2912,33 @@ class CodexDesktopHost extends HostInterface {
     return this.turns.getVisibleTurns();
   }
 
+  resolveOfficialNavigationMarkerKey(markerKey) {
+    const key = String(markerKey ?? "").trim();
+    if (!key) return null;
+    const escaped = cssEscape(key);
+    const selectors = [
+      `[data-message-id="${escaped}"]`,
+      `[data-message-id-container="${escaped}"]`,
+      `[data-user-message-id="${escaped}"]`,
+      `[data-message-key="${escaped}"]`,
+      `[data-turn-id-container="${escaped}"]`,
+      `[data-turn-id="${escaped}"]`,
+      `[data-content-search-turn-key="${escaped}"]`,
+      `[data-turn-key="${escaped}"]`
+    ];
+    const resolved = new Set();
+    const collect = (node) => {
+      if (!node) return;
+      const container = this.turns.getTurnContainer?.(node) ?? node;
+      const turnId = this.turns.getTurnId?.(container) ?? this.turns.getTurnId?.(node);
+      if (turnId) resolved.add(String(turnId));
+    };
+    collect(this.document?.getElementById?.(key));
+    for (const selector of selectors) {
+      for (const node of this.document?.querySelectorAll?.(selector) ?? []) collect(node);
+    }
+    return resolved.size === 1 ? [...resolved][0] : null;
+  }
   resolveTurn(turnId) {
     return this.turns.resolveTurn(turnId);
   }
@@ -2660,15 +2954,17 @@ class CodexDesktopHost extends HostInterface {
       windowRef: this.window
     });
     if (tailActiveTurnId) return tailActiveTurnId;
+    const identity = this.getConversationIdentity();
+    const activationOffset = identity?.stable && identity?.host === "local" && identity?.source === "sidebar-local" ? 132 : 120;
     return computeActiveTurnId({
       visibleTurns,
       resolveTurn,
       container,
-      activationOffset: 120
+      activationOffset
     });
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
     const requestId = ++this.navigationRequestId;
     const stillCurrent = () => requestId === this.navigationRequestId && isCurrent();
     const result = await this.navigation.navigateToTurn(turnId, {
@@ -2676,10 +2972,17 @@ class CodexDesktopHost extends HostInterface {
       getTurns,
       isCurrent: stillCurrent,
       allowMountedFastSettle,
+      allowChatPredictiveFastPath,
       onTraceStep
     });
     if (result?.ok && result?.verified && stillCurrent()) this.persistLocalScrollPosition();
     return result;
+  }
+
+  notifyNavigationIntent() {
+    const container = this.getScrollContainer();
+    if (!container || container.isConnected === false) return false;
+    return this.navigation.notifyCodexPlusScrollIntent?.(container, () => true) ?? false;
   }
 
   persistLocalScrollPosition() {
@@ -2978,6 +3281,7 @@ class QuestionListPanel {
     this.programmaticScrollTop = null;
     this.renderCount = 0;
     this.activeUpdateCount = 0;
+    this.openFollowGeneration = 0;
     this.boundResize = () => this.updatePosition();
   }
 
@@ -3037,12 +3341,16 @@ class QuestionListPanel {
   }
 
   setOpen(open) {
-    this.opened = Boolean(open);
+    const nextOpen = Boolean(open);
+    const openingAnchor = nextOpen && !this.opened ? this.getAnchorRect?.() ?? null : null;
+    this.opened = nextOpen;
     if (this.element) this.element.hidden = !this.opened;
     if (this.opened) {
       this.manualBrowse = false;
-      this.updatePosition();
-      this.scrollActiveIntoView();
+      this.updatePosition(openingAnchor);
+      this.scheduleActiveFollow();
+    } else {
+      this.openFollowGeneration += 1;
     }
     this.onOpenChange(this.opened);
   }
@@ -3058,9 +3366,9 @@ class QuestionListPanel {
     if (this.opened) this.updatePosition();
   }
 
-  updatePosition() {
+  updatePosition(anchorOverride = null) {
     if (!this.opened || !this.element) return;
-    const anchor = this.getAnchorRect?.();
+    const anchor = anchorOverride ?? this.getAnchorRect?.();
     if (!anchor) return;
     const viewportWidth = Number(this.window?.visualViewport?.width ?? this.window?.innerWidth ?? 1280);
     const viewportHeight = Number(this.window?.visualViewport?.height ?? this.window?.innerHeight ?? 800);
@@ -3162,6 +3470,16 @@ class QuestionListPanel {
     queueMicrotask(() => { this.suppressScroll = false; this.programmaticScrollTop = null; });
   }
 
+  scheduleActiveFollow() {
+    const generation = ++this.openFollowGeneration;
+    const run = () => {
+      if (!this.opened || generation !== this.openFollowGeneration) return;
+      this.scrollActiveIntoView();
+    };
+    if (typeof this.window?.requestAnimationFrame === "function") this.window.requestAnimationFrame(run);
+    else (this.window?.setTimeout ?? setTimeout)(run, 0);
+  }
+
   scrollActiveIntoView() {
     const row = this.findRow(this.activeTurnId);
     if (!row) return;
@@ -3197,6 +3515,7 @@ class QuestionListPanel {
   }
 
   destroy() {
+    this.openFollowGeneration += 1;
     this.window?.removeEventListener?.("resize", this.boundResize);
     this.window?.visualViewport?.removeEventListener?.("resize", this.boundResize);
     this.element?.remove?.();
@@ -3717,11 +4036,12 @@ class AppShell {
   setSurface(surface) {
     this.surface = surface;
     const timelineVisible = surface === SURFACE.CONVERSATION;
-    const promptVisible = surface === SURFACE.CONVERSATION || surface === SURFACE.NEW_CHAT;
+    const promptBlocked = Boolean(this.host?.isPromptOverlayBlocked?.());
+    const promptVisible = (surface === SURFACE.CONVERSATION || surface === SURFACE.NEW_CHAT) && !promptBlocked;
     this.rail?.setVisible(timelineVisible);
     this.questionList?.setVisible(timelineVisible);
     this.promptTrigger?.setVisible(promptVisible);
-    if (surface === SURFACE.SETTINGS) this.promptPanel?.setOpen?.(false);
+    if (!promptVisible) this.promptPanel?.setOpen?.(false);
     this.promptPanel?.setVisible(promptVisible);
     if (this.hostElement?.getAttribute?.("data-gte-surface") !== surface) this.hostElement?.setAttribute?.("data-gte-surface", surface);
   }
@@ -3822,6 +4142,1872 @@ class AppShell {
 Object.assign(exports, { AppShell });
 
 },
+"src/v3/diagnostics/official-navigation-probe.js": (module, exports, __require) => {
+const { createScrollModel } = __require("src/v3/core/scroll-model.js");
+
+const DEFAULT_SAMPLE_DELAYS_MS = [24, 80, 180, 420, 900, 1200];
+const MAX_SAMPLES = 32;
+const MAX_PATH_NODES = 6;
+const MAX_CLASS_TOKENS = 8;
+
+class OfficialNavigationProbe {
+  constructor({ document, window, getContext = () => null, getScrollContainer = () => null, getVisibleRange = () => null, isOwnedEvent = defaultOwnedEvent, onPrivateMarker = null, onRecord = null, sampleDelaysMs = DEFAULT_SAMPLE_DELAYS_MS } = {}) {
+    this.document = document ?? globalThis.document;
+    this.window = window ?? globalThis.window;
+    this.getContext = getContext;
+    this.getScrollContainer = getScrollContainer;
+    this.getVisibleRange = getVisibleRange;
+    this.isOwnedEvent = isOwnedEvent;
+    this.onPrivateMarker = onPrivateMarker;
+    this.onRecord = onRecord;
+    this.sampleDelaysMs = [...sampleDelaysMs].filter((value) => Number(value) >= 0);
+    this.active = null;
+    this.sequence = 0;
+    this.started = false;
+    this.boundClick = (event) => this.handleClick(event);
+  }
+
+  start() {
+    if (this.started) return this;
+    this.started = true;
+    this.document?.addEventListener?.("click", this.boundClick, true);
+    return this;
+  }
+
+  destroy() {
+    if (!this.started) return;
+    this.started = false;
+    this.document?.removeEventListener?.("click", this.boundClick, true);
+    this.finishActive("destroyed", { emit: false });
+  }
+
+  handleClick(event) {
+    if (!this.started || this.isOwnedEvent?.(event)) return;
+    const context = safeCall(this.getContext);
+    if (!context?.enabled || !context?.sessionKey) return;
+    if (isConversationSwitchEvent(event) || isEditorEvent(event)) return;
+    const container = safeCall(this.getScrollContainer);
+    if (!container || container.isConnected === false) return;
+
+    this.finishActive("superseded-click");
+    const startedAtMs = probeNow(this.window);
+    const active = {
+      probeId: ++this.sequence,
+      context,
+      initialContainer: container,
+      startedAtMs,
+      startedAt: new Date().toISOString(),
+      trigger: fingerprintClickTarget(event, this.window),
+      marker: identifyOfficialNavigationMarker(event, this.document),
+      before: this.readSnapshot(container),
+      after: null,
+      samples: [],
+      timers: [],
+      observer: null,
+      scrollContainer: null,
+      scrollEventCount: 0,
+      mutationCount: 0,
+      firstScrollMs: null,
+      firstWindowMs: null,
+      firstExtentMs: null
+    };
+    this.active = active;
+    const privateMarkerKey = readOfficialNavigationMarkerKey(event);
+    if (active.marker && privateMarkerKey) {
+      try { this.onPrivateMarker?.({ probeId: active.probeId, sessionKey: context.sessionKey, markerKey: privateMarkerKey, markerIndex: active.marker.markerIndex, markerCount: active.marker.markerCount }); } catch {}
+    }
+    this.appendSample(active, "click", active.before, 0);
+    this.bindActiveContainer(active, container);
+
+    for (const delayMs of this.sampleDelaysMs) {
+      const timer = setTimer(this.window, () => {
+        if (this.active !== active) return;
+        const snapshot = this.readSnapshot();
+        this.observeMilestones(active, snapshot);
+        this.appendSample(active, "timer", snapshot);
+        if (delayMs === this.sampleDelaysMs.at(-1)) this.finishActive("settled");
+      }, delayMs);
+      active.timers.push(timer);
+    }
+  }
+
+  bindActiveContainer(active, container) {
+    if (!active || !container || active.scrollContainer === container) return;
+    if (active.scrollContainer) active.scrollContainer.removeEventListener?.("scroll", active.onScroll);
+    active.scrollContainer = container;
+    active.onScroll = () => {
+      if (this.active !== active) return;
+      active.scrollEventCount += 1;
+      if (active.firstScrollMs == null) active.firstScrollMs = elapsedMs(this.window, active.startedAtMs);
+      const currentContainer = safeCall(this.getScrollContainer) ?? container;
+      if (currentContainer !== active.scrollContainer) this.bindActiveContainer(active, currentContainer);
+      const snapshot = this.readSnapshot(currentContainer);
+      this.observeMilestones(active, snapshot);
+      this.appendSample(active, "scroll", snapshot);
+    };
+    container.addEventListener?.("scroll", active.onScroll, { passive: true });
+
+    try { active.observer?.disconnect?.(); } catch {}
+    const MutationObserverCtor = this.window?.MutationObserver;
+    if (typeof MutationObserverCtor === "function") {
+      try {
+        active.observer = new MutationObserverCtor(() => {
+          if (this.active !== active) return;
+          active.mutationCount += 1;
+          const currentContainer = safeCall(this.getScrollContainer) ?? container;
+          if (currentContainer !== active.scrollContainer) this.bindActiveContainer(active, currentContainer);
+          const snapshot = this.readSnapshot(currentContainer);
+          this.observeMilestones(active, snapshot);
+          this.appendSample(active, "mutation", snapshot);
+        });
+        active.observer.observe(container, { subtree: true, childList: true, attributes: true });
+      } catch {
+        active.observer = null;
+      }
+    }
+  }
+
+  readSnapshot(explicitContainer = null) {
+    const container = explicitContainer ?? safeCall(this.getScrollContainer);
+    if (!container) return null;
+    const flexDirection = safeFlexDirection(this.window, container);
+    const model = createScrollModel({
+      scrollTop: container.scrollTop,
+      scrollHeight: container.scrollHeight,
+      clientHeight: container.clientHeight,
+      flexDirection
+    });
+    const range = sanitizeVisibleRange(safeCall(this.getVisibleRange));
+    return {
+      physicalScrollTop: roundNumber(container.scrollTop),
+      scrollHeight: roundNumber(model.scrollHeight),
+      clientHeight: roundNumber(model.clientHeight),
+      logicalPosition: roundNumber(model.logicalPosition),
+      maxLogicalPosition: roundNumber(model.maxLogicalPosition),
+      isColumnReverse: Boolean(model.isColumnReverse),
+      visibleRange: range,
+      containerChanged: Boolean(this.active && container !== this.active.initialContainer)
+    };
+  }
+
+  observeMilestones(active, snapshot) {
+    if (!active || !snapshot || !active.before) return;
+    const t = elapsedMs(this.window, active.startedAtMs);
+    if (active.firstWindowMs == null && visibleRangeChanged(active.before.visibleRange, snapshot.visibleRange)) active.firstWindowMs = t;
+    if (active.firstExtentMs == null && Math.abs(snapshot.scrollHeight - active.before.scrollHeight) > 2) active.firstExtentMs = t;
+  }
+
+  appendSample(active, kind, snapshot, explicitElapsed = null) {
+    if (!active || !snapshot) return;
+    const sample = { t: explicitElapsed == null ? elapsedMs(this.window, active.startedAtMs) : explicitElapsed, kind, ...snapshot };
+    const previous = active.samples.at(-1);
+    if (previous && sampleEquivalent(previous, sample)) return;
+    active.samples.push(sample);
+    if (active.samples.length > MAX_SAMPLES) active.samples.splice(0, active.samples.length - MAX_SAMPLES);
+  }
+
+  finishActive(reason = "settled", { emit = true } = {}) {
+    const active = this.active;
+    if (!active) return null;
+    this.active = null;
+    for (const timer of active.timers ?? []) clearTimer(this.window, timer);
+    try { active.observer?.disconnect?.(); } catch {}
+    active.scrollContainer?.removeEventListener?.("scroll", active.onScroll);
+
+    const currentContext = safeCall(this.getContext);
+    if (!emit || !currentContext?.enabled || currentContext.sessionKey !== active.context.sessionKey) return null;
+    const finalContainer = safeCall(this.getScrollContainer) ?? active.initialContainer;
+    const after = this.readSnapshot(finalContainer);
+    active.after = after;
+    this.observeMilestones(active, after);
+    this.appendSample(active, "final", after);
+    if (!meaningfulNavigationChange(active.before, after, active.samples, active.scrollEventCount)) return null;
+
+    const metrics = computeProbeMetrics(active);
+    const record = sanitizeOfficialNavigationRecord({
+      probeId: active.probeId,
+      host: active.context.host ?? null,
+      source: active.context.source ?? null,
+      stable: Boolean(active.context.stable),
+      startedAt: active.startedAt,
+      finishedReason: reason,
+      trigger: active.trigger,
+      marker: active.marker,
+      totalElapsedMs: elapsedMs(this.window, active.startedAtMs),
+      clickToFirstScrollMs: active.firstScrollMs,
+      clickToFirstWindowMs: active.firstWindowMs,
+      clickToFirstExtentMs: active.firstExtentMs,
+      scrollEventCount: active.scrollEventCount,
+      mutationCount: active.mutationCount,
+      classification: classifyNavigation(active, metrics),
+      metrics,
+      before: active.before,
+      after,
+      samples: active.samples
+    });
+    if (record) {
+      try { this.onRecord?.(record); } catch {}
+    }
+    return record;
+  }
+}
+
+
+function readOfficialNavigationMarkerKey(event) {
+  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
+  for (const node of path ?? []) {
+    const value = node?.getAttribute?.("data-thread-user-message-navigation-item-id");
+    if (value != null) {
+      const key = String(value).trim();
+      return key || null;
+    }
+  }
+  return null;
+}
+
+function identifyOfficialNavigationMarker(event, documentRef = globalThis.document) {
+  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
+  let marker = null;
+  for (const node of path ?? []) {
+    if (node?.getAttribute?.("data-thread-user-message-navigation-item-id") != null) { marker = node; break; }
+  }
+  if (!marker) return null;
+  const buttons = Array.from(documentRef?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+  const index = buttons.indexOf(marker);
+  if (index < 0) return null;
+  return { markerIndex: index, markerCount: buttons.length };
+}
+
+function sanitizeOfficialNavigationLearningSample(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const markerIndex = Number(value.markerIndex);
+  const markerCount = Number(value.markerCount);
+  const targetOrder = Number(value.targetOrder);
+  const knownTurnCount = Number(value.knownTurnCount);
+  if (!Number.isInteger(markerIndex) || markerIndex < 0 || !Number.isInteger(markerCount) || markerCount <= markerIndex || !Number.isInteger(targetOrder) || targetOrder < 0) return null;
+  return {
+    markerIndex,
+    markerCount,
+    targetOrder,
+    knownTurnCount: Number.isInteger(knownTurnCount) && knownTurnCount >= 0 ? knownTurnCount : null,
+    host: safeString(value.host),
+    classification: safeString(value.classification),
+    observedAt: safeString(value.observedAt)
+  };
+}
+
+function selectTrustedOfficialBridgePair({ learning, targetOrder, markerCount, knownTurnCount, minHits = 2 } = {}) {
+  if (!learning || typeof learning !== "object") return null;
+  if (!learning.oneToOneObserved || !learning.monotonic || Number(learning.markerConflicts) > 0 || Number(learning.targetConflicts) > 0) return null;
+  if (!Number.isInteger(targetOrder) || targetOrder < 0) return null;
+  if (!Number.isInteger(markerCount) || markerCount <= 0 || Number(learning.markerCount) !== markerCount) return null;
+  if (!Number.isInteger(knownTurnCount) || knownTurnCount <= 0 || Number(learning.knownTurnCount) !== knownTurnCount) return null;
+  const pair = (Array.isArray(learning.observedPairs) ? learning.observedPairs : []).find((item) => Number(item?.targetOrder) === targetOrder);
+  if (!pair || !Number.isInteger(pair.markerIndex) || pair.markerIndex < 0 || pair.markerIndex >= markerCount) return null;
+  if ((Number(pair.hits) || 0) < Math.max(2, Number(minHits) || 2)) return null;
+  return { markerIndex: Number(pair.markerIndex), targetOrder, hits: Number(pair.hits) || 0 };
+}
+
+function sanitizeOfficialNavigationLearningHistory(value, limit = 32) {
+  if (!Array.isArray(value)) return [];
+  return value.map(sanitizeOfficialNavigationLearningSample).filter(Boolean).slice(-Math.max(1, Number(limit) || 32));
+}
+
+function analyzeOfficialNavigationLearning(samples = []) {
+  const clean = sanitizeOfficialNavigationLearningHistory(samples, 256);
+  const markerTargets = new Map();
+  const targetMarkers = new Map();
+  for (const sample of clean) {
+    const targets = markerTargets.get(sample.markerIndex) ?? new Set(); targets.add(sample.targetOrder); markerTargets.set(sample.markerIndex, targets);
+    const markers = targetMarkers.get(sample.targetOrder) ?? new Set(); markers.add(sample.markerIndex); targetMarkers.set(sample.targetOrder, markers);
+  }
+  const markerConflicts = [...markerTargets.values()].filter((targets) => targets.size > 1).length;
+  const targetConflicts = [...targetMarkers.values()].filter((markers) => markers.size > 1).length;
+  const pairs = [...markerTargets.entries()]
+    .filter(([, targets]) => targets.size === 1)
+    .map(([markerIndex, targets]) => {
+      const targetOrder = [...targets][0];
+      const hits = clean.filter((sample) => sample.markerIndex === markerIndex && sample.targetOrder === targetOrder).length;
+      return { markerIndex, targetOrder, offset: markerIndex - targetOrder, hits };
+    })
+    .sort((a, b) => a.markerIndex - b.markerIndex);
+  const monotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
+  const oneToOneObserved = markerConflicts === 0 && targetConflicts === 0;
+  const uniqueOffsets = [...new Set(pairs.map((pair) => pair.offset))].sort((a,b)=>a-b);
+  const latest = clean.at(-1) ?? null;
+  const knownTurnCount = latest?.knownTurnCount ?? null;
+  const markerCount = latest?.markerCount ?? null;
+  const targetCoverage = Number.isInteger(knownTurnCount) && knownTurnCount > 0 ? ratio(targetMarkers.size, knownTurnCount) : 0;
+  let recommendedBridgeMode = 'insufficient';
+  if (!oneToOneObserved || !monotonic) recommendedBridgeMode = 'unsafe-conflict';
+  else if (targetCoverage >= 0.95 && pairs.length >= 5) recommendedBridgeMode = 'learned-index-near-complete';
+  else if (pairs.length >= 5) recommendedBridgeMode = 'learned-pairs-only';
+  else if (pairs.length > 0) recommendedBridgeMode = 'collect-more';
+  return {
+    sampleCount: clean.length,
+    uniqueMarkerCount: markerTargets.size,
+    uniqueTargetCount: targetMarkers.size,
+    markerCount,
+    knownTurnCount,
+    markerConflicts,
+    targetConflicts,
+    oneToOneObserved,
+    monotonic,
+    uniqueOffsets,
+    targetCoverage: clampRatio(targetCoverage),
+    observedPairs: pairs.slice(-64),
+    recommendedBridgeMode
+  };
+}
+
+function sanitizeOfficialMarker(value) {
+  if (!value || typeof value !== "object") return null;
+  const markerIndex = Number(value.markerIndex), markerCount = Number(value.markerCount);
+  if (!Number.isInteger(markerIndex) || markerIndex < 0 || !Number.isInteger(markerCount) || markerCount <= markerIndex) return null;
+  return { markerIndex, markerCount };
+}
+
+function fingerprintClickTarget(event, windowRef = globalThis.window) {
+  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
+  const nodes = [];
+  for (const node of path ?? []) {
+    if (!node || typeof node !== "object" || !node.tagName) continue;
+    const tag = String(node.tagName).toLowerCase();
+    if (tag === "html" || tag === "body") continue;
+    nodes.push(fingerprintElement(node, windowRef));
+    if (nodes.length >= MAX_PATH_NODES) break;
+  }
+  return { trusted: Boolean(event?.isTrusted), path: nodes };
+}
+
+function analyzeOfficialNavigationMapping({ document, turns = [] } = {}) {
+  const buttons = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+  const officialIds = buttons
+    .map((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim())
+    .filter(Boolean);
+  const orderedTurns = (Array.isArray(turns) ? turns : [])
+    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
+    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }))
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  const turnOrderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
+  const officialUniqueIdCount = new Set(officialIds).size;
+  const knownUniqueIdCount = new Set(orderedTurns.map((turn) => turn.id)).size;
+  const matchedOrders = officialIds.map((id) => turnOrderById.get(id)).filter(Number.isFinite);
+  const exactIdMatches = matchedOrders.length;
+  let orderedExactMatches = 0;
+  for (let index = 0; index < Math.min(officialIds.length, orderedTurns.length); index += 1) {
+    if (officialIds[index] === orderedTurns[index].id) orderedExactMatches += 1;
+  }
+  const matchedOrderMonotonic = matchedOrders.every((order, index) => index === 0 || order > matchedOrders[index - 1]);
+  const officialButtonCount = officialIds.length;
+  const knownTurnCount = orderedTurns.length;
+  const exactButtonCoverage = ratio(exactIdMatches, officialButtonCount);
+  const exactTurnCoverage = ratio(exactIdMatches, knownTurnCount);
+  const orderedCoverage = ratio(orderedExactMatches, Math.min(officialButtonCount, knownTurnCount));
+  const countAligned = officialButtonCount > 0 && officialButtonCount === knownTurnCount;
+  const oneToOneExact = officialButtonCount > 0
+    && officialUniqueIdCount === officialButtonCount
+    && knownUniqueIdCount === knownTurnCount
+    && countAligned
+    && exactIdMatches === officialButtonCount
+    && orderedExactMatches === officialButtonCount
+    && matchedOrderMonotonic;
+  let recommendedBridgeMode = 'insufficient';
+  if (oneToOneExact) recommendedBridgeMode = 'direct-exact-id';
+  else if (officialButtonCount > 0 && exactButtonCoverage >= 0.95 && matchedOrderMonotonic) recommendedBridgeMode = 'direct-exact-id-partial';
+  else if (countAligned && orderedCoverage >= 0.95) recommendedBridgeMode = 'ordered-index-candidate';
+  else if (officialButtonCount > 0 && exactIdMatches > 0) recommendedBridgeMode = 'mixed-unsafe';
+  return sanitizeOfficialNavigationMapping({
+    officialButtonCount,
+    officialUniqueIdCount,
+    knownTurnCount,
+    knownUniqueIdCount,
+    exactIdMatches,
+    orderedExactMatches,
+    exactButtonCoverage,
+    exactTurnCoverage,
+    orderedCoverage,
+    matchedOrderMonotonic,
+    countAligned,
+    oneToOneExact,
+    matchedOrderRange: matchedOrders.length ? { min: Math.min(...matchedOrders), max: Math.max(...matchedOrders), count: matchedOrders.length } : null,
+    recommendedBridgeMode
+  });
+}
+
+function sanitizeOfficialNavigationMapping(value = {}) {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    officialButtonCount: nonNegativeInt(value.officialButtonCount),
+    officialUniqueIdCount: nonNegativeInt(value.officialUniqueIdCount),
+    knownTurnCount: nonNegativeInt(value.knownTurnCount),
+    knownUniqueIdCount: nonNegativeInt(value.knownUniqueIdCount),
+    exactIdMatches: nonNegativeInt(value.exactIdMatches),
+    orderedExactMatches: nonNegativeInt(value.orderedExactMatches),
+    exactButtonCoverage: clampRatio(value.exactButtonCoverage),
+    exactTurnCoverage: clampRatio(value.exactTurnCoverage),
+    orderedCoverage: clampRatio(value.orderedCoverage),
+    matchedOrderMonotonic: Boolean(value.matchedOrderMonotonic),
+    countAligned: Boolean(value.countAligned),
+    oneToOneExact: Boolean(value.oneToOneExact),
+    matchedOrderRange: sanitizeVisibleRange(value.matchedOrderRange),
+    recommendedBridgeMode: safeString(value.recommendedBridgeMode) ?? 'insufficient'
+  };
+}
+
+function ratio(numerator, denominator) {
+  if (!(Number(denominator) > 0)) return 0;
+  return Math.round((Number(numerator) / Number(denominator)) * 1000) / 1000;
+}
+
+function clampRatio(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
+}
+
+function nonNegativeInt(value) {
+  return Math.max(0, Math.round(Number(value) || 0));
+}
+
+function sanitizeOfficialNavigationHistory(value, limit = 10) {
+  if (!Array.isArray(value)) return [];
+  return value.map(sanitizeOfficialNavigationRecord).filter(Boolean).slice(-Math.max(1, Number(limit) || 10));
+}
+
+function sanitizeOfficialNavigationRecord(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    probeId: Number(value.probeId) || 0,
+    host: safeString(value.host),
+    source: safeString(value.source),
+    stable: Boolean(value.stable),
+    startedAt: safeString(value.startedAt),
+    finishedReason: safeString(value.finishedReason),
+    trigger: sanitizeTrigger(value.trigger),
+    marker: sanitizeOfficialMarker(value.marker),
+    learningSample: sanitizeOfficialNavigationLearningSample(value.learningSample),
+    totalElapsedMs: nullableRound(value.totalElapsedMs),
+    clickToFirstScrollMs: nullableRound(value.clickToFirstScrollMs),
+    clickToFirstWindowMs: nullableRound(value.clickToFirstWindowMs),
+    clickToFirstExtentMs: nullableRound(value.clickToFirstExtentMs),
+    scrollEventCount: Math.max(0, Math.round(Number(value.scrollEventCount) || 0)),
+    mutationCount: Math.max(0, Math.round(Number(value.mutationCount) || 0)),
+    classification: safeString(value.classification) ?? "navigation-change",
+    mapping: sanitizeOfficialNavigationMapping(value.mapping),
+    metrics: sanitizeMetrics(value.metrics),
+    before: sanitizeSnapshot(value.before),
+    after: sanitizeSnapshot(value.after),
+    samples: (Array.isArray(value.samples) ? value.samples : []).map(sanitizeSample).filter(Boolean).slice(-MAX_SAMPLES)
+  };
+}
+
+function fingerprintElement(element, windowRef) {
+  const role = safeAttribute(element, "role");
+  const classes = String(element.className ?? "").split(/\s+/).map((token) => token.trim()).filter(Boolean).slice(0, MAX_CLASS_TOKENS);
+  const dataAttributes = [];
+  for (const attribute of Array.from(element.attributes ?? [])) {
+    const name = String(attribute?.name ?? "");
+    if (!name.startsWith("data-")) continue;
+    dataAttributes.push({ name, kind: classifyAttributeValue(attribute?.value) });
+    if (dataAttributes.length >= 10) break;
+  }
+  const rect = element.getBoundingClientRect?.();
+  const innerWidth = Number(windowRef?.innerWidth) || null;
+  return {
+    tag: String(element.tagName ?? "").toLowerCase() || null,
+    role: role || null,
+    classes,
+    hasId: Boolean(element.id),
+    ariaLabel: attributeShape(element, "aria-label"),
+    ariaCurrent: attributeShape(element, "aria-current"),
+    title: attributeShape(element, "title"),
+    dataAttributes,
+    rect: rect ? {
+      top: roundNumber(rect.top),
+      left: roundNumber(rect.left),
+      width: roundNumber(rect.width),
+      height: roundNumber(rect.height),
+      rightInset: innerWidth == null ? null : roundNumber(innerWidth - Number(rect.right || 0))
+    } : null
+  };
+}
+
+function attributeShape(element, name) {
+  const value = safeAttribute(element, name);
+  if (!value) return null;
+  return { present: true, length: String(value).length, kind: classifyAttributeValue(value) };
+}
+
+function classifyAttributeValue(value) {
+  const text = String(value ?? "");
+  if (!text) return "empty";
+  if (/^-?\d+(?:\.\d+)?$/.test(text)) return "numeric";
+  if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(text)) return "uuid-like";
+  if (/^(true|false|page|step|location|date|time)$/i.test(text)) return "enum";
+  if (text.length <= 24 && /^[A-Za-z0-9_.:-]+$/.test(text)) return "short-token";
+  return text.length > 80 ? "long-text" : "text";
+}
+
+function sanitizeTrigger(value) {
+  if (!value || typeof value !== "object") return { trusted: false, path: [] };
+  return {
+    trusted: Boolean(value.trusted),
+    path: (Array.isArray(value.path) ? value.path : []).slice(0, MAX_PATH_NODES).map((node) => ({
+      tag: safeString(node?.tag),
+      role: safeString(node?.role),
+      classes: (Array.isArray(node?.classes) ? node.classes : []).map(safeString).filter(Boolean).slice(0, MAX_CLASS_TOKENS),
+      hasId: Boolean(node?.hasId),
+      ariaLabel: sanitizeAttributeShape(node?.ariaLabel),
+      ariaCurrent: sanitizeAttributeShape(node?.ariaCurrent),
+      title: sanitizeAttributeShape(node?.title),
+      dataAttributes: (Array.isArray(node?.dataAttributes) ? node.dataAttributes : []).slice(0, 10).map((item) => ({ name: safeString(item?.name), kind: safeString(item?.kind) })).filter((item) => item.name),
+      rect: sanitizeRect(node?.rect)
+    }))
+  };
+}
+
+function sanitizeAttributeShape(value) {
+  if (!value || typeof value !== "object") return null;
+  return { present: Boolean(value.present), length: Math.max(0, Math.round(Number(value.length) || 0)), kind: safeString(value.kind) };
+}
+
+function sanitizeRect(value) {
+  if (!value || typeof value !== "object") return null;
+  return { top: nullableRound(value.top), left: nullableRound(value.left), width: nullableRound(value.width), height: nullableRound(value.height), rightInset: nullableRound(value.rightInset) };
+}
+
+function sanitizeVisibleRange(value) {
+  if (!value || typeof value !== "object") return null;
+  const min = Number(value.min), max = Number(value.max), count = Number(value.count);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  return { min, max, count: Number.isFinite(count) ? count : Math.max(0, max - min + 1) };
+}
+
+function sanitizeSnapshot(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    physicalScrollTop: nullableRound(value.physicalScrollTop),
+    scrollHeight: nullableRound(value.scrollHeight),
+    clientHeight: nullableRound(value.clientHeight),
+    logicalPosition: nullableRound(value.logicalPosition),
+    maxLogicalPosition: nullableRound(value.maxLogicalPosition),
+    isColumnReverse: Boolean(value.isColumnReverse),
+    visibleRange: sanitizeVisibleRange(value.visibleRange),
+    containerChanged: Boolean(value.containerChanged)
+  };
+}
+
+function sanitizeSample(value) {
+  const snapshot = sanitizeSnapshot(value);
+  if (!snapshot) return null;
+  return { t: nullableRound(value?.t), kind: safeString(value?.kind), ...snapshot };
+}
+
+function sanitizeMetrics(value) {
+  if (!value || typeof value !== "object") return { logicalDelta: 0, absoluteLogicalDelta: 0, maxSingleLogicalDelta: 0, distinctMotionSteps: 0, extentDelta: 0, windowChanged: false, containerChanged: false };
+  return {
+    logicalDelta: roundNumber(value.logicalDelta),
+    absoluteLogicalDelta: Math.abs(roundNumber(value.absoluteLogicalDelta)),
+    maxSingleLogicalDelta: Math.abs(roundNumber(value.maxSingleLogicalDelta)),
+    distinctMotionSteps: Math.max(0, Math.round(Number(value.distinctMotionSteps) || 0)),
+    extentDelta: roundNumber(value.extentDelta),
+    windowChanged: Boolean(value.windowChanged),
+    containerChanged: Boolean(value.containerChanged)
+  };
+}
+
+function computeProbeMetrics(active) {
+  const before = active.before ?? {};
+  const after = active.after ?? {};
+  let maxSingleLogicalDelta = 0, distinctMotionSteps = 0, previous = null;
+  for (const sample of active.samples ?? []) {
+    if (previous) {
+      const delta = Math.abs(Number(sample.logicalPosition) - Number(previous.logicalPosition));
+      if (delta > 2) distinctMotionSteps += 1;
+      maxSingleLogicalDelta = Math.max(maxSingleLogicalDelta, delta);
+    }
+    previous = sample;
+  }
+  return {
+    logicalDelta: roundNumber(Number(after.logicalPosition) - Number(before.logicalPosition)),
+    absoluteLogicalDelta: roundNumber(Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition))),
+    maxSingleLogicalDelta: roundNumber(maxSingleLogicalDelta),
+    distinctMotionSteps,
+    extentDelta: roundNumber(Number(after.scrollHeight) - Number(before.scrollHeight)),
+    windowChanged: visibleRangeChanged(before.visibleRange, after.visibleRange),
+    containerChanged: Boolean(after.containerChanged || (active.samples ?? []).some((sample) => sample.containerChanged))
+  };
+}
+
+function classifyNavigation(active, metrics) {
+  const viewport = Math.max(1, Number(active.before?.clientHeight) || 1);
+  if (metrics.windowChanged && metrics.absoluteLogicalDelta <= 2 && active.scrollEventCount <= 1) return "virtual-window-swap";
+  if (metrics.absoluteLogicalDelta >= viewport * 1.5 && metrics.distinctMotionSteps <= 2 && active.scrollEventCount <= 2) return metrics.windowChanged ? "single-jump-window-swap" : "single-jump";
+  if (metrics.distinctMotionSteps >= 3 || active.scrollEventCount >= 3) return "multi-step-scroll";
+  if (metrics.windowChanged || Math.abs(metrics.extentDelta) > 2) return "window-or-extent-navigation";
+  return "navigation-change";
+}
+
+function meaningfulNavigationChange(before, after, samples, scrollEventCount) {
+  if (!before || !after) return false;
+  if (Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition)) > 2) return true;
+  if (Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) > 2) return true;
+  if (visibleRangeChanged(before.visibleRange, after.visibleRange)) return true;
+  if (scrollEventCount > 0 && (samples ?? []).some((sample) => Math.abs(Number(sample.logicalPosition) - Number(before.logicalPosition)) > 2)) return true;
+  return false;
+}
+
+function visibleRangeChanged(a, b) {
+  if (!a && !b) return false;
+  if (!a || !b) return true;
+  return Number(a.min) !== Number(b.min) || Number(a.max) !== Number(b.max) || Number(a.count) !== Number(b.count);
+}
+
+function sampleEquivalent(a, b) {
+  return Number(a.logicalPosition) === Number(b.logicalPosition)
+    && Number(a.scrollHeight) === Number(b.scrollHeight)
+    && Number(a.physicalScrollTop) === Number(b.physicalScrollTop)
+    && !visibleRangeChanged(a.visibleRange, b.visibleRange)
+    && Boolean(a.containerChanged) === Boolean(b.containerChanged);
+}
+
+function defaultOwnedEvent(event) {
+  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) if (node?.id === "gte-root") return true;
+  return false;
+}
+
+function isConversationSwitchEvent(event) {
+  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) {
+    if (!node?.getAttribute) continue;
+    if (node.getAttribute("data-sidebar-chatgpt-conversation-key") != null) return true;
+    if (node.getAttribute("data-app-action-sidebar-thread-id") != null) return true;
+  }
+  return false;
+}
+
+function isEditorEvent(event) {
+  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) {
+    if (!node || !node.tagName) continue;
+    const tag = String(node.tagName).toLowerCase();
+    if (tag === "textarea" || tag === "input") return true;
+    if (node.getAttribute?.("contenteditable") === "true") return true;
+  }
+  return false;
+}
+
+function buildElementPath(target) {
+  const path = [];
+  let node = target;
+  while (node && path.length < MAX_PATH_NODES + 4) {
+    path.push(node);
+    node = node.parentElement ?? node.parentNode ?? null;
+  }
+  return path;
+}
+
+function safeAttribute(element, name) { try { return element?.getAttribute?.(name) ?? ""; } catch { return ""; } }
+function safeFlexDirection(windowRef, container) { try { return windowRef?.getComputedStyle?.(container)?.flexDirection ?? container?.style?.flexDirection ?? "column"; } catch { return container?.style?.flexDirection ?? "column"; } }
+function safeCall(fn) { try { return typeof fn === "function" ? fn() : null; } catch { return null; } }
+function elapsedMs(windowRef, startedAtMs) { return Math.max(0, Math.round(probeNow(windowRef) - Number(startedAtMs || 0))); }
+function probeNow(windowRef) { const value = Number(windowRef?.performance?.now?.()); return Number.isFinite(value) ? value : Date.now(); }
+function setTimer(windowRef, callback, delayMs) { return typeof windowRef?.setTimeout === "function" ? windowRef.setTimeout(callback, Math.max(0, Number(delayMs) || 0)) : setTimeout(callback, Math.max(0, Number(delayMs) || 0)); }
+function clearTimer(windowRef, timer) { if (typeof windowRef?.clearTimeout === "function") windowRef.clearTimeout(timer); else clearTimeout(timer); }
+function roundNumber(value) { const number = Number(value); return Number.isFinite(number) ? Math.round(number) : 0; }
+function nullableRound(value) { const number = Number(value); return Number.isFinite(number) ? Math.round(number) : null; }
+function safeString(value) { return typeof value === "string" && value ? value : null; }
+
+Object.assign(exports, { OfficialNavigationProbe, identifyOfficialNavigationMarker, sanitizeOfficialNavigationLearningSample, selectTrustedOfficialBridgePair, sanitizeOfficialNavigationLearningHistory, analyzeOfficialNavigationLearning, fingerprintClickTarget, analyzeOfficialNavigationMapping, sanitizeOfficialNavigationMapping, sanitizeOfficialNavigationHistory, sanitizeOfficialNavigationRecord });
+
+},
+"src/v3/diagnostics/official-navigation-auto-map.js": (module, exports, __require) => {
+const MARKER_SELECTOR = "[data-thread-user-message-navigation-item-id]";
+
+function analyzeOfficialNavigationAutoMap({ document, turns = [], resolveMarkerKey = null, minCoverage = 0.8 } = {}) {
+  const buttons = Array.from(document?.querySelectorAll?.(MARKER_SELECTOR) ?? []);
+  const orderedTurns = (Array.isArray(turns) ? turns : [])
+    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
+    .map((turn) => ({
+      id: String(turn.id),
+      order: Number(turn.order),
+      text: normalizeText(turn.text),
+      shortText: normalizeText(turn.shortText ?? turn.text)
+    }))
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
+  const uniqueTextOrders = buildUniqueTextOrders(orderedTurns);
+  const markerCandidates = [];
+  const strategyCounts = { domReference: 0, explicitLabel: 0, textMatch: 0, sequenceGap: 0 };
+  let markerConflicts = 0;
+
+  buttons.forEach((button, markerIndex) => {
+    const markerKey = String(button?.getAttribute?.("data-thread-user-message-navigation-item-id") ?? "").trim();
+    if (!markerKey) return;
+    const candidates = new Map();
+    const add = (order, strategy) => {
+      if (!Number.isInteger(order) || order < 0 || order >= orderedTurns.length) return;
+      const strategies = candidates.get(order) ?? new Set();
+      strategies.add(strategy);
+      candidates.set(order, strategies);
+    };
+
+    if (typeof resolveMarkerKey === "function") {
+      const resolvedId = resolveMarkerKey(markerKey);
+      const resolvedOrder = orderById.get(String(resolvedId ?? ""));
+      if (Number.isInteger(resolvedOrder)) add(resolvedOrder, "domReference");
+    }
+
+    const texts = readMarkerTexts(button);
+    for (const text of texts) {
+      const explicitOrder = parseExplicitQuestionOrder(text, orderedTurns.length);
+      if (Number.isInteger(explicitOrder)) add(explicitOrder, "explicitLabel");
+      const normalized = normalizeText(text);
+      const textOrder = uniqueTextOrders.get(normalized);
+      if (Number.isInteger(textOrder)) add(textOrder, "textMatch");
+      if (normalized.length >= 6) {
+        for (const turn of orderedTurns) {
+          const candidateText = turn.shortText || turn.text;
+          if (candidateText.length >= 6 && normalized.endsWith(candidateText)) add(turn.order, "textMatch");
+        }
+      }
+    }
+
+    if (candidates.size !== 1) {
+      if (candidates.size > 1) markerConflicts += 1;
+      return;
+    }
+    const [[targetOrder, strategies]] = candidates.entries();
+    for (const strategy of strategies) strategyCounts[strategy] += 1;
+    markerCandidates.push({ markerIndex, markerKey, targetOrder, strategies: [...strategies].sort() });
+  });
+
+  const byTarget = new Map();
+  for (const pair of markerCandidates) {
+    const list = byTarget.get(pair.targetOrder) ?? [];
+    list.push(pair);
+    byTarget.set(pair.targetOrder, list);
+  }
+  const targetConflicts = [...byTarget.values()].filter((list) => list.length > 1).length;
+  let pairs = markerCandidates
+    .filter((pair) => (byTarget.get(pair.targetOrder)?.length ?? 0) === 1)
+    .sort((a, b) => a.markerIndex - b.markerIndex);
+  const directMonotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
+  if (directMonotonic && markerConflicts === 0 && targetConflicts === 0) {
+    const anchors = [{ markerIndex: -1, targetOrder: -1 }, ...pairs, { markerIndex: buttons.length, targetOrder: orderedTurns.length }];
+    const occupiedMarkers = new Set(pairs.map((pair) => pair.markerIndex));
+    const occupiedTargets = new Set(pairs.map((pair) => pair.targetOrder));
+    const inferred = [];
+    for (let i = 0; i < anchors.length - 1; i += 1) {
+      const left = anchors[i];
+      const right = anchors[i + 1];
+      const markerGap = right.markerIndex - left.markerIndex - 1;
+      const targetGap = right.targetOrder - left.targetOrder - 1;
+      if (markerGap <= 0 || markerGap !== targetGap) continue;
+      for (let offset = 1; offset <= markerGap; offset += 1) {
+        const markerIndex = left.markerIndex + offset;
+        const targetOrder = left.targetOrder + offset;
+        if (occupiedMarkers.has(markerIndex) || occupiedTargets.has(targetOrder)) continue;
+        const button = buttons[markerIndex];
+        const markerKey = String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim();
+        if (!markerKey) continue;
+        inferred.push({ markerIndex, markerKey, targetOrder, strategies: ['sequenceGap'] });
+        occupiedMarkers.add(markerIndex);
+        occupiedTargets.add(targetOrder);
+      }
+    }
+    if (inferred.length) {
+      strategyCounts.sequenceGap += inferred.length;
+      pairs = [...pairs, ...inferred].sort((a, b) => a.markerIndex - b.markerIndex);
+    }
+  }
+  const monotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
+  const mappedTargetCount = new Set(pairs.map((pair) => pair.targetOrder)).size;
+  const knownTurnCount = orderedTurns.length;
+  const coverage = knownTurnCount > 0 ? mappedTargetCount / knownTurnCount : 0;
+  const readyCandidate = buttons.length > 0
+    && knownTurnCount >= 5
+    && markerConflicts === 0
+    && targetConflicts === 0
+    && monotonic
+    && mappedTargetCount >= 5
+    && coverage >= Math.max(0.5, Math.min(1, Number(minCoverage) || 0.8));
+
+  return {
+    privatePairs: pairs,
+    summary: {
+      markerCount: buttons.length,
+      knownTurnCount,
+      mappedTargetCount,
+      coverage: roundRatio(coverage),
+      markerConflicts,
+      targetConflicts,
+      monotonic,
+      strategyCounts,
+      readyCandidate,
+      recommendedMode: readyCandidate ? "auto-official-candidate" : "fallback-self"
+    }
+  };
+}
+
+function sanitizeOfficialNavigationAutoSummary(value = {}) {
+  const strategies = value?.strategyCounts ?? {};
+  return {
+    status: typeof value?.status === "string" ? value.status : "idle",
+    markerCount: nonNegativeInt(value?.markerCount),
+    knownTurnCount: nonNegativeInt(value?.knownTurnCount),
+    mappedTargetCount: nonNegativeInt(value?.mappedTargetCount),
+    coverage: roundRatio(value?.coverage),
+    markerConflicts: nonNegativeInt(value?.markerConflicts),
+    targetConflicts: nonNegativeInt(value?.targetConflicts),
+    monotonic: Boolean(value?.monotonic),
+    stableScans: nonNegativeInt(value?.stableScans),
+    strategyCounts: {
+      domReference: nonNegativeInt(strategies.domReference),
+      explicitLabel: nonNegativeInt(strategies.explicitLabel),
+      textMatch: nonNegativeInt(strategies.textMatch),
+      sequenceGap: nonNegativeInt(strategies.sequenceGap)
+    },
+    recommendedMode: typeof value?.recommendedMode === "string" ? value.recommendedMode : "fallback-self"
+  };
+}
+
+function officialAutoMapSignature(pairs = []) {
+  return (Array.isArray(pairs) ? pairs : [])
+    .map((pair) => `${Number(pair?.targetOrder)}\u0000${String(pair?.markerKey ?? "")}`)
+    .sort()
+    .join("\u0001");
+}
+
+function readMarkerTexts(button) {
+  const values = [
+    button?.getAttribute?.("aria-label"),
+    button?.getAttribute?.("aria-description"),
+    button?.getAttribute?.("title"),
+    button?.innerText,
+    button?.textContent
+  ];
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function parseExplicitQuestionOrder(text, knownTurnCount) {
+  const value = String(text ?? "").trim();
+  const patterns = [
+    /\bQ\s*([1-9]\d*)\b/i,
+    /\bQuestion\s*([1-9]\d*)\b/i,
+    /问题\s*([1-9]\d*)/i,
+    /第\s*([1-9]\d*)\s*(?:个)?(?:问题|提问)/i
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (!match) continue;
+    const number = Number.parseInt(match[1], 10);
+    if (Number.isInteger(number) && number >= 1 && number <= knownTurnCount) return number - 1;
+  }
+  return null;
+}
+
+function buildUniqueTextOrders(turns) {
+  const map = new Map();
+  const ambiguous = new Set();
+  for (const turn of turns) {
+    for (const text of [turn.text, turn.shortText]) {
+      if (!text || text.length < 3) continue;
+      if (map.has(text) && map.get(text) !== turn.order) {
+        ambiguous.add(text);
+        map.delete(text);
+      } else if (!ambiguous.has(text)) {
+        map.set(text, turn.order);
+      }
+    }
+  }
+  return map;
+}
+
+function normalizeText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function nonNegativeInt(value) {
+  return Math.max(0, Math.round(Number(value) || 0));
+}
+
+function roundRatio(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
+}
+
+Object.assign(exports, { analyzeOfficialNavigationAutoMap, sanitizeOfficialNavigationAutoSummary, officialAutoMapSignature });
+
+},
+"src/v3/diagnostics/host-internal-depth-probe.js": (module, exports, __require) => {
+const CANDIDATE_KEY_RE = /(id|turn|message|thread|nav|index|order|item|scroll|virtual|range|offset)/i;
+const REACT_PROPS_PREFIX = '__reactProps$';
+const REACT_FIBER_PREFIX = '__reactFiber$';
+const REACT_CONTAINER_PREFIX = '__reactContainer$';
+
+function collectHostInternalDepthProbe({ window: windowRef, document, host, turns = [] } = {}) {
+  const orderedTurns = (Array.isArray(turns) ? turns : [])
+    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
+    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }));
+  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
+  const markers = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+  const marker = markers[0] ?? null;
+  const markerSample = sampleMarkers(markers, 8);
+  const scrollContainer = host?.getScrollContainer?.() ?? null;
+  const conversationRoot = host?.conversation?.getConversationRoot?.() ?? scrollContainer?.parentElement ?? null;
+
+  const level1 = collectLevel1(windowRef);
+  const level2 = collectReactPropsLayer({ marker, markerSample, scrollContainer, conversationRoot, orderById });
+  const level3 = collectFiberLayer({ marker, markerSample, scrollContainer, conversationRoot, orderById });
+  const l3AutoBridgeProbe = collectL3AutoBridgeProbe({ markers, orderById });
+  return {
+    capturedAt: new Date().toISOString(),
+    host: host?.getConversationIdentity?.()?.host ?? null,
+    level0: {
+      officialMarkerCount: markers.length,
+      hasScrollContainer: Boolean(scrollContainer),
+      markerReactOwnKeys: marker ? reactOwnKeys(marker) : []
+    },
+    level1,
+    level2,
+    level3,
+    l3AutoBridgeProbe,
+    conclusion: summarizeRequiredDepth({ markerCount: markers.length, level1, level2, level3 })
+  };
+}
+
+function collectL3ExactKeyJoinDryRunMap({ document, turns = [], preferredPattern = null } = {}) {
+  const orderedTurns = (Array.isArray(turns) ? turns : [])
+    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
+    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }));
+  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
+  const markers = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+  return collectExactKeyJoinMap({ markers, orderById, preferredPattern });
+}
+function collectLevel1(windowRef) {
+  const handlers = safeDataValue(windowRef, '__codexThreadScrollHandlers');
+  const globals = [];
+  for (const name of safeOwnNames(windowRef)) {
+    if (!/(codex|thread|scroll|nav|virtual|message)/i.test(name)) continue;
+    const value = safeDataValue(windowRef, name);
+    if (value == null) continue;
+    globals.push({
+      name,
+      type: valueType(value),
+      keys: isPlainInspectable(value) ? describeOwnKeys(value, 30) : []
+    });
+    if (globals.length >= 20) break;
+  }
+  return {
+    codexThreadScrollHandlers: handlers == null ? { present: false, keys: [] } : {
+      present: true,
+      keys: describeOwnKeys(handlers, 50)
+    },
+    matchingGlobals: globals
+  };
+}
+
+function collectReactPropsLayer({ marker, markerSample = [], scrollContainer, conversationRoot, orderById }) {
+  const targets = [
+    ['official-marker', marker],
+    ['scroll-container', scrollContainer],
+    ['conversation-root', conversationRoot]
+  ];
+  const inspected = [];
+  for (const [label, node] of targets) {
+    if (!node) continue;
+    const propKey = reactOwnKeys(node).find((key) => key.startsWith(REACT_PROPS_PREFIX));
+    if (!propKey) {
+      inspected.push({ target: label, present: false, candidatePaths: [], knownTurnMatches: [] });
+      continue;
+    }
+    const props = safeDataValue(node, propKey);
+    inspected.push({
+      target: label,
+      present: Boolean(props),
+      candidatePaths: collectCandidatePaths(props, { maxDepth: 4, maxNodes: 350 }),
+      knownTurnMatches: findKnownTurnMatches(props, orderById, { maxDepth: 4, maxNodes: 500 })
+    });
+  }
+  const markerSamples = markerSample.map((node, sampleIndex) => {
+    const propKey = reactOwnKeys(node).find((key) => key.startsWith(REACT_PROPS_PREFIX));
+    const props = propKey ? safeDataValue(node, propKey) : null;
+    return {
+      sampleIndex,
+      present: Boolean(props),
+      candidatePaths: props ? collectCandidatePaths(props, { maxDepth: 5, maxNodes: 700 }) : [],
+      knownTurnMatches: props ? findKnownTurnMatches(props, orderById, { maxDepth: 5, maxNodes: 900 }) : [],
+      handlerTraits: props ? collectHandlerTraits(props, { maxDepth: 3, maxNodes: 220 }) : []
+    };
+  });
+  return {
+    reactPropsPresent: inspected.some((entry) => entry.present) || markerSamples.some((entry) => entry.present),
+    directKnownTurnMatch: inspected.some((entry) => entry.knownTurnMatches.length > 0) || markerSamples.some((entry) => entry.knownTurnMatches.length > 0),
+    inspected,
+    markerSamples,
+    markerSampleCount: markerSamples.length,
+    markerSamplesWithKnownTurnMatch: markerSamples.filter((entry) => entry.knownTurnMatches.length > 0).length
+  };
+}
+
+function collectFiberLayer({ marker, markerSample = [], scrollContainer, conversationRoot, orderById }) {
+  const targets = [
+    ['official-marker', marker],
+    ['scroll-container', scrollContainer],
+    ['conversation-root', conversationRoot]
+  ];
+  const inspected = [];
+  for (const [label, node] of targets) {
+    if (!node) continue;
+    const ownKeys = reactOwnKeys(node);
+    const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
+    if (!fiberKey) {
+      inspected.push({ target: label, present: false, componentChain: [], knownTurnMatches: [], candidatePaths: [] });
+      continue;
+    }
+    let fiber = safeDataValue(node, fiberKey);
+    const componentChain = [];
+    const knownTurnMatches = [];
+    const candidatePaths = [];
+    const seen = new Set();
+    for (let depth = 0; fiber && depth < 12 && !seen.has(fiber); depth += 1) {
+      seen.add(fiber);
+      componentChain.push(describeFiber(fiber));
+      for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
+        const value = safeDataValue(fiber, propName);
+        if (value == null) continue;
+        const prefix = `fiber[${depth}].${propName}`;
+        for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 3, maxNodes: 220 })) {
+          knownTurnMatches.push({ ...hit, path: `${prefix}.${hit.path}` });
+        }
+        for (const hit of collectCandidatePaths(value, { maxDepth: 3, maxNodes: 180 })) {
+          candidatePaths.push({ ...hit, path: `${prefix}.${hit.path}` });
+        }
+      }
+      fiber = safeDataValue(fiber, 'return');
+    }
+    inspected.push({
+      target: label,
+      present: true,
+      componentChain,
+      knownTurnMatches: dedupeMatches(knownTurnMatches).slice(0, 40),
+      candidatePaths: dedupePaths(candidatePaths).slice(0, 60)
+    });
+  }
+  const markerSamples = markerSample.map((node, sampleIndex) => collectMarkerFiberSample(node, sampleIndex, orderById));
+  return {
+    reactFiberPresent: inspected.some((entry) => entry.present) || markerSamples.some((entry) => entry.present),
+    directKnownTurnMatch: inspected.some((entry) => entry.knownTurnMatches.length > 0) || markerSamples.some((entry) => entry.knownTurnMatches.length > 0),
+    inspected,
+    markerSamples,
+    markerSampleCount: markerSamples.length,
+    markerSamplesWithKnownTurnMatch: markerSamples.filter((entry) => entry.knownTurnMatches.length > 0).length,
+    shallowestKnownTurnDepth: minKnownTurnDepth(markerSamples)
+  };
+}
+
+function collectL3AutoBridgeProbe({ markers = [], orderById = new Map() } = {}) {
+  const markerList = Array.isArray(markers) ? markers : [];
+  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
+  const patterns = new Map();
+
+  markerList.forEach((marker, markerIndex) => {
+    const byPattern = new Map();
+    for (const candidate of collectMarkerCandidateMatches(marker, orderById)) {
+      const targets = byPattern.get(candidate.pattern) ?? new Set();
+      targets.add(candidate.targetOrder);
+      byPattern.set(candidate.pattern, targets);
+    }
+    for (const [pattern, targets] of byPattern.entries()) {
+      let record = patterns.get(pattern);
+      if (!record) {
+        record = { markerTargets: new Map() };
+        patterns.set(pattern, record);
+      }
+      record.markerTargets.set(markerIndex, targets);
+    }
+  });
+
+  const summaries = [...patterns.values()].map((record) => summarizeCandidatePattern({
+    markerCount: markerList.length,
+    knownTurnCount,
+    markerTargets: record.markerTargets
+  }));
+  summaries.sort(compareCandidatePatternSummaries);
+  const best = summaries[0] ?? emptyCandidatePatternSummary(markerList.length, knownTurnCount);
+  const candidatePatternCount = summaries.length;
+  const resolvableCandidatePatternCount = summaries.filter((summary) => summary.resolvedMarkerCount > 0).length;
+  const exactOneToOneCandidateCount = summaries.filter((summary) => summary.oneToOne).length;
+  const sharedStateCandidateCount = summaries.filter((summary) => summary.sharedState).length;
+  const partialCandidateCount = summaries.filter((summary) => summary.partial).length;
+  const relational = collectL3RelationalProbe({ markers: markerList, orderById });
+
+  let recommendedMode = 'probe-insufficient';
+  if (markerList.length === 0) recommendedMode = 'probe-pending-marker';
+  else if (knownTurnCount === 0) recommendedMode = 'probe-insufficient-known-turns';
+  else if (relational.objectRef.oneToOne) recommendedMode = 'probe-relation-object-ref-exact-one-to-one';
+  else if (relational.keyJoin.oneToOne) recommendedMode = 'probe-relation-key-join-exact-one-to-one';
+  else if (relational.best.coverage >= 0.95 && relational.best.conflicts === 0) recommendedMode = 'probe-relation-near-complete';
+  else if (relational.best.mappedTurnCount > 0) recommendedMode = 'probe-relation-partial';
+  else if (best.oneToOne) recommendedMode = 'probe-candidate-exact-one-to-one';
+  else if (best.coverage >= 0.95 && best.duplicateTargetCount === 0 && best.ambiguousMarkerCount === 0) recommendedMode = 'probe-candidate-near-complete';
+  else if (best.mappedTurnCount > 0) recommendedMode = 'probe-candidate-partial';
+  else if (candidatePatternCount > 0) recommendedMode = 'probe-candidate-conflict';
+
+  return {
+    markerCount: markerList.length,
+    knownTurnCount,
+    candidatePatternCount,
+    resolvableCandidatePatternCount,
+    exactOneToOneCandidateCount,
+    sharedStateCandidateCount,
+    partialCandidateCount,
+    resolvedMarkerCount: best.resolvedMarkerCount,
+    mappedMarkerCount: best.mappedMarkerCount,
+    mappedTurnCount: best.mappedTurnCount,
+    unmatchedOfficialCount: best.unmatchedOfficialCount,
+    ambiguousMarkerCount: best.ambiguousMarkerCount,
+    duplicateTargetCount: best.duplicateTargetCount,
+    noScopedMatchCount: best.noPatternMatchCount,
+    conflicts: best.ambiguousMarkerCount + best.duplicateTargetCount,
+    coverage: best.coverage,
+    oneToOne: best.oneToOne,
+    bestCandidateResolvedMarkers: best.resolvedMarkerCount,
+    bestCandidateUniqueTurns: best.uniqueTurnCount,
+    bestCandidateDuplicateTargets: best.duplicateTargetCount,
+    bestCandidateAmbiguousMarkers: best.ambiguousMarkerCount,
+    bestCandidateCoverage: best.coverage,
+    bestCandidateOneToOne: best.oneToOne,
+    objectRefMappedMarkers: relational.objectRef.mappedMarkerCount,
+    objectRefUniqueTurns: relational.objectRef.uniqueTurnCount,
+    objectRefConflicts: relational.objectRef.conflicts,
+    objectRefCoverage: relational.objectRef.coverage,
+    objectRefOneToOne: relational.objectRef.oneToOne,
+    keyJoinMappedMarkers: relational.keyJoin.mappedMarkerCount,
+    keyJoinUniqueTurns: relational.keyJoin.uniqueTurnCount,
+    keyJoinConflicts: relational.keyJoin.conflicts,
+    keyJoinCoverage: relational.keyJoin.coverage,
+    keyJoinOneToOne: relational.keyJoin.oneToOne,
+    positionalAlignmentCandidates: relational.positionalAlignmentCandidates,
+    bestPositionalCoverage: relational.bestPositionalCoverage,
+    bestRelationKind: relational.best.kind,
+    bestRelationMappedMarkers: relational.best.mappedMarkerCount,
+    bestRelationUniqueTurns: relational.best.uniqueTurnCount,
+    bestRelationConflicts: relational.best.conflicts,
+    bestRelationCoverage: relational.best.coverage,
+    bestRelationOneToOne: relational.best.oneToOne,
+    recommendedMode
+  };
+}
+
+function collectMarkerCandidateMatches(node, orderById) {
+  if (!node || !(orderById instanceof Map) || orderById.size === 0) return [];
+  const ownKeys = reactOwnKeys(node);
+  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
+  if (!fiberKey) return [];
+  let fiber = safeDataValue(node, fiberKey);
+  const seen = new Set();
+  const candidates = [];
+  const dedupe = new Set();
+  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
+    seen.add(fiber);
+    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
+      const value = safeDataValue(fiber, propName);
+      if (value == null) continue;
+      for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 6, maxNodes: 1200 })) {
+        const pattern = normalizeCandidatePattern(`fiber[${depth}].${propName}.${hit.path}`);
+        const key = `${pattern}\u0000${hit.targetOrder}`;
+        if (dedupe.has(key)) continue;
+        dedupe.add(key);
+        candidates.push({ pattern, targetOrder: hit.targetOrder });
+      }
+    }
+    fiber = safeDataValue(fiber, 'return');
+  }
+  return candidates;
+}
+
+function normalizeCandidatePattern(path) {
+  return String(path ?? '')
+    .replace(/\[\d+\]/g, '[*]')
+    .replace(/(^|\.)\d+(?=\.|$)/g, '$1[*]');
+}
+
+function summarizeCandidatePattern({ markerCount = 0, knownTurnCount = 0, markerTargets = new Map() } = {}) {
+  let resolvedMarkerCount = 0;
+  let ambiguousMarkerCount = 0;
+  const targetCounts = new Map();
+  for (const targets of markerTargets.values()) {
+    if (!(targets instanceof Set) || targets.size === 0) continue;
+    if (targets.size > 1) {
+      ambiguousMarkerCount += 1;
+      continue;
+    }
+    const targetOrder = [...targets][0];
+    resolvedMarkerCount += 1;
+    targetCounts.set(targetOrder, Number(targetCounts.get(targetOrder) ?? 0) + 1);
+  }
+  const duplicateTargets = new Set([...targetCounts.entries()].filter(([, count]) => count > 1).map(([targetOrder]) => targetOrder));
+  const duplicateTargetCount = duplicateTargets.size;
+  const conflictFreeCounts = [...targetCounts.entries()].filter(([targetOrder]) => !duplicateTargets.has(targetOrder));
+  const mappedTurnCount = conflictFreeCounts.length;
+  const mappedMarkerCount = conflictFreeCounts.reduce((sum, [, count]) => sum + count, 0);
+  const uniqueTurnCount = targetCounts.size;
+  const noPatternMatchCount = Math.max(0, markerCount - markerTargets.size);
+  const unmatchedOfficialCount = Math.max(0, markerCount - mappedMarkerCount);
+  const coverage = knownTurnCount > 0 ? roundRatio(mappedTurnCount / knownTurnCount) : 0;
+  const oneToOne = knownTurnCount > 0
+    && ambiguousMarkerCount === 0
+    && duplicateTargetCount === 0
+    && resolvedMarkerCount === knownTurnCount
+    && uniqueTurnCount === knownTurnCount;
+  const sharedState = resolvedMarkerCount >= 2 && duplicateTargetCount > 0 && uniqueTurnCount < resolvedMarkerCount;
+  const partial = !oneToOne && mappedTurnCount > 0 && duplicateTargetCount === 0 && ambiguousMarkerCount === 0;
+  return {
+    resolvedMarkerCount,
+    mappedMarkerCount,
+    mappedTurnCount,
+    uniqueTurnCount,
+    unmatchedOfficialCount,
+    ambiguousMarkerCount,
+    duplicateTargetCount,
+    noPatternMatchCount,
+    coverage,
+    oneToOne,
+    sharedState,
+    partial
+  };
+}
+
+function emptyCandidatePatternSummary(markerCount, knownTurnCount) {
+  return summarizeCandidatePattern({ markerCount, knownTurnCount, markerTargets: new Map() });
+}
+
+function compareCandidatePatternSummaries(a, b) {
+  if (Boolean(a.oneToOne) !== Boolean(b.oneToOne)) return a.oneToOne ? -1 : 1;
+  const aConflicts = Number(a.duplicateTargetCount || 0) + Number(a.ambiguousMarkerCount || 0);
+  const bConflicts = Number(b.duplicateTargetCount || 0) + Number(b.ambiguousMarkerCount || 0);
+  const aConflictFree = aConflicts === 0;
+  const bConflictFree = bConflicts === 0;
+  if (aConflictFree !== bConflictFree) return aConflictFree ? -1 : 1;
+  if (a.mappedTurnCount !== b.mappedTurnCount) return b.mappedTurnCount - a.mappedTurnCount;
+  if (a.uniqueTurnCount !== b.uniqueTurnCount) return b.uniqueTurnCount - a.uniqueTurnCount;
+  if (aConflicts !== bConflicts) return aConflicts - bConflicts;
+  if (a.coverage !== b.coverage) return b.coverage - a.coverage;
+  return b.resolvedMarkerCount - a.resolvedMarkerCount;
+}
+
+const RELATION_JOIN_KEY_RE = /(?:id|key|marker|nav)/i;
+
+function collectL3RelationalProbe({ markers = [], orderById = new Map() } = {}) {
+  const markerList = Array.isArray(markers) ? markers : [];
+  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
+  const objectPatterns = new Map();
+  const keyPatterns = new Map();
+  const positionalCollections = new Map();
+
+  markerList.forEach((marker, markerIndex) => {
+    const relations = collectMarkerRelationMatches(marker, orderById);
+    addRelationCandidates(objectPatterns, markerIndex, relations.objectRefs);
+    addRelationCandidates(keyPatterns, markerIndex, relations.keyJoins);
+    for (const collection of relations.collections) {
+      if (!positionalCollections.has(collection.pattern)) positionalCollections.set(collection.pattern, collection.targetOrders);
+    }
+  });
+
+  const objectRef = summarizeBestRelationPatterns(objectPatterns, markerList.length, knownTurnCount, 'object-ref');
+  const keyJoin = summarizeBestRelationPatterns(keyPatterns, markerList.length, knownTurnCount, 'key-join');
+  const positional = summarizePositionalAlignments({
+    markerCount: markerList.length,
+    knownTurnCount,
+    collections: [...positionalCollections.values()]
+  });
+  const best = compareRelationSummaries(objectRef, keyJoin) <= 0 ? objectRef : keyJoin;
+  return {
+    objectRef,
+    keyJoin,
+    positionalAlignmentCandidates: positional.candidateCount,
+    bestPositionalCoverage: positional.bestCoverage,
+    best
+  };
+}
+
+function collectMarkerRelationMatches(node, orderById) {
+  if (!node || !(orderById instanceof Map) || orderById.size === 0) return { objectRefs: [], keyJoins: [], collections: [] };
+  const ownKeys = reactOwnKeys(node);
+  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
+  if (!fiberKey) return { objectRefs: [], keyJoins: [], collections: [] };
+  let fiber = safeDataValue(node, fiberKey);
+  const seen = new Set();
+  const localObjects = [];
+  const localTokens = [];
+  const collections = [];
+
+  const markerKey = safeAttributeValue(node, 'data-thread-user-message-navigation-item-id');
+  if (isRelationScalar(markerKey)) localTokens.push({ path: 'dom.markerKey', value: markerKey });
+
+  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
+    seen.add(fiber);
+    const fiberKeyValue = safeDataValue(fiber, 'key');
+    if (isRelationScalar(fiberKeyValue)) localTokens.push({ path: `fiber[${depth}].key`, value: fiberKeyValue });
+    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
+      const value = safeDataValue(fiber, propName);
+      if (value == null) continue;
+      const prefix = `fiber[${depth}].${propName}`;
+      localObjects.push(...collectNonArrayObjectRefs(value, prefix, { maxDepth: 5, maxNodes: 500 }));
+      localTokens.push(...collectRelationJoinTokens(value, prefix, orderById, { maxDepth: 5, maxNodes: 500 }));
+      collections.push(...collectTurnItemCollections(value, prefix, orderById, { maxDepth: 5, maxNodes: 700 }));
+    }
+    fiber = safeDataValue(fiber, 'return');
+  }
+
+  const objectRefs = [];
+  const keyJoins = [];
+  const objectSeen = new Set();
+  const keySeen = new Set();
+  for (const collection of collections) {
+    const itemByObject = new Map(collection.items.map((item) => [item.object, item]));
+    for (const local of localObjects) {
+      const item = itemByObject.get(local.object);
+      if (!item) continue;
+      const pattern = `ref:${normalizeCandidatePattern(local.path)}=>${collection.pattern}`;
+      const dedupeKey = `${pattern}\u0000${item.targetOrder}`;
+      if (objectSeen.has(dedupeKey)) continue;
+      objectSeen.add(dedupeKey);
+      objectRefs.push({ pattern, targetOrder: item.targetOrder });
+    }
+    for (const local of localTokens) {
+      for (const item of collection.items) {
+        for (const token of item.tokens) {
+          if (!relationScalarEqual(local.value, token.value)) continue;
+          const pattern = `key:${normalizeCandidatePattern(local.path)}=>${collection.pattern}.${normalizeCandidatePattern(token.path)}`;
+          const dedupeKey = `${pattern}\u0000${item.targetOrder}`;
+          if (keySeen.has(dedupeKey)) continue;
+          keySeen.add(dedupeKey);
+          keyJoins.push({ pattern, targetOrder: item.targetOrder, identity: local.value });
+        }
+      }
+    }
+  }
+  const collectionSummaries = collections.map((collection) => ({
+    pattern: collection.pattern,
+    targetOrders: collection.items.map((item) => item.targetOrder)
+  }));
+  return { objectRefs, keyJoins, collections: collectionSummaries };
+}
+
+function collectTurnItemCollections(root, prefix, orderById, { maxDepth = 5, maxNodes = 600 } = {}) {
+  const queue = [{ value: root, path: prefix, depth: 0 }];
+  const seen = new Set();
+  const out = [];
+  let visited = 0;
+  while (queue.length && visited < maxNodes) {
+    const current = queue.shift();
+    const value = current.value;
+    if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) continue;
+    seen.add(value);
+    visited += 1;
+    if (Array.isArray(value)) {
+      const items = [];
+      const limit = Math.min(value.length, Math.max(128, orderById.size + 8));
+      for (let index = 0; index < limit; index += 1) {
+        const item = value[index];
+        if (!item || typeof item !== 'object') continue;
+        const orders = new Set(findKnownTurnMatches(item, orderById, { maxDepth: 4, maxNodes: 180 }).map((hit) => hit.targetOrder));
+        if (orders.size !== 1) continue;
+        items.push({
+          object: item,
+          targetOrder: [...orders][0],
+          tokens: collectRelationJoinTokens(item, '', orderById, { maxDepth: 4, maxNodes: 180, includeTurnKeys: true })
+        });
+      }
+      if (items.length >= 2) out.push({ pattern: normalizeCandidatePattern(current.path), items });
+      continue;
+    }
+    if (current.depth >= maxDepth) continue;
+    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
+      if (!('value' in descriptor)) continue;
+      const child = descriptor.value;
+      if (!child || (typeof child !== 'object' && typeof child !== 'function')) continue;
+      const path = current.path ? `${current.path}.${key}` : key;
+      queue.push({ value: child, path, depth: current.depth + 1 });
+    }
+  }
+  return dedupeCollections(out);
+}
+
+function collectNonArrayObjectRefs(root, prefix, { maxDepth = 5, maxNodes = 400 } = {}) {
+  const queue = [{ value: root, path: prefix, depth: 0 }];
+  const seen = new Set();
+  const out = [];
+  let visited = 0;
+  while (queue.length && visited < maxNodes) {
+    const current = queue.shift();
+    const value = current.value;
+    if (!value || (typeof value !== 'object' && typeof value !== 'function') || Array.isArray(value) || seen.has(value)) continue;
+    seen.add(value);
+    visited += 1;
+    if (current.depth >= maxDepth) continue;
+    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
+      if (!('value' in descriptor)) continue;
+      const child = descriptor.value;
+      const path = current.path ? `${current.path}.${key}` : key;
+      if (child && typeof child === 'object' && !Array.isArray(child)) {
+        out.push({ path, object: child });
+        queue.push({ value: child, path, depth: current.depth + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+function collectRelationJoinTokens(root, prefix, orderById, { maxDepth = 5, maxNodes = 400, includeTurnKeys = false } = {}) {
+  const queue = [{ value: root, path: prefix, depth: 0 }];
+  const seen = new Set();
+  const out = [];
+  let visited = 0;
+  while (queue.length && visited < maxNodes) {
+    const current = queue.shift();
+    const value = current.value;
+    if (!value || (typeof value !== 'object' && typeof value !== 'function') || Array.isArray(value) || seen.has(value)) continue;
+    seen.add(value);
+    visited += 1;
+    if (current.depth >= maxDepth) continue;
+    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
+      if (!('value' in descriptor)) continue;
+      const child = descriptor.value;
+      const path = current.path ? `${current.path}.${key}` : key;
+      if (isRelationScalar(child)) {
+        const terminal = String(key);
+        const isTurnKey = /^(?:turnKey|turnId)$/i.test(terminal);
+        if (isTurnKey ? includeTurnKeys : RELATION_JOIN_KEY_RE.test(terminal)) out.push({ path, value: child });
+      } else if (child && typeof child === 'object' && !Array.isArray(child)) {
+        queue.push({ value: child, path, depth: current.depth + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+function addRelationCandidates(patterns, markerIndex, candidates) {
+  const byPattern = new Map();
+  for (const candidate of candidates ?? []) {
+    const targets = byPattern.get(candidate.pattern) ?? new Set();
+    targets.add(candidate.targetOrder);
+    byPattern.set(candidate.pattern, targets);
+  }
+  for (const [pattern, targets] of byPattern.entries()) {
+    let markerTargets = patterns.get(pattern);
+    if (!markerTargets) {
+      markerTargets = new Map();
+      patterns.set(pattern, markerTargets);
+    }
+    markerTargets.set(markerIndex, targets);
+  }
+}
+
+function summarizeBestRelationPatterns(patterns, markerCount, knownTurnCount, kind) {
+  const summaries = [...patterns.values()].map((markerTargets) => ({
+    ...summarizeCandidatePattern({ markerCount, knownTurnCount, markerTargets }),
+    kind
+  }));
+  summaries.sort(compareCandidatePatternSummaries);
+  const best = summaries[0] ?? { ...emptyCandidatePatternSummary(markerCount, knownTurnCount), kind };
+  return { ...best, conflicts: best.ambiguousMarkerCount + best.duplicateTargetCount };
+}
+
+function collectExactKeyJoinMap({ markers = [], orderById = new Map(), preferredPattern = null } = {}) {
+  const markerList = Array.isArray(markers) ? markers : [];
+  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
+  const patterns = new Map();
+  markerList.forEach((marker, markerIndex) => {
+    const byPattern = new Map();
+    for (const candidate of collectMarkerRelationMatches(marker, orderById).keyJoins) {
+      let entry = byPattern.get(candidate.pattern);
+      if (!entry) {
+        entry = { targets: new Set(), identitiesByTarget: new Map() };
+        byPattern.set(candidate.pattern, entry);
+      }
+      entry.targets.add(candidate.targetOrder);
+      let identities = entry.identitiesByTarget.get(candidate.targetOrder);
+      if (!identities) {
+        identities = new Set();
+        entry.identitiesByTarget.set(candidate.targetOrder, identities);
+      }
+      identities.add(candidate.identity);
+    }
+    for (const [pattern, entry] of byPattern.entries()) {
+      let markerEntries = patterns.get(pattern);
+      if (!markerEntries) {
+        markerEntries = new Map();
+        patterns.set(pattern, markerEntries);
+      }
+      markerEntries.set(markerIndex, { marker, ...entry });
+    }
+  });
+
+  const markersWithKeyJoinCandidates = new Set();
+  const keyJoinPatternSummaries = [];
+  for (const markerEntries of patterns.values()) {
+    for (const markerIndex of markerEntries.keys()) markersWithKeyJoinCandidates.add(markerIndex);
+    const markerTargets = new Map([...markerEntries.entries()].map(([markerIndex, entry]) => [markerIndex, entry.targets]));
+    keyJoinPatternSummaries.push(summarizeCandidatePattern({ markerCount: markerList.length, knownTurnCount, markerTargets }));
+  }
+  keyJoinPatternSummaries.sort(compareCandidatePatternSummaries);
+  const bestKeyJoin = keyJoinPatternSummaries[0] ?? emptyCandidatePatternSummary(markerList.length, knownTurnCount);
+  const bestKeyJoinConflicts = Number(bestKeyJoin.ambiguousMarkerCount || 0) + Number(bestKeyJoin.duplicateTargetCount || 0);
+  const exact = [];
+  for (const [pattern, markerEntries] of patterns.entries()) {
+    const markerTargets = new Map([...markerEntries.entries()].map(([markerIndex, entry]) => [markerIndex, entry.targets]));
+    const summary = summarizeCandidatePattern({ markerCount: markerList.length, knownTurnCount, markerTargets });
+    if (!summary.oneToOne) continue;
+    const pairsByTarget = new Map();
+    const identityByTarget = new Map();
+    let identityAmbiguous = false;
+    for (const [markerIndex, entry] of markerEntries.entries()) {
+      if (!(entry.targets instanceof Set) || entry.targets.size !== 1) continue;
+      const targetOrder = [...entry.targets][0];
+      const identities = entry.identitiesByTarget?.get(targetOrder);
+      if (!(identities instanceof Set) || identities.size !== 1) {
+        identityAmbiguous = true;
+        break;
+      }
+      const identity = [...identities][0];
+      pairsByTarget.set(targetOrder, { marker: entry.marker, markerIndex });
+      identityByTarget.set(targetOrder, identity);
+    }
+    if (identityAmbiguous || identityByTarget.size !== knownTurnCount) continue;
+    exact.push({ pattern, summary, pairsByTarget, identityByTarget });
+  }
+
+  exact.sort((a, b) => String(a.pattern).localeCompare(String(b.pattern)));
+  const preferred = preferredPattern ? exact.find((entry) => entry.pattern === preferredPattern) ?? null : null;
+  const preferredPatternPresent = preferredPattern ? Boolean(preferred) : null;
+  const alternateExactPatternAvailable = preferredPattern ? exact.some((entry) => entry.pattern !== preferredPattern) : null;
+  const selected = preferred ?? exact[0] ?? null;
+  const mappingAgreement = Boolean(selected);
+  return {
+    summary: {
+      markerCount: markerList.length,
+      knownTurnCount,
+      exactPatternCount: exact.length,
+      relationPatternCount: patterns.size,
+      markersWithKeyJoinCandidates: markersWithKeyJoinCandidates.size,
+      keyJoinMappedMarkers: bestKeyJoin.mappedMarkerCount,
+      keyJoinUniqueTurns: bestKeyJoin.uniqueTurnCount,
+      bestKeyJoinCoverage: bestKeyJoin.coverage,
+      bestKeyJoinConflicts,
+      bestKeyJoinOneToOne: Boolean(bestKeyJoin.oneToOne),
+      mappingAgreement,
+      preferredPatternPresent,
+      alternateExactPatternAvailable,
+      mappedTurnCount: selected?.summary?.mappedTurnCount ?? 0,
+      coverage: selected?.summary?.coverage ?? 0,
+      conflicts: selected ? 0 : (exact.length > 0 ? 1 : 0),
+      oneToOne: Boolean(selected?.summary?.oneToOne)
+    },
+    pairsByTarget: selected?.pairsByTarget ?? new Map(),
+    identityByTarget: selected?.identityByTarget ?? new Map(),
+    patternKey: selected?.pattern ?? ''
+  };
+}
+function compareRelationSummaries(a, b) {
+  if (Boolean(a.oneToOne) !== Boolean(b.oneToOne)) return a.oneToOne ? -1 : 1;
+  if (a.mappedTurnCount !== b.mappedTurnCount) return b.mappedTurnCount - a.mappedTurnCount;
+  if (a.conflicts !== b.conflicts) return a.conflicts - b.conflicts;
+  if (a.coverage !== b.coverage) return b.coverage - a.coverage;
+  return b.resolvedMarkerCount - a.resolvedMarkerCount;
+}
+
+function summarizePositionalAlignments({ markerCount = 0, knownTurnCount = 0, collections = [] } = {}) {
+  let candidateCount = 0;
+  let bestMappedTurns = 0;
+  for (const orders of collections) {
+    if (!Array.isArray(orders) || orders.length === 0) continue;
+    const maxOffset = Math.max(markerCount, orders.length);
+    for (let offset = -maxOffset; offset <= maxOffset; offset += 1) {
+      const mapped = [];
+      for (let markerIndex = 0; markerIndex < markerCount; markerIndex += 1) {
+        const itemIndex = markerIndex + offset;
+        if (itemIndex < 0 || itemIndex >= orders.length) continue;
+        const order = orders[itemIndex];
+        if (Number.isInteger(order)) mapped.push(order);
+      }
+      const unique = new Set(mapped);
+      bestMappedTurns = Math.max(bestMappedTurns, unique.size);
+      if (knownTurnCount > 0 && mapped.length === knownTurnCount && unique.size === knownTurnCount) candidateCount += 1;
+    }
+  }
+  return {
+    candidateCount,
+    bestCoverage: knownTurnCount > 0 ? roundRatio(bestMappedTurns / knownTurnCount) : 0
+  };
+}
+
+function dedupeCollections(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const key = `${value.pattern}\u0000${value.items.map((item) => item.targetOrder).join(',')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function isRelationScalar(value) {
+  if (typeof value === 'string') return value.length > 0 && value.length <= 256;
+  return Number.isFinite(value);
+}
+
+function relationScalarEqual(a, b) {
+  return typeof a === typeof b && a === b;
+}
+
+function safeAttributeValue(node, name) {
+  try {
+    const value = node?.getAttribute?.(name);
+    return value == null ? null : String(value);
+  } catch {
+    return null;
+  }
+}
+
+function roundRatio(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
+}
+
+function collectMarkerFiberSample(node, sampleIndex, orderById) {
+  const ownKeys = reactOwnKeys(node);
+  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
+  if (!fiberKey) return { sampleIndex, present: false, componentChain: [], knownTurnMatches: [], candidatePaths: [], handlerTraits: [] };
+  let fiber = safeDataValue(node, fiberKey);
+  const componentChain = [];
+  const knownTurnMatches = [];
+  const candidatePaths = [];
+  const handlerTraits = [];
+  const seen = new Set();
+  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
+    seen.add(fiber);
+    componentChain.push(describeFiber(fiber));
+    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
+      const value = safeDataValue(fiber, propName);
+      if (value == null) continue;
+      const prefix = `fiber[${depth}].${propName}`;
+      for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 5, maxNodes: 800 })) knownTurnMatches.push({ ...hit, path: `${prefix}.${hit.path}`, fiberDepth: depth });
+      for (const hit of collectCandidatePaths(value, { maxDepth: 4, maxNodes: 500 })) candidatePaths.push({ ...hit, path: `${prefix}.${hit.path}` });
+      for (const hit of collectHandlerTraits(value, { maxDepth: 3, maxNodes: 220 })) handlerTraits.push({ ...hit, path: `${prefix}.${hit.path}` });
+    }
+    fiber = safeDataValue(fiber, 'return');
+  }
+  return {
+    sampleIndex,
+    present: true,
+    componentChain,
+    knownTurnMatches: dedupeMatches(knownTurnMatches).slice(0, 80),
+    candidatePaths: dedupePaths(candidatePaths).slice(0, 100),
+    handlerTraits: dedupeHandlerTraits(handlerTraits).slice(0, 60)
+  };
+}
+
+function minKnownTurnDepth(samples) {
+  const depths = samples.flatMap((entry) => entry.knownTurnMatches ?? []).map((entry) => entry.fiberDepth).filter(Number.isFinite);
+  return depths.length ? Math.min(...depths) : null;
+}
+
+function sampleMarkers(markers, limit) {
+  if (!Array.isArray(markers) || markers.length <= limit) return Array.isArray(markers) ? markers : [];
+  const out = [];
+  for (let i = 0; i < limit; i += 1) {
+    const index = Math.round((i * (markers.length - 1)) / Math.max(1, limit - 1));
+    if (!out.includes(markers[index])) out.push(markers[index]);
+  }
+  return out;
+}
+
+function collectHandlerTraits(root, { maxDepth = 3, maxNodes = 200 } = {}) {
+  const hits = [];
+  walkData(root, { maxDepth, maxNodes }, ({ path, key, value }) => {
+    if (typeof value !== 'function') return;
+    if (!/(click|navigate|scroll|jump|select|press|pointer|intent|capture|restore)/i.test(String(key ?? ''))) return;
+    hits.push({ path, name: String(key ?? ''), arity: value.length, sourceTraits: functionSourceTraits(value) });
+  });
+  return dedupeHandlerTraits(hits).slice(0, 60);
+}
+
+function functionSourceTraits(fn) {
+  let source = '';
+  try { source = Function.prototype.toString.call(fn); } catch { return []; }
+  const traits = [];
+  for (const token of ['scrollIntoView','scrollTo','scrollBy','captureNavigation','prepareRestoreLock','saveNow','preventDefault','stopPropagation']) {
+    if (source.includes(token)) traits.push(token);
+  }
+  return traits;
+}
+
+function dedupeHandlerTraits(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const key = `${value.path}\u0000${value.name}\u0000${(value.sourceTraits ?? []).join(',')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function summarizeRequiredDepth({ markerCount, level1, level2, level3 }) {
+  const l1Keys = level1?.codexThreadScrollHandlers?.keys ?? [];
+  const directL1 = l1Keys.some((entry) => /^(scrollToIndex|jumpToTurn|navigateToMessage|navigateToTurn|scrollToItem)$/i.test(entry.name));
+  if (directL1) return { recommendedDepth: 'L1', reason: 'direct-navigation-handler-visible' };
+  if (!(markerCount > 0)) return { recommendedDepth: 'pending-marker', reason: 'official-marker-not-mounted' };
+  if (level2?.markerSamplesWithKnownTurnMatch > 0) return { recommendedDepth: 'L2', reason: 'marker-react-props-map-to-known-turn' };
+  if (level3?.markerSamplesWithKnownTurnMatch > 0) return { recommendedDepth: 'L3', reason: 'marker-fiber-chain-maps-to-known-turn', shallowestFiberDepth: level3.shallowestKnownTurnDepth };
+  return { recommendedDepth: 'deeper-than-L3', reason: 'marker-props-and-return-chain-have-no-known-turn-match' };
+}
+
+function findKnownTurnMatches(root, orderById, { maxDepth = 3, maxNodes = 300 } = {}) {
+  if (!root || orderById.size === 0) return [];
+  const hits = [];
+  walkData(root, { maxDepth, maxNodes }, ({ path, value }) => {
+    if (typeof value !== 'string') return;
+    const order = orderById.get(value);
+    if (!Number.isInteger(order)) return;
+    hits.push({ path, targetOrder: order, targetLabel: `Q${order + 1}` });
+  });
+  return dedupeMatches(hits).slice(0, 40);
+}
+
+function collectCandidatePaths(root, { maxDepth = 3, maxNodes = 250 } = {}) {
+  const hits = [];
+  walkData(root, { maxDepth, maxNodes }, ({ path, key, value }) => {
+    if (!key || !CANDIDATE_KEY_RE.test(key)) return;
+    hits.push({ path, type: valueType(value), shape: valueShape(value) });
+  });
+  return dedupePaths(hits).slice(0, 60);
+}
+
+function walkData(root, { maxDepth, maxNodes }, visitor) {
+  const queue = [{ value: root, path: '', depth: 0 }];
+  const seen = new Set();
+  let visited = 0;
+  while (queue.length && visited < maxNodes) {
+    const current = queue.shift();
+    const value = current.value;
+    if (value == null || (typeof value !== 'object' && typeof value !== 'function')) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    visited += 1;
+    if (current.depth >= maxDepth) continue;
+    const descriptors = safeDescriptors(value);
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!('value' in descriptor)) continue;
+      const child = descriptor.value;
+      const path = current.path ? `${current.path}.${key}` : key;
+      visitor({ path, key, value: child });
+      if (isPlainInspectable(child)) queue.push({ value: child, path, depth: current.depth + 1 });
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < Math.min(value.length, 20); index += 1) {
+        const child = value[index];
+        const path = `${current.path}[${index}]`;
+        visitor({ path, key: String(index), value: child });
+        if (isPlainInspectable(child)) queue.push({ value: child, path, depth: current.depth + 1 });
+      }
+    }
+  }
+}
+
+function describeFiber(fiber) {
+  const type = safeDataValue(fiber, 'elementType') ?? safeDataValue(fiber, 'type');
+  return {
+    tag: Number.isFinite(safeDataValue(fiber, 'tag')) ? Number(safeDataValue(fiber, 'tag')) : null,
+    component: componentName(type),
+    hasMemoizedProps: safeDataValue(fiber, 'memoizedProps') != null,
+    hasMemoizedState: safeDataValue(fiber, 'memoizedState') != null
+  };
+}
+
+function componentName(type) {
+  if (typeof type === 'string') return type;
+  if (typeof type === 'function') return type.displayName || type.name || 'function';
+  if (type && typeof type === 'object') return String(safeDataValue(type, 'displayName') ?? safeDataValue(type, 'name') ?? 'object');
+  return null;
+}
+
+function reactOwnKeys(node) {
+  return safeOwnNames(node).filter((key) => key.startsWith('__react')).slice(0, 20);
+}
+
+function describeOwnKeys(value, limit) {
+  return safeOwnNames(value).slice(0, limit).map((name) => {
+    const child = safeDataValue(value, name);
+    return { name, type: valueType(child), arity: typeof child === 'function' ? child.length : null, sourceTraits: typeof child === 'function' ? functionSourceTraits(child) : [] };
+  });
+}
+
+function safeOwnNames(value) {
+  try { return Object.getOwnPropertyNames(value ?? {}); } catch { return []; }
+}
+
+function safeDescriptors(value) {
+  try { return Object.getOwnPropertyDescriptors(value ?? {}); } catch { return {}; }
+}
+
+function safeDataValue(value, key) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value ?? {}, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function isPlainInspectable(value) {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
+  const tag = Object.prototype.toString.call(value);
+  return tag === '[object Object]' || tag === '[object Array]' || typeof value === 'function';
+}
+
+function valueType(value) {
+  if (Array.isArray(value)) return 'array';
+  if (value === null) return 'null';
+  return typeof value;
+}
+
+function valueShape(value) {
+  if (typeof value === 'string') return { length: value.length, uuidLike: /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(value), numericLike: /^\d+$/.test(value) };
+  if (Array.isArray(value)) return { length: value.length };
+  if (typeof value === 'function') return { arity: value.length };
+  if (value && typeof value === 'object') return { keys: safeOwnNames(value).slice(0, 12) };
+  return null;
+}
+
+function dedupeMatches(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const key = `${value.path}\u0000${value.targetOrder}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupePaths(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const key = `${value.path}\u0000${value.type}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+
+
+
+Object.assign(exports, { collectHostInternalDepthProbe, collectL3ExactKeyJoinDryRunMap });
+
+},
 "src/v3/bootstrap.js": (module, exports, __require) => {
 const { EventBus } = __require("src/v3/core/event-bus.js");
 const { LocalStorageAdapter } = __require("src/v3/core/storage.js");
@@ -3835,8 +6021,13 @@ const { SURFACE } = __require("src/v3/host/host-interface.js");
 const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js");
 const { parseSidebarConversationKey } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
+const { OfficialNavigationProbe, analyzeOfficialNavigationLearning, analyzeOfficialNavigationMapping, sanitizeOfficialNavigationHistory, sanitizeOfficialNavigationLearningHistory, sanitizeOfficialNavigationRecord, selectTrustedOfficialBridgePair } = __require("src/v3/diagnostics/official-navigation-probe.js");
+const { analyzeOfficialNavigationAutoMap, officialAutoMapSignature, sanitizeOfficialNavigationAutoSummary } = __require("src/v3/diagnostics/official-navigation-auto-map.js");
+const { collectHostInternalDepthProbe, collectL3ExactKeyJoinDryRunMap } = __require("src/v3/diagnostics/host-internal-depth-probe.js");
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
+const OFFICIAL_NAVIGATION_RUNTIME_ENABLED = false;
+const L3_RUNTIME_ENABLED = false;
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
@@ -3844,6 +6035,14 @@ const NAVIGATION_HISTORY_LIMIT = 5;
 const NAVIGATION_STEP_LIMIT = 16;
 const SLOW_NAVIGATION_HISTORY_LIMIT = 10;
 const SLOW_NAVIGATION_STORAGE_KEY = "gte.v3.navigation-diagnostics";
+const OFFICIAL_NAVIGATION_HISTORY_LIMIT = 10;
+const OFFICIAL_NAVIGATION_STORAGE_KEY = "gte.v3.official-navigation-diagnostics";
+const OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT = 32;
+const OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY = "gte.v3.official-navigation-learning";
+const OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS = [120, 400];
+const L3_ADAPTIVE_RESCAN_DELAYS_MS = [50, 120, 250];
+const L3_POST_NAVIGATION_SCAN_DELAY_MS = 180;
+const L3_EVENT_RECOVERY_DEBOUNCE_MS = 140;
 
 class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -3859,7 +6058,7 @@ class TalkEnhancerV3App {
     this.cacheHydrationCounts = new Map();
     this.turnIndexes = new Map();
     this.currentConversationId = null;
-    this.lastNavigation = { target: null, verified: false, reason: "none" };
+    this.lastNavigation = { target: null, verified: false, reason: "none", fastAttempted: false, fastSucceeded: false, fallbackReason: null, officialBridgeAttempted: false, officialBridgeSucceeded: false, officialBridgeFallbackReason: null };
     this.navigationRequestId = 0;
     this.navigationRunSequence = 0;
     this.activeNavigation = null;
@@ -3867,6 +6066,39 @@ class TalkEnhancerV3App {
     this.slowNavigationHistory = sanitizeSlowNavigationHistory(
       this.storage?.read?.(SLOW_NAVIGATION_STORAGE_KEY, [])
     );
+    this.officialNavigationHistory = sanitizeOfficialNavigationHistory(
+      this.storage?.read?.(OFFICIAL_NAVIGATION_STORAGE_KEY, []),
+      OFFICIAL_NAVIGATION_HISTORY_LIMIT
+    );
+    this.officialNavigationMapping = this.officialNavigationHistory.at(-1)?.mapping ?? null;
+    this.officialNavigationLearningHistory = sanitizeOfficialNavigationLearningHistory(
+      this.storage?.read?.(OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY, []),
+      OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT
+    );
+    this.officialNavigationLearning = analyzeOfficialNavigationLearning(this.officialNavigationLearningHistory);
+    this.officialBridgeAutoSessions = new Map();
+    this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "idle" });
+    this.officialBridgeAutoTimer = null;
+    this.officialNavigationSessionLearningHistory = [];
+    this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning([]);
+    this.officialBridgeInFlight = false;
+    this.hostInternalDepthProbe = null;
+    this.hostInternalDepthProbeByConversation = new Map();
+    this.hostInternalDepthProbeAttempts = new Map();
+    this.hostInternalDepthProbeTimer = null;
+    this.l3KeyJoinDryRunSessions = new Map();
+    this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary();
+    this.l3AdaptiveRescanTimer = null;
+    this.l3AdaptiveRescanGeneration = 0;
+    this.l3PostNavigationScanTimer = null;
+    this.l3EventRecoveryTimer = null;
+    this.l3EventRecoveryWatch = null;
+    this.officialNavigationPrivateMarkers = new Map();
+    this.officialNavigationPrivateSessions = new Map();
+    this.officialNavigationSessionPrivatePairsByTarget = new Map();
+    this.officialNavigationSessionPrivateTargetsByKey = new Map();
+    this.officialNavigationSessionPrivateConflictedTargets = new Set();
+    this.officialNavigationSessionPrivateConflictedKeys = new Set();
     this.navigationUxTimer = null;
     this.navigationUx = { state: "idle", target: null, targetOrder: null, pendingVisible: false };
     this.captureStatus = { status: "unavailable", turnCount: 0, lastError: "" };
@@ -3893,6 +6125,24 @@ class TalkEnhancerV3App {
       onNavigate: (turnId) => this.navigate(turnId),
       initialPanelOpen: this.settings.load().timelinePanelOpen
     });
+    this.officialNavigationProbe = new OfficialNavigationProbe({
+      document: this.document,
+      window: this.window,
+      getContext: () => {
+        const identity = this.host.getConversationIdentity?.() ?? null;
+        return {
+          enabled: !this.destroyed && this.host.getSurface?.() === SURFACE.CONVERSATION && Boolean(this.currentConversationId),
+          sessionKey: this.currentConversationId,
+          host: identity?.host ?? null,
+          source: identity?.source ?? null,
+          stable: Boolean(identity?.stable)
+        };
+      },
+      getScrollContainer: () => this.host.getScrollContainer?.(),
+      getVisibleRange: () => this.getOfficialProbeVisibleRange(),
+      isOwnedEvent: (event) => this.officialBridgeInFlight || ((event?.composedPath?.() ?? []).some((node) => node?.id === "gte-root")),
+      onRecord: (record) => this.handleOfficialNavigationRecord(record)
+    });
   }
 
   start() {
@@ -3900,6 +6150,7 @@ class TalkEnhancerV3App {
     this.shell.mount();
     this.host.start?.();
     this.bindLifecycle();
+    if (OFFICIAL_NAVIGATION_RUNTIME_ENABLED) this.officialNavigationProbe.start();
     this.refresh("start");
     this.window.__GPTTalkEnhancerV3 = this;
     return this;
@@ -3907,7 +6158,10 @@ class TalkEnhancerV3App {
 
   bindLifecycle() {
     if (typeof this.window?.MutationObserver === "function" && this.document?.body) {
-      this.observer = new this.window.MutationObserver(() => this.scheduleRefresh("mutation"));
+      this.observer = new this.window.MutationObserver((records) => {
+        this.scheduleRefresh("mutation");
+        if (L3_RUNTIME_ENABLED) this.handleL3EventRecoveryMutation(records);
+      });
       this.observer.observe(this.document.body, { childList: true, subtree: true, attributes: true });
     }
     this.window?.addEventListener?.("popstate", this.boundRoute);
@@ -3924,6 +6178,14 @@ class TalkEnhancerV3App {
     const chatKey = row?.getAttribute?.("data-sidebar-chatgpt-conversation-key") ?? null;
     const expectedChatId = chatKey ? parseSidebarConversationKey(chatKey) : null;
     const localThreadSelected = Boolean(localId);
+    const currentIdentity = this.host.getConversationIdentity?.() ?? null;
+    const currentLocalId = currentIdentity?.stable
+      && currentIdentity?.host === "local"
+      && currentIdentity?.source === "sidebar-local"
+      ? String(currentIdentity.id ?? "")
+      : "";
+    const leavingCurrentLocal = Boolean(currentLocalId && (!localId || String(localId) !== currentLocalId));
+    if (leavingCurrentLocal) this.host.persistLocalScrollPosition?.();
     this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
@@ -3977,6 +6239,11 @@ class TalkEnhancerV3App {
       const visible = this.host.getVisibleTurns();
       index.setVisible(visible);
       if (conversationIdentity?.source === "sidebar-local" && conversationIdentity?.stable) index.reindexUuidV7?.();
+      if (OFFICIAL_NAVIGATION_RUNTIME_ENABLED) {
+        this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
+      } else {
+        this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
+      }
       if (this.navigationUx.state === "pending" && this.navigationUx.target) {
         const pendingRecord = index.get(this.navigationUx.target);
         const pendingOrder = Number.isFinite(pendingRecord?.order) ? Number(pendingRecord.order) : null;
@@ -3988,6 +6255,7 @@ class TalkEnhancerV3App {
       const activeTurnId = index.resolveCanonicalId(this.host.getActiveTurnId());
       this.conversations.update(conversationId, { turnCount: index.size(), activeTurnId, route: this.host.getRoute?.() ?? "" });
       this.shell.updateTimeline(index.getOrdered(), activeTurnId);
+      if (L3_RUNTIME_ENABLED) this.scheduleHostInternalDepthProbe(conversationId, index, conversationIdentity);
       this.bindScrollContainer(this.host.getScrollContainer?.());
     } else if (surface === SURFACE.CONVERSATION && this.currentConversationId) {
       if (this.navigationUx.state === "pending") this.invalidateNavigation("conversation-identity-transient");
@@ -4009,6 +6277,16 @@ class TalkEnhancerV3App {
       this.invalidateNavigation("conversation-changed");
     }
     this.currentConversationId = conversationId;
+    this.clearOfficialBridgeAutoTimer();
+    this.clearHostInternalDepthProbeTimer();
+    this.clearL3AdaptiveRescanTimer();
+    this.clearL3PostNavigationScanTimer();
+    this.clearL3EventRecoveryWatch();
+    this.hostInternalDepthProbe = this.hostInternalDepthProbeByConversation.get(conversationId) ?? null;
+    const existingAutoSession = this.officialBridgeAutoSessions.get(conversationId);
+    if (existingAutoSession) existingAutoSession.retryAttempt = 0;
+    this.officialNavigationSessionLearningHistory = [];
+    this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning([]);
     const conversation = this.conversations.activateConversation(conversationId, this.host.getRoute?.() ?? "");
     if (conversation?.captureStatus?.status === "unavailable" && this.captureStatus?.status !== "unavailable") {
       this.conversations.setCaptureStatus(conversationId, this.captureStatus);
@@ -4018,6 +6296,7 @@ class TalkEnhancerV3App {
   }
 
   deactivateConversationView() {
+    this.clearL3EventRecoveryWatch();
     if (this.currentConversationId) {
       this.saveConversationView(this.currentConversationId);
       this.invalidateNavigation("conversation-deactivated");
@@ -4134,6 +6413,12 @@ class TalkEnhancerV3App {
       reason: result?.reason ?? (result?.ok ? "ok" : "unknown"),
       ok: Boolean(result?.ok),
       verified: Boolean(result?.verified),
+      fastAttempted: Boolean(result?.fastAttempted),
+      fastSucceeded: Boolean(result?.fastSucceeded),
+      fallbackReason: result?.fallbackReason ?? null,
+      officialBridgeAttempted: Boolean(result?.officialBridgeAttempted),
+      officialBridgeSucceeded: Boolean(result?.officialBridgeSucceeded),
+      officialBridgeFallbackReason: result?.officialBridgeFallbackReason ?? null,
       slowestStep,
       currentStep: null,
       steps
@@ -4156,6 +6441,12 @@ class TalkEnhancerV3App {
         reason: completed.reason,
         ok: completed.ok,
         verified: completed.verified,
+        fastAttempted: completed.fastAttempted,
+        fastSucceeded: completed.fastSucceeded,
+        fallbackReason: completed.fallbackReason,
+        officialBridgeAttempted: completed.officialBridgeAttempted,
+        officialBridgeSucceeded: completed.officialBridgeSucceeded,
+        officialBridgeFallbackReason: completed.officialBridgeFallbackReason,
         slowestStep: completed.slowestStep,
         slowSteps,
         steps
@@ -4167,6 +6458,140 @@ class TalkEnhancerV3App {
     }
     if (this.activeNavigation?.runId === run.runId) this.activeNavigation = null;
     this.publishNavigationDiagnostics();
+  }
+
+  getOfficialProbeVisibleRange() {
+    const index = this.currentConversationId ? this.getTurnIndex(this.currentConversationId) : null;
+    const orders = [];
+    for (const turn of this.host.getVisibleTurns?.() ?? []) {
+      const record = turn?.id && index ? index.get(turn.id) : null;
+      const order = Number.isFinite(record?.order) ? Number(record.order) : (!index && Number.isFinite(turn?.order) ? Number(turn.order) : null);
+      if (Number.isFinite(order)) orders.push(order);
+    }
+    const unique = [...new Set(orders)].sort((a, b) => a - b);
+    if (!unique.length) return null;
+    return { min: unique[0], max: unique.at(-1), count: unique.length };
+  }
+
+  resetOfficialNavigationPrivateSession() {
+    this.officialNavigationPrivateMarkers?.clear?.();
+    this.officialNavigationSessionPrivatePairsByTarget = new Map();
+    this.officialNavigationSessionPrivateTargetsByKey = new Map();
+    this.officialNavigationSessionPrivateConflictedTargets = new Set();
+    this.officialNavigationSessionPrivateConflictedKeys = new Set();
+  }
+
+  activateOfficialNavigationPrivateSession(conversationId) {
+    this.officialNavigationPrivateMarkers?.clear?.();
+    if (!conversationId) {
+      this.resetOfficialNavigationPrivateSession();
+      return;
+    }
+    let session = this.officialNavigationPrivateSessions.get(conversationId);
+    if (!session) {
+      session = {
+        pairsByTarget: new Map(),
+        targetsByKey: new Map(),
+        conflictedTargets: new Set(),
+        conflictedKeys: new Set()
+      };
+      this.officialNavigationPrivateSessions.set(conversationId, session);
+    }
+    this.officialNavigationSessionPrivatePairsByTarget = session.pairsByTarget;
+    this.officialNavigationSessionPrivateTargetsByKey = session.targetsByKey;
+    this.officialNavigationSessionPrivateConflictedTargets = session.conflictedTargets;
+    this.officialNavigationSessionPrivateConflictedKeys = session.conflictedKeys;
+  }
+
+  handleOfficialPrivateMarker(marker) {
+    const probeId = Number(marker?.probeId);
+    const sessionKey = typeof marker?.sessionKey === "string" ? marker.sessionKey : null;
+    const markerKey = typeof marker?.markerKey === "string" ? marker.markerKey.trim() : "";
+    if (!Number.isInteger(probeId) || probeId <= 0 || !sessionKey || sessionKey !== this.currentConversationId || !markerKey) return;
+    this.officialNavigationPrivateMarkers.set(probeId, { sessionKey, markerKey });
+    while (this.officialNavigationPrivateMarkers.size > 32) this.officialNavigationPrivateMarkers.delete(this.officialNavigationPrivateMarkers.keys().next().value);
+  }
+
+  recordOfficialPrivateMarkerLearning({ probeId, targetOrder, knownTurnCount }) {
+    const privateMarker = this.officialNavigationPrivateMarkers.get(Number(probeId));
+    this.officialNavigationPrivateMarkers.delete(Number(probeId));
+    if (!privateMarker || privateMarker.sessionKey !== this.currentConversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
+    const markerKey = privateMarker.markerKey;
+    if (!markerKey || this.officialNavigationSessionPrivateConflictedKeys.has(markerKey) || this.officialNavigationSessionPrivateConflictedTargets.has(targetOrder)) return;
+    const existingTarget = this.officialNavigationSessionPrivateTargetsByKey.get(markerKey);
+    const existingPair = this.officialNavigationSessionPrivatePairsByTarget.get(targetOrder);
+    if ((Number.isInteger(existingTarget) && existingTarget !== targetOrder) || (existingPair?.markerKey && existingPair.markerKey !== markerKey)) {
+      this.officialNavigationSessionPrivateConflictedKeys.add(markerKey);
+      this.officialNavigationSessionPrivateConflictedTargets.add(targetOrder);
+      if (Number.isInteger(existingTarget)) this.officialNavigationSessionPrivateConflictedTargets.add(existingTarget);
+      if (existingPair?.markerKey) this.officialNavigationSessionPrivateConflictedKeys.add(existingPair.markerKey);
+      this.officialNavigationSessionPrivateTargetsByKey.delete(markerKey);
+      this.officialNavigationSessionPrivatePairsByTarget.delete(targetOrder);
+      return;
+    }
+    const hits = existingPair?.markerKey === markerKey ? Number(existingPair.hits || 0) + 1 : 1;
+    this.officialNavigationSessionPrivateTargetsByKey.set(markerKey, targetOrder);
+    this.officialNavigationSessionPrivatePairsByTarget.set(targetOrder, { markerKey, hits, knownTurnCount: Number(knownTurnCount) || 0 });
+  }
+
+  getTrustedOfficialPrivatePair({ targetOrder, index }) {
+    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || this.officialNavigationSessionPrivateConflictedTargets.has(targetOrder)) return null;
+    const pair = this.officialNavigationSessionPrivatePairsByTarget.get(targetOrder);
+    if (!pair?.markerKey || Number(pair.hits) < 2 || this.officialNavigationSessionPrivateConflictedKeys.has(pair.markerKey)) return null;
+    if (Number(pair.knownTurnCount) !== Number(index.size?.() ?? 0)) return null;
+    const buttons = Array.from(this.document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+    const matches = buttons.filter((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim() === pair.markerKey);
+    if (matches.length !== 1) return null;
+    return { marker: matches[0], targetOrder, hits: Number(pair.hits) };
+  }
+
+  handleOfficialNavigationRecord(record) {
+    const index = this.currentConversationId ? this.getTurnIndex(this.currentConversationId) : null;
+    const mapping = analyzeOfficialNavigationMapping({ document: this.document, turns: index?.getOrdered?.() ?? [] });
+    const activeTurnId = index?.resolveCanonicalId?.(this.host.getActiveTurnId?.());
+    const activeRecord = activeTurnId ? index?.get?.(activeTurnId) : null;
+    const marker = record?.marker ?? null;
+    const learningSample = marker && Number.isFinite(activeRecord?.order) ? {
+      markerIndex: marker.markerIndex,
+      markerCount: marker.markerCount,
+      targetOrder: Number(activeRecord.order),
+      knownTurnCount: index?.size?.() ?? null,
+      host: record?.host ?? null,
+      classification: record?.classification ?? null,
+      observedAt: new Date().toISOString()
+    } : null;
+    const clean = sanitizeOfficialNavigationRecord({ ...record, mapping, learningSample });
+    if (!clean) return;
+    this.officialNavigationMapping = clean.mapping ?? null;
+    if (clean.learningSample) {
+      this.officialNavigationLearningHistory = [...this.officialNavigationLearningHistory, clean.learningSample].slice(-OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT);
+      this.officialNavigationLearning = analyzeOfficialNavigationLearning(this.officialNavigationLearningHistory);
+      this.storage?.write?.(OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY, this.officialNavigationLearningHistory);
+      this.officialNavigationSessionLearningHistory = [...this.officialNavigationSessionLearningHistory, clean.learningSample].slice(-OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT);
+      this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning(this.officialNavigationSessionLearningHistory);
+    }
+    this.officialNavigationHistory = [...this.officialNavigationHistory, clean].slice(-OFFICIAL_NAVIGATION_HISTORY_LIMIT);
+    this.storage?.write?.(OFFICIAL_NAVIGATION_STORAGE_KEY, this.officialNavigationHistory);
+    this.publishOfficialNavigationDiagnostics();
+  }
+
+  publishOfficialNavigationDiagnostics() {
+    if (!this.window) return;
+    const current = this.window.__GPTTalkEnhancerDebug ?? {};
+    this.window.__GPTTalkEnhancerDebug = {
+      ...current,
+      officialNavigationHistory: this.officialNavigationHistory.map((item) => JSON.parse(JSON.stringify(item))),
+      lastOfficialNavigation: this.officialNavigationHistory.length ? JSON.parse(JSON.stringify(this.officialNavigationHistory.at(-1))) : null,
+      officialNavigationMapping: this.officialNavigationMapping ? JSON.parse(JSON.stringify(this.officialNavigationMapping)) : null,
+      officialNavigationLearning: JSON.parse(JSON.stringify(this.officialNavigationLearning)),
+      officialNavigationSessionLearning: JSON.parse(JSON.stringify(this.officialNavigationSessionLearning)),
+      officialBridgeAuto: JSON.parse(JSON.stringify(this.officialBridgeAuto)),
+      officialBridgeSessionTrustedTargets: this.getOfficialBridgeSessionTrustedTargets(),
+      hostInternalDepthProbe: this.hostInternalDepthProbe ? JSON.parse(JSON.stringify(this.hostInternalDepthProbe)) : null,
+      l3RuntimeEnabled: L3_RUNTIME_ENABLED,
+      l3KeyJoinDryRun: createL3KeyJoinDryRunSummary(this.l3KeyJoinDryRun),
+      officialNavigationLearningHistory: this.officialNavigationLearningHistory.map((item) => ({ ...item }))
+    };
   }
 
   publishNavigationDiagnostics() {
@@ -4181,6 +6606,557 @@ class TalkEnhancerV3App {
     };
   }
 
+  getOfficialBridgeAutoSession(conversationId) {
+    if (!conversationId) return null;
+    let session = this.officialBridgeAutoSessions.get(conversationId);
+    if (!session) {
+      session = {
+        conversationId,
+        status: "auto-scanning",
+        stableScans: 0,
+        lastSignature: null,
+        pairsByTarget: new Map(),
+        knownTurnCount: 0,
+        retryAttempt: 0,
+        summary: sanitizeOfficialNavigationAutoSummary({ status: "auto-scanning" })
+      };
+      this.officialBridgeAutoSessions.set(conversationId, session);
+    }
+    return session;
+  }
+
+  clearHostInternalDepthProbeTimer() {
+    if (this.hostInternalDepthProbeTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.hostInternalDepthProbeTimer);
+    this.hostInternalDepthProbeTimer = null;
+  }
+
+  getL3KeyJoinDryRunSession(conversationId) {
+    if (!conversationId) return null;
+    let session = this.l3KeyJoinDryRunSessions.get(conversationId);
+    if (!session) {
+      session = {
+        status: "idle",
+        stableScans: 0,
+        patternKey: null,
+        identityByTarget: new Map(),
+        knownTurnCount: 0,
+        pairsByTarget: new Map(),
+        adaptiveRescanState: "idle",
+        adaptiveRescanAttempt: 0,
+        summary: createL3KeyJoinDryRunSummary()
+      };
+      this.l3KeyJoinDryRunSessions.set(conversationId, session);
+    }
+    return session;
+  }
+
+  runL3ResearchScan({ targetOrder = null } = {}) {
+    if (this.isLocalWorkNavigationActive()) {
+      return createL3KeyJoinDryRunSummary({ status: "research-blocked-navigation" });
+    }
+    const conversationId = this.currentConversationId;
+    const index = conversationId ? this.getTurnIndex(conversationId) : null;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
+      const unavailable = createL3KeyJoinDryRunSummary({ status: "research-unavailable" });
+      this.l3KeyJoinDryRun = unavailable;
+      this.updateDebug("l3-research-unavailable");
+      return unavailable;
+    }
+    const session = this.getL3KeyJoinDryRunSession(conversationId);
+    const scan = collectL3ExactKeyJoinDryRunMap({
+      document: this.document,
+      turns: index.getOrdered?.() ?? [],
+      preferredPattern: session?.patternKey ?? null
+    });
+    const source = scan?.summary ?? {};
+    const target = Number.isInteger(targetOrder) && targetOrder >= 0 ? targetOrder : -1;
+    const result = createL3KeyJoinDryRunSummary({
+      status: "research-one-shot",
+      stableScans: session?.stableScans ?? 0,
+      mappedTurnCount: Number(source.mappedTurnCount) || 0,
+      coverage: Number(source.coverage) || 0,
+      conflicts: Number(source.conflicts) || 0,
+      exactPatternCount: Number(source.exactPatternCount) || 0,
+      mappingAgreement: Boolean(source.mappingAgreement),
+      ...createL3FreshDiagnostics(scan, target),
+      mappingStable: null,
+      adaptiveRescanState: "research-frozen",
+      adaptiveRescanAttempt: 0,
+      freshMapAccepted: false
+    });
+    this.l3KeyJoinDryRun = result;
+    this.updateDebug("l3-research-one-shot");
+    return result;
+  }
+  refreshL3KeyJoinDryRun({ conversationId, index, identity, finalAttempt = false } = {}) {
+    if (this.isLocalWorkNavigationActive()) return null;
+    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
+      this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary({ status: "unavailable" });
+      return null;
+    }
+    const session = this.getL3KeyJoinDryRunSession(conversationId);
+    const scan = collectL3ExactKeyJoinDryRunMap({
+      document: this.document,
+      turns: index.getOrdered?.() ?? [],
+      preferredPattern: session.patternKey
+    });
+    const summary = scan?.summary ?? {};
+    const exact = Boolean(
+      summary.oneToOne
+      && summary.coverage === 1
+      && Number(summary.conflicts) === 0
+      && scan?.patternKey
+      && scan?.identityByTarget instanceof Map
+      && scan.identityByTarget.size === Number(summary.knownTurnCount ?? 0)
+    );
+    if (exact) {
+      const sameIdentity = Boolean(
+        session.patternKey
+        && session.patternKey === scan.patternKey
+        && sameL3KeyJoinIdentityMap(session.identityByTarget, scan.identityByTarget)
+      );
+      session.stableScans = sameIdentity ? session.stableScans + 1 : 1;
+      session.patternKey = scan.patternKey;
+      session.identityByTarget = new Map(scan.identityByTarget);
+      session.knownTurnCount = Number(summary.knownTurnCount) || 0;
+      session.pairsByTarget = scan.pairsByTarget instanceof Map ? scan.pairsByTarget : new Map();
+      session.status = session.stableScans >= 2 ? "dry-run-ready" : (finalAttempt ? "dry-run-unstable" : "dry-run-scanning");
+    } else {
+      session.status = "dry-run-unavailable";
+      session.stableScans = 0;
+      session.patternKey = null;
+      session.identityByTarget = new Map();
+      session.knownTurnCount = Number(summary.knownTurnCount) || Number(index.size?.() ?? 0);
+      session.pairsByTarget = new Map();
+    }
+    session.summary = createL3KeyJoinDryRunSummary({
+      status: session.status,
+      stableScans: session.stableScans,
+      mappedTurnCount: Number(summary.mappedTurnCount) || 0,
+      coverage: Number(summary.coverage) || 0,
+      conflicts: Number(summary.conflicts) || 0,
+      exactPatternCount: Number(summary.exactPatternCount) || 0,
+      mappingAgreement: Boolean(summary.mappingAgreement)
+    });
+    this.l3KeyJoinDryRun = session.summary;
+    return session;
+  }
+
+  recordL3KeyJoinDryRunTarget({ targetOrder, index, identity } = {}) {
+    if (this.isLocalWorkNavigationActive()) return this.l3KeyJoinDryRun;
+    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return this.l3KeyJoinDryRun;
+    const conversationId = this.currentConversationId;
+    const session = conversationId ? this.l3KeyJoinDryRunSessions.get(conversationId) : null;
+    const currentScan = session?.patternKey ? collectL3ExactKeyJoinDryRunMap({
+      document: this.document,
+      turns: index.getOrdered?.() ?? [],
+      preferredPattern: session.patternKey
+    }) : null;
+    const currentSummary = currentScan?.summary ?? null;
+    const mappingStable = Boolean(
+      session
+      && session.status === "dry-run-ready"
+      && Number(session.knownTurnCount) === Number(index.size?.() ?? 0)
+      && currentSummary?.oneToOne
+      && Number(currentSummary?.conflicts) === 0
+      && currentScan?.patternKey === session.patternKey
+      && sameL3KeyJoinIdentityMap(session.identityByTarget, currentScan?.identityByTarget)
+    );
+    const exactCurrent = isL3ExactKeyJoinScan(currentScan, index);
+    let adaptiveRescanState = session?.adaptiveRescanState ?? "idle";
+    let freshMapAccepted = null;
+    if (session && exactCurrent) {
+      this.clearL3AdaptiveRescanTimer();
+      this.clearL3EventRecoveryWatch();
+      if (!mappingStable) {
+        adoptL3ExactKeyJoinScan(session, currentScan);
+        adaptiveRescanState = "accepted-current";
+        freshMapAccepted = true;
+      } else {
+        adaptiveRescanState = "stable";
+        freshMapAccepted = false;
+      }
+      session.adaptiveRescanState = adaptiveRescanState;
+      session.adaptiveRescanAttempt = 0;
+    } else if (session && currentScan) {
+      this.clearL3AdaptiveRescanTimer();
+      this.clearL3EventRecoveryWatch();
+      adaptiveRescanState = "pending";
+      freshMapAccepted = false;
+      session.adaptiveRescanState = adaptiveRescanState;
+      session.adaptiveRescanAttempt = 0;
+    }
+    const summary = createL3KeyJoinDryRunSummary({
+      ...(session?.summary ?? this.l3KeyJoinDryRun),
+      status: session?.status ?? this.l3KeyJoinDryRun?.status,
+      stableScans: session?.stableScans ?? this.l3KeyJoinDryRun?.stableScans,
+      ...createL3FreshDiagnostics(currentScan, targetOrder),
+      mappingStable,
+      adaptiveRescanState,
+      adaptiveRescanAttempt: session?.adaptiveRescanAttempt ?? 0,
+      freshMapAccepted
+    });
+    this.l3KeyJoinDryRun = summary;
+    if (session) session.summary = summary;
+    this.updateDebug("l3-key-join-dry-run-target");
+    if (session && currentScan && !exactCurrent && conversationId) {
+      this.scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt: 0 });
+    }
+    return summary;
+  }
+
+  clearL3AdaptiveRescanTimer() {
+    this.l3AdaptiveRescanGeneration += 1;
+    if (this.l3AdaptiveRescanTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.l3AdaptiveRescanTimer);
+    this.l3AdaptiveRescanTimer = null;
+  }
+
+  scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt = 0 } = {}) {
+    if (this.isLocalWorkNavigationActive()) return;
+    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0 || attempt >= L3_ADAPTIVE_RESCAN_DELAYS_MS.length) return;
+    const session = this.l3KeyJoinDryRunSessions.get(conversationId);
+    if (!session?.patternKey) return;
+    const generation = this.l3AdaptiveRescanGeneration;
+    const delayMs = L3_ADAPTIVE_RESCAN_DELAYS_MS[attempt];
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.l3AdaptiveRescanTimer = set(() => {
+      this.l3AdaptiveRescanTimer = null;
+      if (this.destroyed || generation !== this.l3AdaptiveRescanGeneration || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
+      const index = this.getTurnIndex(conversationId);
+      const identity = this.host.getConversationIdentity?.() ?? null;
+      if (!index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
+      const scan = collectL3ExactKeyJoinDryRunMap({
+        document: this.document,
+        turns: index.getOrdered?.() ?? [],
+        preferredPattern: session.patternKey
+      });
+      session.adaptiveRescanAttempt = attempt + 1;
+      const exact = isL3ExactKeyJoinScan(scan, index);
+      let state = "pending";
+      let freshMapAccepted = false;
+      if (exact) {
+        adoptL3ExactKeyJoinScan(session, scan);
+        this.clearL3EventRecoveryWatch();
+        state = "recovered";
+        freshMapAccepted = true;
+      } else if (attempt + 1 >= L3_ADAPTIVE_RESCAN_DELAYS_MS.length) {
+        state = "exhausted-watching";
+      }
+      session.adaptiveRescanState = state;
+      session.summary = createL3KeyJoinDryRunSummary({
+        ...(session.summary ?? this.l3KeyJoinDryRun),
+        status: session.status,
+        stableScans: session.stableScans,
+        ...createL3FreshDiagnostics(scan, targetOrder),
+        mappingStable: false,
+        adaptiveRescanState: state,
+        adaptiveRescanAttempt: session.adaptiveRescanAttempt,
+        freshMapAccepted
+      });
+      this.l3KeyJoinDryRun = session.summary;
+      this.updateDebug("l3-key-join-adaptive-rescan");
+      if (!exact && state === "pending") this.scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt: attempt + 1 });
+      if (!exact && state === "exhausted-watching") this.startL3EventRecoveryWatch({ conversationId, targetOrder });
+    }, delayMs);
+  }
+
+  clearL3EventRecoveryTimer() {
+    if (this.l3EventRecoveryTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.l3EventRecoveryTimer);
+    this.l3EventRecoveryTimer = null;
+  }
+
+  clearL3EventRecoveryWatch() {
+    this.clearL3EventRecoveryTimer();
+    this.l3EventRecoveryWatch = null;
+  }
+
+  startL3EventRecoveryWatch({ conversationId, targetOrder } = {}) {
+    this.clearL3EventRecoveryWatch();
+    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
+    const session = this.l3KeyJoinDryRunSessions.get(conversationId);
+    if (!session?.patternKey) return;
+    this.l3EventRecoveryWatch = { conversationId, targetOrder };
+  }
+
+  handleL3EventRecoveryMutation(records = []) {
+    const watch = this.l3EventRecoveryWatch;
+    if (!watch || this.isLocalWorkNavigationActive() || this.l3EventRecoveryTimer != null) return;
+    if (!Array.from(records ?? []).length) return;
+    if (this.currentConversationId !== watch.conversationId) {
+      this.clearL3EventRecoveryWatch();
+      return;
+    }
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.l3EventRecoveryTimer = set(() => {
+      this.l3EventRecoveryTimer = null;
+      const currentWatch = this.l3EventRecoveryWatch;
+      if (this.destroyed || !currentWatch || currentWatch.conversationId !== watch.conversationId || this.currentConversationId !== watch.conversationId || this.isLocalWorkNavigationActive()) return;
+      const index = this.getTurnIndex(watch.conversationId);
+      const identity = this.host.getConversationIdentity?.() ?? null;
+      const session = this.l3KeyJoinDryRunSessions.get(watch.conversationId);
+      if (!index || !session?.patternKey || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
+        this.clearL3EventRecoveryWatch();
+        return;
+      }
+      const scan = collectL3ExactKeyJoinDryRunMap({
+        document: this.document,
+        turns: index.getOrdered?.() ?? [],
+        preferredPattern: session.patternKey
+      });
+      const exact = isL3ExactKeyJoinScan(scan, index);
+      let state = "exhausted-watching";
+      let freshMapAccepted = false;
+      if (exact) {
+        adoptL3ExactKeyJoinScan(session, scan);
+        state = "recovered-event";
+        freshMapAccepted = true;
+      }
+      session.adaptiveRescanState = state;
+      session.summary = createL3KeyJoinDryRunSummary({
+        ...(session.summary ?? this.l3KeyJoinDryRun),
+        status: session.status,
+        stableScans: session.stableScans,
+        ...createL3FreshDiagnostics(scan, watch.targetOrder),
+        mappingStable: false,
+        adaptiveRescanState: state,
+        adaptiveRescanAttempt: session.adaptiveRescanAttempt,
+        freshMapAccepted
+      });
+      this.l3KeyJoinDryRun = session.summary;
+      this.updateDebug("l3-key-join-event-recovery");
+      if (exact) this.clearL3EventRecoveryWatch();
+    }, L3_EVENT_RECOVERY_DEBOUNCE_MS);
+    this.l3EventRecoveryTimer?.unref?.();
+  }
+
+  isLocalWorkNavigationActive() {
+    return Boolean(this.activeNavigation?.status === "running"
+      && this.activeNavigation?.host === "local"
+      && this.activeNavigation?.source === "sidebar-local");
+  }
+
+  clearL3PostNavigationScanTimer() {
+    if (this.l3PostNavigationScanTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.l3PostNavigationScanTimer);
+    this.l3PostNavigationScanTimer = null;
+  }
+
+  scheduleL3PostNavigationScan({ conversationId, targetOrder, requestId } = {}) {
+    this.clearL3PostNavigationScanTimer();
+    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.l3PostNavigationScanTimer = set(() => {
+      this.l3PostNavigationScanTimer = null;
+      if (this.destroyed || requestId !== this.navigationRequestId || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
+      const index = this.getTurnIndex(conversationId);
+      const identity = this.host.getConversationIdentity?.() ?? null;
+      if (!index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
+      this.recordL3KeyJoinDryRunTarget({ targetOrder, index, identity });
+    }, L3_POST_NAVIGATION_SCAN_DELAY_MS);
+    this.l3PostNavigationScanTimer?.unref?.();
+  }
+
+  scheduleHostInternalDepthProbe(conversationId, index, identity) {
+    if (this.isLocalWorkNavigationActive()) return;
+    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
+    const existing = this.hostInternalDepthProbeByConversation.get(conversationId);
+    const drySession = this.l3KeyJoinDryRunSessions.get(conversationId) ?? null;
+    if (existing) {
+      this.hostInternalDepthProbe = existing;
+      if (!drySession || drySession.status !== "dry-run-scanning") {
+        if (drySession?.summary) this.l3KeyJoinDryRun = drySession.summary;
+        return;
+      }
+    }
+    if (this.hostInternalDepthProbeTimer != null) return;
+    const attempts = Number(this.hostInternalDepthProbeAttempts.get(conversationId) ?? 0);
+    const delays = [180, 420, 900, 1600, 2600];
+    const delayMs = delays[Math.min(attempts, delays.length - 1)];
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.hostInternalDepthProbeTimer = set(() => {
+      this.hostInternalDepthProbeTimer = null;
+      if (this.destroyed || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
+      const currentIdentity = this.host.getConversationIdentity?.() ?? null;
+      if (!currentIdentity?.stable || currentIdentity.host !== "local" || currentIdentity.source !== "sidebar-local") return;
+      const currentIndex = this.getTurnIndex(conversationId);
+      const attempt = attempts + 1;
+      this.hostInternalDepthProbeAttempts.set(conversationId, attempt);
+      try {
+        const result = collectHostInternalDepthProbe({ window: this.window, document: this.document, host: this.host, turns: currentIndex?.getOrdered?.() ?? [] });
+        const markerCount = Number(result?.level0?.officialMarkerCount ?? 0);
+        const markerComplete = markerCount > 0 || attempt >= delays.length;
+        const dryRunSession = markerCount > 0 ? this.refreshL3KeyJoinDryRun({ conversationId, index: currentIndex, identity: currentIdentity, finalAttempt: attempt >= delays.length }) : null;
+        const dryRunNeedsRetry = dryRunSession?.status === "dry-run-scanning";
+        this.hostInternalDepthProbe = { ...result, markerProbeAttempt: attempt, markerProbeComplete: markerComplete };
+        if (markerComplete) this.hostInternalDepthProbeByConversation.set(conversationId, this.hostInternalDepthProbe);
+        this.updateDebug("host-internal-depth-probe");
+        if (!markerComplete || dryRunNeedsRetry) this.scheduleHostInternalDepthProbe(conversationId, currentIndex, currentIdentity);
+      } catch (error) {
+        this.hostInternalDepthProbe = { error: String(error?.message ?? error ?? "unknown"), markerProbeAttempt: attempt, markerProbeComplete: true };
+        this.hostInternalDepthProbeByConversation.set(conversationId, this.hostInternalDepthProbe);
+        this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary({ status: "error" });
+        this.updateDebug("host-internal-depth-probe-error");
+      }
+    }, delayMs);
+    this.hostInternalDepthProbeTimer?.unref?.();
+  }
+
+  clearOfficialBridgeAutoTimer() {
+    if (this.officialBridgeAutoTimer == null) return;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    clear(this.officialBridgeAutoTimer);
+    this.officialBridgeAutoTimer = null;
+  }
+
+  scheduleOfficialBridgeAutoRetry(conversationId, session) {
+    if (!conversationId || !session || session.status === "auto-official-ready" || this.officialBridgeAutoTimer != null) return;
+    const attempt = Number(session.retryAttempt) || 0;
+    if (attempt >= OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS.length) return;
+    const delayMs = OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS[attempt];
+    session.retryAttempt = attempt + 1;
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.officialBridgeAutoTimer = set(() => {
+      this.officialBridgeAutoTimer = null;
+      if (this.destroyed || this.currentConversationId !== conversationId) return;
+      this.refresh("official-bridge-auto-scan");
+    }, delayMs);
+  }
+
+  refreshOfficialWorkAutoBridge({ conversationId, index, identity }) {
+    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
+      if (conversationId === this.currentConversationId) this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
+      return this.officialBridgeAuto;
+    }
+    const session = this.getOfficialBridgeAutoSession(conversationId);
+    const scan = analyzeOfficialNavigationAutoMap({
+      document: this.document,
+      turns: index.getOrdered?.() ?? [],
+      resolveMarkerKey: (markerKey) => this.host.resolveOfficialNavigationMarkerKey?.(markerKey) ?? null,
+      minCoverage: 0.8
+    });
+    const signature = scan.summary.readyCandidate ? officialAutoMapSignature(scan.privatePairs) : "";
+    if (scan.summary.readyCandidate && signature) {
+      session.stableScans = session.lastSignature === signature ? session.stableScans + 1 : 1;
+      session.lastSignature = signature;
+      session.knownTurnCount = scan.summary.knownTurnCount;
+      if (session.stableScans >= 2) {
+        session.status = "auto-official-ready";
+        session.pairsByTarget = new Map(scan.privatePairs.map((pair) => [pair.targetOrder, { markerKey: pair.markerKey, strategies: pair.strategies }]));
+        this.clearOfficialBridgeAutoTimer();
+      } else {
+        session.status = "auto-scanning";
+      }
+    } else {
+      session.status = "fallback-self";
+      session.stableScans = 0;
+      session.lastSignature = null;
+      session.pairsByTarget = new Map();
+      session.knownTurnCount = scan.summary.knownTurnCount;
+    }
+    session.summary = sanitizeOfficialNavigationAutoSummary({
+      ...scan.summary,
+      status: session.status,
+      stableScans: session.stableScans,
+      recommendedMode: session.status === "auto-official-ready" ? "auto-official-ready" : session.status === "auto-scanning" ? "auto-scanning" : "fallback-self"
+    });
+    this.officialBridgeAuto = session.summary;
+    this.scheduleOfficialBridgeAutoRetry(conversationId, session);
+    return session.summary;
+  }
+
+  getOfficialAutoBridgePair({ targetOrder, index }) {
+    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || !this.currentConversationId) return null;
+    const session = this.officialBridgeAutoSessions.get(this.currentConversationId);
+    if (!session || session.status !== "auto-official-ready" || Number(session.knownTurnCount) !== Number(index.size?.() ?? 0)) return null;
+    const pair = session.pairsByTarget.get(targetOrder);
+    if (!pair?.markerKey) return null;
+    const buttons = Array.from(this.document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
+    const matches = buttons.filter((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim() === pair.markerKey);
+    if (matches.length !== 1) return null;
+    return { marker: matches[0], targetOrder, strategies: [...(pair.strategies ?? [])] };
+  }
+
+  getOfficialBridgeSessionTrustedTargets() {
+    const session = this.currentConversationId ? this.officialBridgeAutoSessions.get(this.currentConversationId) : null;
+    if (!session || session.status !== "auto-official-ready") return [];
+    return [...session.pairsByTarget.entries()]
+      .map(([targetOrder, pair]) => ({ targetOrder: Number(targetOrder), trusted: true, source: "auto", strategies: [...(pair?.strategies ?? [])] }))
+      .sort((a, b) => a.targetOrder - b.targetOrder);
+  }
+
+  getOfficialBridgeActiveOrder(index) {
+    if (!index) return null;
+    const activeTurnId = index.resolveCanonicalId?.(this.host.getActiveTurnId?.());
+    const activeRecord = activeTurnId ? index.get?.(activeTurnId) : null;
+    return Number.isFinite(activeRecord?.order) ? Number(activeRecord.order) : null;
+  }
+
+  hasTrustedOfficialWorkBridgeCandidate({ targetOrder, index, identity }) {
+    if (!OFFICIAL_NAVIGATION_RUNTIME_ENABLED) return false;
+    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return false;
+    return Boolean(this.getOfficialAutoBridgePair({ targetOrder, index }));
+  }
+
+  async tryOfficialWorkBridge({ targetOrder, index, identity, isCurrent }) {
+    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return { attempted: false, fallbackReason: "not-local-work" };
+    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index) return { attempted: false, fallbackReason: "invalid-target" };
+    const pair = this.getOfficialAutoBridgePair({ targetOrder, index });
+    if (!pair) return { attempted: false, fallbackReason: "auto-bridge-unavailable" };
+    const marker = pair.marker;
+    if (!marker || typeof marker.click !== "function") return { attempted: false, fallbackReason: "marker-unavailable" };
+
+    const startedAt = appNowMs(this.window);
+    let firstMatchedAt = null;
+    try {
+      this.officialBridgeInFlight = true;
+      marker.click();
+    } catch {
+      return { attempted: true, succeeded: false, fallbackReason: "marker-click-failed", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
+    } finally {
+      this.officialBridgeInFlight = false;
+    }
+
+    while (appNowMs(this.window) - startedAt <= 650) {
+      if (!isCurrent?.()) return { attempted: true, succeeded: false, fallbackReason: "superseded", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
+      const activeOrder = this.getOfficialBridgeActiveOrder(index);
+      const now = appNowMs(this.window);
+      if (activeOrder === targetOrder) {
+        if (firstMatchedAt == null) firstMatchedAt = now;
+        if (now - firstMatchedAt >= 80) {
+          this.host.persistLocalScrollPosition?.();
+          return {
+            attempted: true,
+            succeeded: true,
+            fallbackReason: null,
+            elapsedMs: Math.round(now - startedAt),
+            result: {
+              ok: true,
+              verified: true,
+              reason: "official-bridge",
+              settleMode: "official-bridge",
+              officialBridgeAttempted: true,
+              officialBridgeSucceeded: true,
+              officialBridgeFallbackReason: null,
+              steps: [{ mode: "official-bridge", direction: 0, elapsedMs: Math.round(now - startedAt), jumpPx: 0, waitMs: 0, targetOrder, progressKind: "target", before: null, after: null }]
+            }
+          };
+        }
+      } else {
+        firstMatchedAt = null;
+      }
+      await waitMs(this.window, 24);
+    }
+    return { attempted: true, succeeded: false, fallbackReason: "verify-timeout", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
+  }
+
   async navigate(turnId) {
     const conversationId = this.currentConversationId;
     const index = conversationId ? this.getTurnIndex(conversationId) : null;
@@ -4189,6 +7165,12 @@ class TalkEnhancerV3App {
     const targetOrder = Number.isFinite(record?.order) ? Number(record.order) : null;
     const requestId = ++this.navigationRequestId;
     const identity = this.host.getConversationIdentity?.() ?? null;
+    const localWorkNavigation = Boolean(identity?.stable && identity.host === "local" && identity.source === "sidebar-local");
+    if (localWorkNavigation) {
+      this.clearL3AdaptiveRescanTimer();
+      this.clearL3PostNavigationScanTimer();
+      this.clearL3EventRecoveryWatch();
+    }
     const navigationRun = this.beginNavigationRun({ targetOrder, identity });
     this.clearNavigationUxTimer();
     this.setNavigationUx({ state: "pending", target: turnId, targetOrder, pendingVisible: false }, "navigate-start");
@@ -4204,6 +7186,7 @@ class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
+    if (localWorkNavigation) this.host.notifyNavigationIntent?.();
     if (identity?.host === "local") {
       const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
       if (remainingSettleMs > 0) {
@@ -4215,12 +7198,28 @@ class TalkEnhancerV3App {
         }
       }
     }
+    const bridge = { attempted: false, succeeded: false, fallbackReason: null, elapsedMs: 0 };
+    if (!isCurrent()) {
+      const superseded = { ok: false, target: turnId, verified: false, reason: "superseded", officialBridgeAttempted: Boolean(bridge.attempted), officialBridgeSucceeded: false, officialBridgeFallbackReason: bridge.fallbackReason ?? "superseded" };
+      this.completeNavigationRun(navigationRun, superseded);
+      return superseded;
+    }
+
     const allowMountedFastSettle = Boolean(identity?.stable && (identity.host === "chatgpt" || identity.host === "local"));
-    const result = await this.host.navigateToTurn(turnId, {
+    const cacheRestoredTurns = Number(this.cacheHydrationCounts.get(conversationId) ?? 0);
+    const knownTurns = Number(index.size?.() ?? 0);
+    const allowChatPredictiveFastPath = Boolean(
+      identity?.stable
+      && identity.host === "chatgpt"
+      && knownTurns >= 20
+      && cacheRestoredTurns >= Math.max(20, Math.ceil(knownTurns * 0.8))
+    );
+    let result = await this.host.navigateToTurn(turnId, {
       turns: index.getOrdered(),
       getTurns: () => index.getOrdered(),
       isCurrent,
       allowMountedFastSettle,
+      allowChatPredictiveFastPath,
       onTraceStep: (entry, steps) => this.recordNavigationStep(navigationRun, entry, steps)
     });
     if (requestId !== this.navigationRequestId) {
@@ -4250,6 +7249,12 @@ class TalkEnhancerV3App {
       domId: result?.domId ?? null,
       settleChecks: Number.isFinite(result?.settleChecks) ? result.settleChecks : null,
       settleMode: result?.settleMode ?? null,
+      fastAttempted: Boolean(result?.fastAttempted),
+      fastSucceeded: Boolean(result?.fastSucceeded),
+      fallbackReason: result?.fallbackReason ?? null,
+      officialBridgeAttempted: Boolean(result?.officialBridgeAttempted),
+      officialBridgeSucceeded: Boolean(result?.officialBridgeSucceeded),
+      officialBridgeFallbackReason: result?.officialBridgeFallbackReason ?? null,
       steps: Array.isArray(result?.steps) ? result.steps : [],
       targetOrder: latestTargetOrder
     };
@@ -4264,6 +7269,9 @@ class TalkEnhancerV3App {
       this.shell.showToast(`未能定位 ${label}，请再试一次`);
     }
     this.refresh("navigate-result");
+    if (L3_RUNTIME_ENABLED && localWorkNavigation && result?.ok && result?.verified && result?.reason !== "superseded") {
+      this.scheduleL3PostNavigationScan({ conversationId, targetOrder: latestTargetOrder, requestId });
+    }
     return result;
   }
 
@@ -4306,6 +7314,17 @@ class TalkEnhancerV3App {
       navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
       slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
       lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
+      officialNavigationHistory: this.officialNavigationHistory.map((item) => JSON.parse(JSON.stringify(item))),
+      lastOfficialNavigation: this.officialNavigationHistory.length ? JSON.parse(JSON.stringify(this.officialNavigationHistory.at(-1))) : null,
+      officialNavigationMapping: this.officialNavigationMapping ? JSON.parse(JSON.stringify(this.officialNavigationMapping)) : null,
+      officialNavigationLearning: JSON.parse(JSON.stringify(this.officialNavigationLearning)),
+      officialNavigationSessionLearning: JSON.parse(JSON.stringify(this.officialNavigationSessionLearning)),
+      officialBridgeAuto: JSON.parse(JSON.stringify(this.officialBridgeAuto)),
+      officialBridgeSessionTrustedTargets: this.getOfficialBridgeSessionTrustedTargets(),
+      hostInternalDepthProbe: this.hostInternalDepthProbe ? JSON.parse(JSON.stringify(this.hostInternalDepthProbe)) : null,
+      l3RuntimeEnabled: L3_RUNTIME_ENABLED,
+      l3KeyJoinDryRun: createL3KeyJoinDryRunSummary(this.l3KeyJoinDryRun),
+      officialNavigationLearningHistory: this.officialNavigationLearningHistory.map((item) => ({ ...item })),
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
       hostContract,
@@ -4330,6 +7349,11 @@ class TalkEnhancerV3App {
     this.window?.removeEventListener?.("hashchange", this.boundRoute);
     this.document?.removeEventListener?.("click", this.boundConversationSelect, true);
     this.clearConversationSelectTimer();
+    this.clearOfficialBridgeAutoTimer();
+    this.clearHostInternalDepthProbeTimer();
+    this.clearL3AdaptiveRescanTimer();
+    this.clearL3EventRecoveryWatch();
+    this.officialNavigationProbe?.destroy?.();
     if (this.refreshFrame != null && typeof this.window?.cancelAnimationFrame === "function") this.window.cancelAnimationFrame(this.refreshFrame);
     this.host?.destroy?.();
     this.shell?.destroy?.();
@@ -4351,10 +7375,105 @@ function registerBundle(windowRef = globalThis.window) {
 
 if (typeof window !== "undefined") registerBundle(window);
 
+function createL3KeyJoinDryRunSummary(value = {}) {
+  const nullableBoolean = (input) => input === true ? true : input === false ? false : null;
+  const nullableCount = (input) => input == null || !Number.isFinite(Number(input)) ? null : Math.max(0, Math.floor(Number(input)));
+  const nullableRatio = (input) => input == null || !Number.isFinite(Number(input)) ? null : Math.max(0, Math.min(1, Number(input)));
+  return {
+    status: typeof value.status === "string" ? value.status : "idle",
+    stableScans: Math.max(0, Number(value.stableScans) || 0),
+    mappedTurnCount: Math.max(0, Number(value.mappedTurnCount) || 0),
+    coverage: Math.max(0, Math.min(1, Number(value.coverage) || 0)),
+    conflicts: Math.max(0, Number(value.conflicts) || 0),
+    exactPatternCount: Math.max(0, Number(value.exactPatternCount) || 0),
+    mappingAgreement: Boolean(value.mappingAgreement),
+    currentMarkerCount: nullableCount(value.currentMarkerCount),
+    currentKnownTurnCount: nullableCount(value.currentKnownTurnCount),
+    currentExactPatternCount: nullableCount(value.currentExactPatternCount),
+    currentRelationPatternCount: nullableCount(value.currentRelationPatternCount),
+    currentMarkersWithKeyJoinCandidates: nullableCount(value.currentMarkersWithKeyJoinCandidates),
+    currentKeyJoinMappedMarkers: nullableCount(value.currentKeyJoinMappedMarkers),
+    currentKeyJoinUniqueTurns: nullableCount(value.currentKeyJoinUniqueTurns),
+    currentBestKeyJoinCoverage: nullableRatio(value.currentBestKeyJoinCoverage),
+    currentBestKeyJoinConflicts: nullableCount(value.currentBestKeyJoinConflicts),
+    currentBestKeyJoinOneToOne: nullableBoolean(value.currentBestKeyJoinOneToOne),
+    currentMappedTurnCount: nullableCount(value.currentMappedTurnCount),
+    currentCoverage: nullableRatio(value.currentCoverage),
+    currentConflicts: nullableCount(value.currentConflicts),
+    currentOneToOne: nullableBoolean(value.currentOneToOne),
+    preferredPatternPresent: nullableBoolean(value.preferredPatternPresent),
+    alternateExactPatternAvailable: nullableBoolean(value.alternateExactPatternAvailable),
+    mappingStable: nullableBoolean(value.mappingStable),
+    targetResolvable: nullableBoolean(value.targetResolvable),
+    markerConnected: nullableBoolean(value.markerConnected),
+    adaptiveRescanState: typeof value.adaptiveRescanState === "string" ? value.adaptiveRescanState : "idle",
+    adaptiveRescanAttempt: Math.max(0, Number(value.adaptiveRescanAttempt) || 0),
+    freshMapAccepted: nullableBoolean(value.freshMapAccepted)
+  };
+}
+
+function isL3ExactKeyJoinScan(scan, index) {
+  const summary = scan?.summary ?? null;
+  const expectedKnownTurnCount = Number(index?.size?.() ?? 0);
+  return Boolean(
+    summary?.oneToOne
+    && Number(summary?.coverage) === 1
+    && Number(summary?.conflicts) === 0
+    && scan?.patternKey
+    && scan?.identityByTarget instanceof Map
+    && scan.identityByTarget.size === expectedKnownTurnCount
+    && Number(summary?.knownTurnCount) === expectedKnownTurnCount
+  );
+}
+
+function adoptL3ExactKeyJoinScan(session, scan) {
+  if (!session || !scan?.patternKey || !(scan?.identityByTarget instanceof Map)) return false;
+  session.patternKey = scan.patternKey;
+  session.identityByTarget = new Map(scan.identityByTarget);
+  session.knownTurnCount = Number(scan?.summary?.knownTurnCount) || 0;
+  session.pairsByTarget = scan.pairsByTarget instanceof Map ? scan.pairsByTarget : new Map();
+  session.status = "dry-run-ready";
+  session.stableScans = Math.max(2, Number(session.stableScans) || 0);
+  return true;
+}
+
+function createL3FreshDiagnostics(scan, targetOrder) {
+  const currentSummary = scan?.summary ?? null;
+  const pair = scan?.pairsByTarget instanceof Map ? scan.pairsByTarget.get(targetOrder) : null;
+  const marker = pair?.marker ?? null;
+  return {
+    currentMarkerCount: currentSummary ? currentSummary.markerCount : null,
+    currentKnownTurnCount: currentSummary ? currentSummary.knownTurnCount : null,
+    currentExactPatternCount: currentSummary ? currentSummary.exactPatternCount : null,
+    currentRelationPatternCount: currentSummary ? currentSummary.relationPatternCount : null,
+    currentMarkersWithKeyJoinCandidates: currentSummary ? currentSummary.markersWithKeyJoinCandidates : null,
+    currentKeyJoinMappedMarkers: currentSummary ? currentSummary.keyJoinMappedMarkers : null,
+    currentKeyJoinUniqueTurns: currentSummary ? currentSummary.keyJoinUniqueTurns : null,
+    currentBestKeyJoinCoverage: currentSummary ? currentSummary.bestKeyJoinCoverage : null,
+    currentBestKeyJoinConflicts: currentSummary ? currentSummary.bestKeyJoinConflicts : null,
+    currentBestKeyJoinOneToOne: currentSummary ? Boolean(currentSummary.bestKeyJoinOneToOne) : null,
+    currentMappedTurnCount: currentSummary ? currentSummary.mappedTurnCount : null,
+    currentCoverage: currentSummary ? currentSummary.coverage : null,
+    currentConflicts: currentSummary ? currentSummary.conflicts : null,
+    currentOneToOne: currentSummary ? Boolean(currentSummary.oneToOne) : null,
+    preferredPatternPresent: currentSummary?.preferredPatternPresent ?? null,
+    alternateExactPatternAvailable: currentSummary?.alternateExactPatternAvailable ?? null,
+    targetResolvable: Boolean(pair && pair.markerIndex != null),
+    markerConnected: Boolean(marker && marker.isConnected !== false)
+  };
+}
+function sameL3KeyJoinIdentityMap(left, right) {
+  if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
+  for (const [targetOrder, identity] of left.entries()) {
+    if (!right.has(targetOrder) || !Object.is(identity, right.get(targetOrder))) return false;
+  }
+  return true;
+}
+
 function isSlowNavigationStep(step = {}) {
   const elapsedMs = Number(step?.elapsedMs) || 0;
   const waitMs = Number(step?.waitMs) || 0;
-  if (step?.mode === "chat-progressive") return elapsedMs >= 100;
+  if (step?.mode === "chat-progressive" || step?.mode === "chat-fast") return elapsedMs >= 100;
   if (step?.mode === "work-wheel") return elapsedMs >= Math.max(180, waitMs * 1.5);
   return elapsedMs >= Math.max(100, waitMs * 1.5);
 }
@@ -4391,6 +7510,12 @@ function sanitizeSlowNavigationRecord(value = {}) {
     reason: typeof value.reason === "string" ? value.reason : null,
     ok: Boolean(value.ok),
     verified: Boolean(value.verified),
+    fastAttempted: Boolean(value.fastAttempted),
+    fastSucceeded: Boolean(value.fastSucceeded),
+    fallbackReason: typeof value.fallbackReason === "string" ? value.fallbackReason : null,
+    officialBridgeAttempted: Boolean(value.officialBridgeAttempted),
+    officialBridgeSucceeded: Boolean(value.officialBridgeSucceeded),
+    officialBridgeFallbackReason: typeof value.officialBridgeFallbackReason === "string" ? value.officialBridgeFallbackReason : null,
     slowestStep: cleanStep(value.slowestStep),
     slowSteps: (Array.isArray(value.slowSteps) ? value.slowSteps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT),
     steps: (Array.isArray(value.steps) ? value.steps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT)

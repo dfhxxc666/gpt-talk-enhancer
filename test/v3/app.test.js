@@ -44,7 +44,7 @@ function createHarness({ navigationOk = true, storage = null } = {}) {
     destroy() {}
   };
   app.refresh("test-init");
-  return { app, host, shellState, turns, getActive: () => active, setConversationId: (value) => { conversationId = value; }, setSurface: (value) => { surface = value; } };
+  return { app, host, shellState, turns, getActive: () => active, setActive: (value) => { active = value; }, setConversationId: (value) => { conversationId = value; }, setSurface: (value) => { surface = value; } };
 }
 
 test("Timeline cache restores a complete long-conversation index before DOM hydration catches up", () => {
@@ -178,7 +178,7 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
 test("debug status exposes requested v3 runtime fields", () => {
   const { app } = createHarness();
   const status = app.status();
-  assert.equal(status.version, "0.5.1");
+  assert.equal(status.version, "0.5.2");
   assert.deepEqual(status.conversationIdentity, { id: "A", source: "test", host: "test", kind: "conversation", stable: true });
   assert.equal(status.host, "codex-desktop");
   assert.equal(status.hostContract.revision, "codex-desktop-v1");
@@ -195,6 +195,10 @@ test("debug status exposes requested v3 runtime fields", () => {
   assert.equal(status.navigationCompatibility.feature, "codex-plus-thread-scroll-restore");
   assert.equal(status.navigationCompatibility.status, "not-needed");
   assert.ok(["healthy", "degraded"].includes(status.health));
+  app.hostInternalDepthProbe = { level1: { present: true }, level2: { reactPropsPresent: false }, level3: { reactFiberPresent: false } };
+  app.updateDebug("host-depth-test");
+  assert.deepEqual(app.status().hostInternalDepthProbe, app.hostInternalDepthProbe);
+  assert.deepEqual(app.window.__GPTTalkEnhancerDebug.hostInternalDepthProbe, app.hostInternalDepthProbe);
 });
 
 test("conversation switch invalidates in-flight navigation without stale failure UI", async () => {
@@ -291,6 +295,43 @@ test("sidebar conversation click settles after Desktop selection transition", ()
   assert.equal(app.localNavigationSettleUntil, 1500);
 });
 
+test("Local sidebar switch saves the current thread position before invalidation", () => {
+  const { app, host } = createHarness();
+  const events = [];
+  const currentId = "local:11111111-1111-7111-8111-111111111111";
+  const nextId = "local:22222222-2222-7222-8222-222222222222";
+  host.getConversationIdentity = () => ({ id: currentId, source: "sidebar-local", host: "local", kind: "local", stable: true });
+  host.persistLocalScrollPosition = () => { events.push("save"); return true; };
+  app.invalidateNavigation = (reason) => events.push(`invalidate:${reason}`);
+  app.scheduleRefresh = () => {};
+  app.window = { performance: { now: () => 1000 }, setTimeout() { return 7; }, clearTimeout() {} };
+  app.handleConversationSelect({
+    target: {
+      closest: () => ({
+        getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? nextId : null
+      })
+    }
+  });
+  assert.deepEqual(events.slice(0, 2), ["save", "invalidate:conversation-select"]);
+});
+
+test("clicking the current Local sidebar thread does not force a duplicate scroll save", () => {
+  const { app, host } = createHarness();
+  const currentId = "local:11111111-1111-7111-8111-111111111111";
+  let saves = 0;
+  host.getConversationIdentity = () => ({ id: currentId, source: "sidebar-local", host: "local", kind: "local", stable: true });
+  host.persistLocalScrollPosition = () => { saves += 1; return true; };
+  app.scheduleRefresh = () => {};
+  app.window = { performance: { now: () => 1000 }, setTimeout() { return 7; }, clearTimeout() {} };
+  app.handleConversationSelect({
+    target: {
+      closest: () => ({
+        getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? currentId : null
+      })
+    }
+  });
+  assert.equal(saves, 0);
+});
 test("ChatGPT sidebar click retries delayed identity before restoring Timeline cache", () => {
   const storage = new MemoryStorageAdapter();
   const cache = new TimelineCache({ storage });
@@ -333,7 +374,27 @@ test("stable ChatGPT identity authorizes mounted fast settle", async () => {
   host.navigateToTurn = async (_turnId, context) => { received = context; return { ok: true, verified: true, target: "q22", settleMode: "mounted-fast" }; };
   await app.navigate("q22");
   assert.equal(received.allowMountedFastSettle, true);
+  assert.equal(received.allowChatPredictiveFastPath, false);
   assert.equal(app.status().navigation.settleMode, "mounted-fast");
+});
+
+test("restored ChatGPT cache authorizes predictive fast path and exposes result diagnostics", async () => {
+  const storage = new MemoryStorageAdapter();
+  const cache = new TimelineCache({ storage });
+  cache.save("A", Array.from({ length: 50 }, (_, order) => ({ id: `q${order + 1}`, order, text: `Cached ${order + 1}`, type: "text" })));
+  const { app, host } = createHarness({ storage });
+  host.getConversationIdentity = () => ({ id: "chatgpt-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true });
+  let received = null;
+  host.navigateToTurn = async (_turnId, context) => {
+    received = context;
+    return { ok: true, verified: true, target: "q22", fastAttempted: true, fastSucceeded: true, fallbackReason: null };
+  };
+  await app.navigate("q22");
+  assert.equal(app.status().timeline.cacheRestoredTurns, 50);
+  assert.equal(received.allowChatPredictiveFastPath, true);
+  assert.equal(app.status().navigation.fastAttempted, true);
+  assert.equal(app.status().navigation.fastSucceeded, true);
+  assert.equal(app.status().navigation.fallbackReason, null);
 });
 
 test("slow navigation diagnostics persist automatically without conversation identifiers", async () => {
@@ -376,6 +437,497 @@ test("fast navigation does not pollute persisted slow diagnostics", async () => 
   assert.equal(app.status().lastSlowNavigation, null);
 });
 
+test("official navigation diagnostics persist and restore without conversation content", () => {
+  const storage = new MemoryStorageAdapter();
+  const { app } = createHarness({ storage });
+  app.document = {
+    querySelectorAll(selector) {
+      if (selector !== "[data-thread-user-message-navigation-item-id]") return [];
+      return Array.from({ length: 8 }, (_, offset) => ({ getAttribute: () => `q${offset + 21}` }));
+    }
+  };
+  app.handleOfficialNavigationRecord({
+    probeId: 7, host: "local", source: "sidebar-local", stable: true, startedAt: "2026-09-08T00:00:00.000Z", finishedReason: "settled",
+    trigger: { trusted: true, path: [{ tag: "button", role: "button", classes: ["official-marker"], hasId: false, ariaLabel: { present: true, length: 12, kind: "text" }, dataAttributes: [{ name: "data-turn-id", kind: "uuid-like" }] }] },
+    marker: { markerIndex: 21, markerCount: 50 },
+    totalElapsedMs: 41, clickToFirstScrollMs: 5, clickToFirstWindowMs: 6, clickToFirstExtentMs: null, scrollEventCount: 1, mutationCount: 2,
+    classification: "single-jump-window-swap",
+    metrics: { logicalDelta: -8400, absoluteLogicalDelta: 8400, maxSingleLogicalDelta: 8400, distinctMotionSteps: 1, extentDelta: 0, windowChanged: true, containerChanged: false },
+    before: { physicalScrollTop: 9000, scrollHeight: 20000, clientHeight: 800, logicalPosition: 9000, maxLogicalPosition: 19200, isColumnReverse: false, visibleRange: { min: 60, max: 75, count: 16 } },
+    after: { physicalScrollTop: 600, scrollHeight: 20000, clientHeight: 800, logicalPosition: 600, maxLogicalPosition: 19200, isColumnReverse: false, visibleRange: { min: 0, max: 15, count: 16 } },
+    samples: []
+  });
+  const saved = storage.read("gte.v3.official-navigation-diagnostics", []);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].classification, "single-jump-window-swap");
+  assert.equal(saved[0].mapping.oneToOneExact, true);
+  assert.equal(saved[0].mapping.recommendedBridgeMode, "direct-exact-id");
+  assert.equal(app.status().officialNavigationMapping.exactIdMatches, 8);
+  assert.equal("conversationId" in saved[0], false);
+  assert.equal("text" in saved[0], false);
+  assert.equal(app.status().lastOfficialNavigation.host, "local");
+  assert.equal(app.status().lastOfficialNavigation.learningSample.markerIndex, 21);
+  assert.equal(app.status().lastOfficialNavigation.learningSample.targetOrder, 21);
+  assert.equal(app.status().officialNavigationLearning.sampleCount, 1);
+  assert.equal(app.status().officialNavigationLearning.observedPairs[0].markerIndex, 21);
+  assert.equal(app.status().officialNavigationLearning.observedPairs[0].targetOrder, 21);
+  const learned = storage.read("gte.v3.official-navigation-learning", []);
+  assert.equal(learned.length, 1);
+  assert.equal("turnId" in learned[0], false);
+  const { app: restored } = createHarness({ storage });
+  assert.equal(restored.status().officialNavigationHistory.length, 1);
+  assert.equal(restored.status().lastOfficialNavigation.probeId, 7);
+  assert.equal(restored.status().officialNavigationLearning.sampleCount, 1);
+  assert.equal(restored.status().officialNavigationMapping.recommendedBridgeMode, "direct-exact-id");
+});
+
+
+
+test("Work official bridge stays runtime-disabled even when auto mapping would be ready", async () => {
+  const storage = new MemoryStorageAdapter();
+  const cache = new TimelineCache({ storage });
+  cache.save("A", Array.from({ length: 50 }, (_, order) => ({ id: `q${order + 1}`, order, text: `Question ${order + 1}`, type: "text", lastSeen: order + 1 })));
+  const { app, host, setActive } = createHarness({ storage });
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  let fallbackCalls = 0;
+  host.navigateToTurn = async () => { fallbackCalls += 1; return { ok: true, verified: true, reason: "fallback" }; };
+  const markers = [
+    { getAttribute: (name) => name === "data-thread-user-message-navigation-item-id" ? "extra-top" : name === "aria-label" ? "Pinned" : null, click() {} },
+    ...Array.from({ length: 50 }, (_, order) => ({
+      getAttribute: (name) => name === "data-thread-user-message-navigation-item-id" ? `official-q${order + 1}` : name === "aria-label" ? `Jump to Q${order + 1}` : null,
+      click() { setActive(`q${order + 1}`); }
+    }))
+  ];
+  app.document = { querySelectorAll: (selector) => selector === '[data-thread-user-message-navigation-item-id]' ? markers : [], getElementById: () => null };
+  const index = app.getTurnIndex("A");
+  app.refreshOfficialWorkAutoBridge({ conversationId: "A", index, identity });
+  app.refreshOfficialWorkAutoBridge({ conversationId: "A", index, identity });
+  assert.equal(app.status().officialBridgeAuto.status, "auto-official-ready");
+  assert.equal(app.status().officialBridgeAuto.coverage, 1);
+  const result = await app.navigate("q23");
+  assert.equal(result.reason, "fallback", JSON.stringify(result));
+  assert.equal(Boolean(result.officialBridgeAttempted), false);
+  assert.equal(Boolean(result.officialBridgeSucceeded), false);
+  assert.equal(fallbackCalls, 1);
+});
+
+test("manual official learning never unlocks Work bridge when auto mapping is unavailable", () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  app.document = { querySelectorAll: () => [], getElementById: () => null };
+  const index = app.getTurnIndex("A");
+  app.handleOfficialPrivateMarker({ probeId: 1, sessionKey: "A", markerKey: "manual-key" });
+  app.recordOfficialPrivateMarkerLearning({ probeId: 1, targetOrder: 22, knownTurnCount: index.size() });
+  app.handleOfficialPrivateMarker({ probeId: 2, sessionKey: "A", markerKey: "manual-key" });
+  app.recordOfficialPrivateMarkerLearning({ probeId: 2, targetOrder: 22, knownTurnCount: index.size() });
+  app.refreshOfficialWorkAutoBridge({ conversationId: "A", index, identity });
+  assert.equal(app.status().officialBridgeAuto.status, "fallback-self");
+  assert.equal(app.hasTrustedOfficialWorkBridgeCandidate({ targetOrder: 22, index, identity }), false);
+});
+
+test("disabled official bridge hooks cannot intercept the existing Work navigation", async () => {
+  const { app, host } = createHarness();
+  host.getConversationIdentity = () => ({ id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  app.hasTrustedOfficialWorkBridgeCandidate = () => true;
+  app.tryOfficialWorkBridge = async () => ({ attempted: true, succeeded: false, fallbackReason: "verify-timeout", elapsedMs: 90 });
+  let fallbackCalls = 0;
+  host.navigateToTurn = async (turnId) => { fallbackCalls += 1; return { ok: true, verified: true, target: turnId, reason: "ok" }; };
+  const result = await app.navigate("q22");
+  assert.equal(result.ok, true);
+  assert.equal(fallbackCalls, 1);
+  assert.equal(Boolean(result.officialBridgeAttempted), false);
+  assert.equal(Boolean(result.officialBridgeSucceeded), false);
+  assert.equal(result.officialBridgeFallbackReason ?? null, null);
+});
+
+test("L3 exact key-join dry-run stays stable across marker DOM rebuild and keeps diagnostics independent", async () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  let sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `dry-nav-${order + 1}` }));
+  let markerClicks = 0;
+  const makeMarker = (markerKey, items = sharedItems) => {
+    const marker = {
+      isConnected: true,
+      getAttribute(name) { return name === "data-thread-user-message-navigation-item-id" ? markerKey : null; },
+      click() { markerClicks += 1; }
+    };
+    const parent = { tag: 0, memoizedProps: { items }, pendingProps: null, memoizedState: null, return: null };
+    const fiber = { tag: 5, key: markerKey, memoizedProps: { onClick() {} }, pendingProps: null, memoizedState: null, return: parent };
+    Object.defineProperty(marker, "__reactFiber$dry", { value: fiber, configurable: true });
+    return marker;
+  };
+  let currentMarkers = sharedItems.map((item) => makeMarker(item.navKey));
+  currentMarkers.push(makeMarker("dry-nav-extra"));
+  app.document = { querySelectorAll: (selector) => selector === "[data-thread-user-message-navigation-item-id]" ? currentMarkers : [] };
+  const index = app.getTurnIndex("A");
+
+  let adaptiveSchedules = 0;
+  const originalScheduleAdaptive = app.scheduleL3AdaptiveRescan.bind(app);
+  app.scheduleL3AdaptiveRescan = () => { adaptiveSchedules += 1; };
+  const oneShot = app.runL3ResearchScan({ targetOrder: 22 });
+  assert.equal(oneShot.status, "research-one-shot");
+  assert.equal(oneShot.currentCoverage, 1);
+  assert.equal(oneShot.currentOneToOne, true);
+  assert.equal(oneShot.adaptiveRescanState, "research-frozen");
+  assert.equal(adaptiveSchedules, 0);
+  app.scheduleL3AdaptiveRescan = originalScheduleAdaptive;
+
+  const first = app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity });
+  assert.equal(first.status, "dry-run-scanning");
+  assert.equal(first.stableScans, 1);
+  assert.equal(first.summary.coverage, 1);
+  assert.equal(first.summary.conflicts, 0);
+
+  const second = app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity });
+  assert.equal(second.status, "dry-run-ready");
+  assert.equal(second.stableScans, 2);
+  assert.equal(second.pairsByTarget.size, index.size());
+  assert.equal(app.status().l3KeyJoinDryRun.status, "dry-run-ready");
+
+  // Simulate Work rebuilding/reordering official markers while preserving exact join identities.
+  const rebuilt = sharedItems.map((item) => makeMarker(item.navKey)).reverse();
+  currentMarkers = [makeMarker("dry-nav-extra"), ...rebuilt];
+
+  let hostCalls = 0;
+  host.navigateToTurn = async (turnId) => { hostCalls += 1; return { ok: true, verified: true, target: turnId, reason: "work-self" }; };
+  const result = await app.navigate("q23");
+  assert.equal(result.reason, "work-self");
+  assert.equal(hostCalls, 1);
+  assert.equal(markerClicks, 0);
+  app.clearL3PostNavigationScanTimer();
+  app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+  let dryRun = app.status().l3KeyJoinDryRun;
+  assert.equal(dryRun.status, "dry-run-ready");
+  assert.equal(dryRun.stableScans, 2);
+  assert.equal(dryRun.mappingStable, true);
+  assert.equal(dryRun.targetResolvable, true);
+  assert.equal(dryRun.markerConnected, true);
+  assert.equal(dryRun.currentMarkerCount, 51);
+  assert.equal(dryRun.currentKnownTurnCount, index.size());
+  assert.ok(dryRun.currentExactPatternCount >= 1);
+  assert.ok(dryRun.currentRelationPatternCount >= dryRun.currentExactPatternCount);
+  assert.ok(dryRun.currentMarkersWithKeyJoinCandidates >= index.size());
+  assert.equal(dryRun.currentKeyJoinMappedMarkers, index.size());
+  assert.equal(dryRun.currentKeyJoinUniqueTurns, index.size());
+  assert.equal(dryRun.currentBestKeyJoinCoverage, 1);
+  assert.equal(dryRun.currentBestKeyJoinConflicts, 0);
+  assert.equal(dryRun.currentBestKeyJoinOneToOne, true);
+  assert.equal(dryRun.currentMappedTurnCount, index.size());
+  assert.equal(dryRun.currentCoverage, 1);
+  assert.equal(dryRun.currentConflicts, 0);
+  assert.equal(dryRun.currentOneToOne, true);
+  assert.equal(dryRun.preferredPatternPresent, true);
+  assert.equal(typeof dryRun.alternateExactPatternAvailable, "boolean");
+
+  // Change only private join identities. Current target is still resolvable and connected, but mapping stability must fail independently.
+  sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `dry-new-${order + 1}` }));
+  currentMarkers = [makeMarker("dry-new-extra", sharedItems), ...sharedItems.map((item) => makeMarker(item.navKey, sharedItems)).reverse()];
+  const changed = await app.navigate("q23");
+  assert.equal(changed.reason, "work-self");
+  assert.equal(markerClicks, 0);
+  app.clearL3PostNavigationScanTimer();
+  app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+  dryRun = app.status().l3KeyJoinDryRun;
+  assert.equal(dryRun.mappingStable, false);
+  assert.equal(dryRun.targetResolvable, true);
+  assert.equal(dryRun.markerConnected, true);
+  assert.equal(dryRun.currentMarkerCount, 51);
+  assert.equal(dryRun.currentKnownTurnCount, index.size());
+  assert.ok(dryRun.currentExactPatternCount >= 1);
+  assert.ok(dryRun.currentRelationPatternCount >= dryRun.currentExactPatternCount);
+  assert.ok(dryRun.currentMarkersWithKeyJoinCandidates >= index.size());
+  assert.equal(dryRun.currentKeyJoinMappedMarkers, index.size());
+  assert.equal(dryRun.currentKeyJoinUniqueTurns, index.size());
+  assert.equal(dryRun.currentBestKeyJoinCoverage, 1);
+  assert.equal(dryRun.currentBestKeyJoinConflicts, 0);
+  assert.equal(dryRun.currentBestKeyJoinOneToOne, true);
+  assert.equal(dryRun.currentMappedTurnCount, index.size());
+  assert.equal(dryRun.currentCoverage, 1);
+  assert.equal(dryRun.currentConflicts, 0);
+  assert.equal(dryRun.currentOneToOne, true);
+  assert.equal(dryRun.preferredPatternPresent, true);
+  const publicJson = JSON.stringify(dryRun);
+  assert.equal(publicJson.includes("dry-nav"), false);
+  assert.equal(publicJson.includes("dry-new"), false);
+  assert.equal(publicJson.includes("q23"), false);
+});
+
+
+test("L3 fresh diagnostics still run while the dry-run session is unstable", async () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  const sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `unstable-nav-${order + 1}` }));
+  let markerClicks = 0;
+  const makeMarker = (markerKey) => {
+    const marker = {
+      isConnected: true,
+      getAttribute(name) { return name === "data-thread-user-message-navigation-item-id" ? markerKey : null; },
+      click() { markerClicks += 1; }
+    };
+    const parent = { tag: 0, memoizedProps: { items: sharedItems }, pendingProps: null, memoizedState: null, return: null };
+    const fiber = { tag: 5, key: markerKey, memoizedProps: { onClick() {} }, pendingProps: null, memoizedState: null, return: parent };
+    Object.defineProperty(marker, "__reactFiber$unstable", { value: fiber, configurable: true });
+    return marker;
+  };
+  const markers = [...sharedItems.map((item) => makeMarker(item.navKey)), makeMarker("unstable-nav-extra")];
+  app.document = { querySelectorAll: (selector) => selector === "[data-thread-user-message-navigation-item-id]" ? markers : [] };
+  const index = app.getTurnIndex("A");
+  const session = app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity, finalAttempt: true });
+  assert.equal(session.status, "dry-run-unstable");
+  assert.equal(session.stableScans, 1);
+  assert.ok(session.patternKey);
+
+  host.navigateToTurn = async (turnId) => ({ ok: true, verified: true, target: turnId, reason: "work-self" });
+  const result = await app.navigate("q23");
+  assert.equal(result.reason, "work-self");
+  assert.equal(markerClicks, 0);
+  app.clearL3PostNavigationScanTimer();
+  app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+
+  const dryRun = app.status().l3KeyJoinDryRun;
+  assert.equal(dryRun.status, "dry-run-ready");
+  assert.equal(dryRun.stableScans, 2);
+  assert.equal(dryRun.mappingStable, false);
+  assert.equal(dryRun.targetResolvable, true);
+  assert.equal(dryRun.markerConnected, true);
+  assert.equal(dryRun.currentMarkerCount, 51);
+  assert.equal(dryRun.currentKnownTurnCount, index.size());
+  assert.ok(dryRun.currentExactPatternCount >= 1);
+  assert.ok(dryRun.currentRelationPatternCount >= dryRun.currentExactPatternCount);
+  assert.ok(dryRun.currentMarkersWithKeyJoinCandidates >= index.size());
+  assert.equal(dryRun.currentKeyJoinMappedMarkers, index.size());
+  assert.equal(dryRun.currentKeyJoinUniqueTurns, index.size());
+  assert.equal(dryRun.currentBestKeyJoinCoverage, 1);
+  assert.equal(dryRun.currentBestKeyJoinConflicts, 0);
+  assert.equal(dryRun.currentBestKeyJoinOneToOne, true);
+  assert.equal(dryRun.currentMappedTurnCount, index.size());
+  assert.equal(dryRun.currentCoverage, 1);
+  assert.equal(dryRun.currentConflicts, 0);
+  assert.equal(dryRun.currentOneToOne, true);
+  assert.equal(dryRun.preferredPatternPresent, true);
+  assert.equal(typeof dryRun.alternateExactPatternAvailable, "boolean");
+  const publicJson = JSON.stringify(dryRun);
+  assert.equal(publicJson.includes("unstable-nav"), false);
+  assert.equal(publicJson.includes("q23"), false);
+});
+test("L3 research runtime stays frozen during normal Local Work refresh and navigation", async () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  let depthSchedules = 0;
+  let postNavigationSchedules = 0;
+  app.scheduleHostInternalDepthProbe = () => { depthSchedules += 1; };
+  app.scheduleL3PostNavigationScan = () => { postNavigationSchedules += 1; };
+  app.refresh("local-work-runtime-freeze");
+  assert.equal(depthSchedules, 0);
+  assert.equal(app.status().l3RuntimeEnabled, false);
+  host.navigateToTurn = async (turnId) => {
+    assert.equal(app.isLocalWorkNavigationActive(), true);
+    return { ok: true, verified: true, target: turnId, reason: "work-self" };
+  };
+  const result = await app.navigate("q23");
+  assert.equal(result.ok, true);
+  assert.equal(app.activeNavigation, null);
+  assert.equal(postNavigationSchedules, 0);
+});
+
+test("Local Work active navigation blocks L3 diagnostic scans and timers", () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  const index = app.getTurnIndex("A");
+  let queryCalls = 0;
+  app.document = { querySelectorAll() { queryCalls += 1; return []; } };
+  const session = app.getL3KeyJoinDryRunSession("A");
+  session.patternKey = "private-pattern";
+  const run = app.beginNavigationRun({ targetOrder: 22, identity });
+  const before = app.l3KeyJoinDryRun;
+  assert.equal(app.isLocalWorkNavigationActive(), true);
+  assert.equal(app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity }), before);
+  assert.equal(app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity }), null);
+  app.scheduleL3AdaptiveRescan({ conversationId: "A", targetOrder: 22, attempt: 0 });
+  app.scheduleHostInternalDepthProbe("A", index, identity);
+  app.startL3EventRecoveryWatch({ conversationId: "A", targetOrder: 22 });
+  app.handleL3EventRecoveryMutation([{ type: "childList" }]);
+  assert.equal(queryCalls, 0);
+  assert.equal(app.l3AdaptiveRescanTimer, null);
+  assert.equal(app.hostInternalDepthProbeTimer, null);
+  assert.equal(app.l3EventRecoveryTimer, null);
+  app.completeNavigationRun(run, { ok: true, verified: true, reason: "work-self" });
+  assert.equal(app.isLocalWorkNavigationActive(), false);
+});
+
+test("L3 adaptive rescan follows official marker rebuild without clicking markers", () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  let sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `adaptive-nav-${order + 1}` }));
+  let markerClicks = 0;
+  const makeMarker = (markerKey, items = sharedItems) => {
+    const marker = {
+      isConnected: true,
+      getAttribute(name) { return name === "data-thread-user-message-navigation-item-id" ? markerKey : null; },
+      click() { markerClicks += 1; }
+    };
+    const parent = { tag: 0, memoizedProps: { items }, pendingProps: null, memoizedState: null, return: null };
+    const fiber = { tag: 5, key: markerKey, memoizedProps: { onClick() {} }, pendingProps: null, memoizedState: null, return: parent };
+    Object.defineProperty(marker, "__reactFiber$adaptive", { value: fiber, configurable: true });
+    return marker;
+  };
+  let currentMarkers = [...sharedItems.map((item) => makeMarker(item.navKey)), makeMarker("adaptive-extra")];
+  app.document = { querySelectorAll: (selector) => selector === "[data-thread-user-message-navigation-item-id]" ? currentMarkers : [] };
+  const index = app.getTurnIndex("A");
+  app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity });
+  const ready = app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity });
+  assert.equal(ready.status, "dry-run-ready");
+
+  const scheduled = [];
+  app.window = {
+    setTimeout(callback, delay) {
+      const token = { callback, delay, cancelled: false };
+      scheduled.push(token);
+      return token;
+    },
+    clearTimeout(token) { if (token) token.cancelled = true; }
+  };
+
+  currentMarkers = [
+    ...sharedItems.map((item) => makeMarker(item.navKey)),
+    makeMarker(sharedItems[20].navKey),
+    makeMarker(sharedItems[21].navKey),
+    makeMarker(sharedItems[22].navKey),
+    makeMarker("adaptive-extra")
+  ];
+  const pending = app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+  assert.equal(pending.adaptiveRescanState, "pending");
+  assert.equal(pending.adaptiveRescanAttempt, 0);
+  assert.equal(pending.freshMapAccepted, false);
+  assert.equal(pending.currentExactPatternCount, 0);
+  assert.ok(pending.currentBestKeyJoinConflicts >= 1);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 50);
+  assert.equal(markerClicks, 0);
+
+  sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `adaptive-new-${order + 1}` }));
+  currentMarkers = [...sharedItems.map((item) => makeMarker(item.navKey, sharedItems)), makeMarker("adaptive-new-extra", sharedItems)];
+  scheduled[0].callback();
+
+  const recovered = app.status().l3KeyJoinDryRun;
+  assert.equal(recovered.adaptiveRescanState, "recovered");
+  assert.equal(recovered.adaptiveRescanAttempt, 1);
+  assert.equal(recovered.freshMapAccepted, true);
+  assert.equal(recovered.currentCoverage, 1);
+  assert.equal(recovered.currentConflicts, 0);
+  assert.equal(recovered.currentOneToOne, true);
+  assert.equal(recovered.targetResolvable, true);
+  assert.equal(recovered.markerConnected, true);
+  assert.equal(recovered.mappingStable, false);
+  assert.equal(markerClicks, 0);
+
+  const stable = app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+  assert.equal(stable.mappingStable, true);
+  assert.equal(stable.adaptiveRescanState, "stable");
+  assert.equal(stable.freshMapAccepted, false);
+  assert.equal(markerClicks, 0);
+});
+test("L3 exhausted adaptive scan recovers on a later official DOM mutation without polling", () => {
+  const { app, host } = createHarness();
+  const identity = { id: "local:A", source: "sidebar-local", host: "local", kind: "local", stable: true };
+  host.getConversationIdentity = () => identity;
+  let sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `event-nav-${order + 1}` }));
+  let markerClicks = 0;
+  const makeMarker = (markerKey, items = sharedItems) => {
+    const marker = {
+      isConnected: true,
+      getAttribute(name) { return name === "data-thread-user-message-navigation-item-id" ? markerKey : null; },
+      click() { markerClicks += 1; }
+    };
+    const parent = { tag: 0, memoizedProps: { items }, pendingProps: null, memoizedState: null, return: null };
+    const fiber = { tag: 5, key: markerKey, memoizedProps: { onClick() {} }, pendingProps: null, memoizedState: null, return: parent };
+    Object.defineProperty(marker, "__reactFiber$event", { value: fiber, configurable: true });
+    return marker;
+  };
+  let currentMarkers = [...sharedItems.map((item) => makeMarker(item.navKey)), makeMarker("event-extra")];
+  app.document = { querySelectorAll: (selector) => selector === "[data-thread-user-message-navigation-item-id]" ? currentMarkers : [] };
+  const index = app.getTurnIndex("A");
+  app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity });
+  assert.equal(app.refreshL3KeyJoinDryRun({ conversationId: "A", index, identity }).status, "dry-run-ready");
+
+  const scheduled = [];
+  app.window = {
+    setTimeout(callback, delay) {
+      const token = { callback, delay, cancelled: false };
+      scheduled.push(token);
+      return token;
+    },
+    clearTimeout(token) { if (token) token.cancelled = true; }
+  };
+
+  currentMarkers = [
+    ...sharedItems.map((item) => makeMarker(item.navKey)),
+    makeMarker(sharedItems[20].navKey),
+    makeMarker(sharedItems[21].navKey),
+    makeMarker(sharedItems[22].navKey),
+    makeMarker("event-extra")
+  ];
+  const pending = app.recordL3KeyJoinDryRunTarget({ targetOrder: 22, index, identity });
+  assert.equal(pending.adaptiveRescanState, "pending");
+  assert.equal(scheduled[0].delay, 50);
+
+  scheduled[0].callback();
+  assert.equal(scheduled[1].delay, 120);
+  scheduled[1].callback();
+  assert.equal(scheduled[2].delay, 250);
+  scheduled[2].callback();
+
+  let state = app.status().l3KeyJoinDryRun;
+  assert.equal(state.adaptiveRescanState, "exhausted-watching");
+  assert.equal(state.adaptiveRescanAttempt, 3);
+  assert.equal(state.freshMapAccepted, false);
+  assert.ok(app.l3EventRecoveryWatch);
+  assert.equal(app.l3EventRecoveryTimer, null);
+
+  sharedItems = Array.from({ length: 50 }, (_, order) => ({ turnKey: `q${order + 1}`, navKey: `event-new-${order + 1}` }));
+  currentMarkers = [...sharedItems.map((item) => makeMarker(item.navKey, sharedItems)), makeMarker("event-new-extra", sharedItems)];
+  app.handleL3EventRecoveryMutation([{ type: "childList" }]);
+  assert.equal(scheduled[3].delay, 140);
+  app.handleL3EventRecoveryMutation([{ type: "attributes" }]);
+  assert.equal(scheduled.length, 4);
+  scheduled[3].callback();
+
+  state = app.status().l3KeyJoinDryRun;
+  assert.equal(state.adaptiveRescanState, "recovered-event");
+  assert.equal(state.adaptiveRescanAttempt, 3);
+  assert.equal(state.freshMapAccepted, true);
+  assert.equal(state.currentCoverage, 1);
+  assert.equal(state.currentConflicts, 0);
+  assert.equal(state.currentOneToOne, true);
+  assert.equal(state.targetResolvable, true);
+  assert.equal(state.markerConnected, true);
+  assert.equal(app.l3EventRecoveryWatch, null);
+  assert.equal(app.l3EventRecoveryTimer, null);
+  assert.equal(markerClicks, 0);
+});
+
+test("Chat never invokes official Work markers even when learned data exists", async () => {
+  const { app, host } = createHarness();
+  host.getConversationIdentity = () => ({ id: "chat:A", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true });
+  let markerClicks = 0;
+  app.document = { querySelectorAll: () => [{ click() { markerClicks += 1; } }] };
+  app.officialNavigationSessionLearning = { markerCount: 1, knownTurnCount: 8, markerConflicts: 0, targetConflicts: 0, oneToOneObserved: true, monotonic: true, observedPairs: [{ markerIndex: 0, targetOrder: 21, hits: 3 }] };
+  let hostCalls = 0;
+  host.navigateToTurn = async (turnId) => { hostCalls += 1; return { ok: true, verified: true, target: turnId, reason: "ok" }; };
+  const result = await app.navigate("q22");
+  assert.equal(result.ok, true);
+  assert.equal(hostCalls, 1);
+  assert.equal(markerClicks, 0);
+  assert.equal(result.officialBridgeAttempted, undefined);
+});
+
 test("Local Work navigation waits for the short host restore settle window", async () => {
   const { app, host } = createHarness();
   host.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
@@ -386,4 +938,19 @@ test("Local Work navigation waits for the short host restore settle window", asy
   const result = await app.navigate("q4");
   assert.equal(result.ok, true);
   assert.ok(calledAt - startedAt >= 15, `expected Local navigation to wait for host settle, got ${calledAt - startedAt}ms`);
+});
+
+test("Local Work notifies Codex++ scroll intent before waiting for host restore settle", async () => {
+  const { app, host } = createHarness();
+  host.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  const events = [];
+  host.notifyNavigationIntent = () => { events.push({ kind: "intent", at: Date.now() }); return true; };
+  host.navigateToTurn = async (turnId) => { events.push({ kind: "navigate", at: Date.now() }); return { ok: true, target: turnId, verified: true }; };
+  const startedAt = Date.now();
+  app.localNavigationSettleUntil = startedAt + 25;
+  const result = await app.navigate("q4");
+  assert.equal(result.ok, true);
+  assert.equal(events[0]?.kind, "intent");
+  assert.equal(events[1]?.kind, "navigate");
+  assert.ok(events[1].at - startedAt >= 15);
 });

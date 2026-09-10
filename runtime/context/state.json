@@ -2,188 +2,337 @@
   "protocol_id": "project-relay",
   "schema_version": 2,
   "project_id": "gpt-talk-enhancer",
-  "revision": 3,
-  "observed_at": "2026-09-09T11:13:10.3465128+09:00",
+  "revision": 4,
+  "observed_at": "2026-09-10T09:54:52.3007371+09:00",
   "checkpoint": {
     "mode": "carrier_commit",
-    "base_head": "d3dfb60bc4662beb412ed7dbe68bb3f43261a441",
+    "base_head": "42635a30eb7278f9df0f6720e542a7c3f3824d13",
     "target_ref": "refs/heads/main",
     "carrier_paths": [
-      "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
-      "runtime/context/state.json"
+      "dist/market/gpt-talk-enhancer.js",
+      "dist/v3/00-gpt-talk-enhancer.v3.bundle.js",
+      "dist/v3/package.json",
+      "docs/CODEXPLUSPLUS-SCRIPT-MARKET.md",
+      "docs/KNOWN-ISSUES.zh-CN.md",
+      "docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md",
+      "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+      "docs/V0.5.2-WIP-CHECKPOINT.zh-CN.md",
+      "package.json",
+      "README.md",
+      "runtime/context/state.json",
+      "scripts/build-v3.mjs",
+      "src/v3/bootstrap.js",
+      "src/v3/diagnostics/host-internal-depth-probe.js",
+      "src/v3/diagnostics/official-navigation-auto-map.js",
+      "src/v3/diagnostics/official-navigation-probe.js",
+      "src/v3/host/codex-desktop/codex-host.js",
+      "src/v3/host/codex-desktop/composer-adapter.js",
+      "src/v3/host/codex-desktop/navigation-adapter.js",
+      "src/v3/host/codex-desktop/overlay-detector.js",
+      "src/v3/host/host-interface.js",
+      "src/v3/ui/app-shell.js",
+      "src/v3/ui/timeline/question-list.js",
+      "test/v3/app.test.js",
+      "test/v3/host-internal-depth-probe.test.js",
+      "test/v3/host.test.js",
+      "test/v3/official-navigation-auto-map.test.js",
+      "test/v3/official-navigation-probe.test.js",
+      "test/v3/ui.test.js"
     ]
   },
   "observation": {
     "dirty": true,
     "change_summary": {
       "staged": 0,
-      "unstaged": 2,
-      "untracked": 0
+      "unstaged": 20,
+      "untracked": 9
     },
     "relevant_paths": [
       "package.json",
-      ".gitignore",
-      "AGENTS.md",
       "README.md",
-      ".agents/skills/project-continuity/SKILL.md",
-      ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
-      ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
-      "runtime/context/bootstrap.json",
-      "runtime/context/state.json",
-      "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
-      "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md"
+      "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+      "docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md",
+      "docs/KNOWN-ISSUES.zh-CN.md",
+      "docs/CODEXPLUSPLUS-SCRIPT-MARKET.md",
+      "src/v3/bootstrap.js",
+      "src/v3/host/codex-desktop/navigation-adapter.js",
+      "src/v3/host/codex-desktop/codex-host.js",
+      "src/v3/host/codex-desktop/overlay-detector.js",
+      "src/v3/ui/timeline/question-list.js",
+      "test/v3/app.test.js",
+      "test/v3/host.test.js",
+      "dist/market/gpt-talk-enhancer.js",
+      "runtime/context/state.json"
     ],
     "content_checks": [
       {
+        "path": "dist/market/gpt-talk-enhancer.js",
+        "algorithm": "git-blob-oid",
+        "digest": "8e93f600f5b6495db4301c34967fd876c5b608ad"
+      },
+      {
+        "path": "dist/v3/00-gpt-talk-enhancer.v3.bundle.js",
+        "algorithm": "git-blob-oid",
+        "digest": "55f4861d394456edccb84a0eab04f42c8791122f"
+      },
+      {
+        "path": "dist/v3/package.json",
+        "algorithm": "git-blob-oid",
+        "digest": "ab3fcfac781adc17098b940981cd1819ec60953f"
+      },
+      {
+        "path": "docs/CODEXPLUSPLUS-SCRIPT-MARKET.md",
+        "algorithm": "git-blob-oid",
+        "digest": "bf57a200ead0f8be1bfc42aefc07d211cb882394"
+      },
+      {
+        "path": "docs/KNOWN-ISSUES.zh-CN.md",
+        "algorithm": "git-blob-oid",
+        "digest": "f18376c97b75abfe59f07dd0100294f5c5ac5f3e"
+      },
+      {
+        "path": "docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md",
+        "algorithm": "git-blob-oid",
+        "digest": "d8a7ee4f5c08e7a93790f9629c2c132a46fe3178"
+      },
+      {
+        "path": "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+        "algorithm": "git-blob-oid",
+        "digest": "d7a2f6dec65fa76ccf025a38ecef5af960526a9e"
+      },
+      {
+        "path": "docs/V0.5.2-WIP-CHECKPOINT.zh-CN.md",
+        "algorithm": "git-blob-oid",
+        "digest": "a491385ea5a0f3ac8a6a7d78c6a5ab44e4411604"
+      },
+      {
         "path": "package.json",
         "algorithm": "git-blob-oid",
-        "digest": "6f738e324170b9d15eec0ad1c65b360418a3aa8e"
-      },
-      {
-        "path": ".gitignore",
-        "algorithm": "git-blob-oid",
-        "digest": "ddcad17d881d8b0201198221aca880f4682c29da"
-      },
-      {
-        "path": "AGENTS.md",
-        "algorithm": "git-blob-oid",
-        "digest": "a142c055eedea97ca0c14e18d8d661d1811a379a"
+        "digest": "f5ad3c229b1a14dcdb0cefc767049817c69169e7"
       },
       {
         "path": "README.md",
         "algorithm": "git-blob-oid",
-        "digest": "af774f1882280e74c2322d71c9b3108d40858be8"
+        "digest": "bd860128d2053b6ff5aa410bb65ceb73fe95a1f9"
       },
       {
-        "path": ".agents/skills/project-continuity/SKILL.md",
+        "path": "scripts/build-v3.mjs",
         "algorithm": "git-blob-oid",
-        "digest": "53c321987a1e342c756368191bd142d42cea1333"
+        "digest": "febe87707fe6bb7eeb09f094862d59a953316e0c"
       },
       {
-        "path": ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
+        "path": "src/v3/bootstrap.js",
         "algorithm": "git-blob-oid",
-        "digest": "6a8abdc295e4e47aef9c604bcaee5eceb0947875"
+        "digest": "22c61056badc67a9812f9571da82bbae28e2654d"
       },
       {
-        "path": ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1",
+        "path": "src/v3/diagnostics/host-internal-depth-probe.js",
         "algorithm": "git-blob-oid",
-        "digest": "3ea0aecaa40d263b12e27a81222e36d3af9799ce"
+        "digest": "da94519ceccb8a1533ed5d17fb54647b6ad90213"
       },
       {
-        "path": "runtime/context/bootstrap.json",
+        "path": "src/v3/diagnostics/official-navigation-auto-map.js",
         "algorithm": "git-blob-oid",
-        "digest": "28283533100ee1c7d35bb16e628a6bd5b6c9b439"
+        "digest": "e0e71eaa81547dd82d49ef7e702f7da6aab4af6c"
       },
       {
-        "path": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+        "path": "src/v3/diagnostics/official-navigation-probe.js",
         "algorithm": "git-blob-oid",
-        "digest": "0db37cbd79f75c8921424f3cf373e1cf2da129ad"
+        "digest": "d5c1d625342f4cca8b1baa2118cd84e85a825e0a"
       },
       {
-        "path": "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
+        "path": "src/v3/host/codex-desktop/codex-host.js",
         "algorithm": "git-blob-oid",
-        "digest": "2da217c08c29e9b153ea80679c3167f87aac9670"
+        "digest": "9de8017acdf675284f68c4a3013e67ceb520fc0c"
+      },
+      {
+        "path": "src/v3/host/codex-desktop/composer-adapter.js",
+        "algorithm": "git-blob-oid",
+        "digest": "5787760d746df32359a90958c300cbed74c7b4fb"
+      },
+      {
+        "path": "src/v3/host/codex-desktop/navigation-adapter.js",
+        "algorithm": "git-blob-oid",
+        "digest": "c89eedc44835462687f2233330c0b0e36561e93b"
+      },
+      {
+        "path": "src/v3/host/codex-desktop/overlay-detector.js",
+        "algorithm": "git-blob-oid",
+        "digest": "58c98bc7dd9d9b36da271b3530790f455242f0f4"
+      },
+      {
+        "path": "src/v3/host/host-interface.js",
+        "algorithm": "git-blob-oid",
+        "digest": "90866d9359da8b8beb7a8183811de571971df371"
+      },
+      {
+        "path": "src/v3/ui/app-shell.js",
+        "algorithm": "git-blob-oid",
+        "digest": "ca8dacb0d1cabe03cd91d99bf6dbadf4af9ede95"
+      },
+      {
+        "path": "src/v3/ui/timeline/question-list.js",
+        "algorithm": "git-blob-oid",
+        "digest": "fa80ba66c694a9102c0c2c65b2d3fad3b17c6126"
+      },
+      {
+        "path": "test/v3/app.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "9a6a94bbc8c0d718d1b2d53fc841e383ad25360a"
+      },
+      {
+        "path": "test/v3/host-internal-depth-probe.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "659139aed943a16c8961753937ce7d9823d3921b"
+      },
+      {
+        "path": "test/v3/host.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "64dd29093ea1293aabab1b09dad43f17277d222b"
+      },
+      {
+        "path": "test/v3/official-navigation-auto-map.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "5de6dc2a82decb67e96fb1a2f95ccb696c3e532d"
+      },
+      {
+        "path": "test/v3/official-navigation-probe.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "5ca3794f1567a46ba99d25e5188b0b072b1235ca"
+      },
+      {
+        "path": "test/v3/ui.test.js",
+        "algorithm": "git-blob-oid",
+        "digest": "ecce089d88fc079946b5a8aa10d95a2b745b7501"
       }
     ],
     "probe_notes": [
-      "Revision 3 seals Project Relay Phase 1 Core after Fresh Codex repository Skill auto-discovery acceptance.",
-      "The checkpoint is prepared directly on d3dfb60bc4662beb412ed7dbe68bb3f43261a441 and carries only the acceptance document plus state metadata.",
-      "A separately started Fresh Codex task reported automatic discovery and use of project-continuity with main at d3dfb60, a clean worktree, metadata_status=valid, checkpoint_state=committed, and freshness=matches.",
-      "Fresh Codex discovery evidence is recorded as a user-reported runtime acceptance result; it is not represented as an isolated-script result.",
-      "No product execution paths are changed by this sealing checkpoint."
+      "Revision 4 prepares the GPT TalkEnhancer v0.5.2 release carrier on top of the sealed Project Relay Phase 1 Core main baseline.",
+      "The release preserves Chat predictive/coalesced/progressive behavior, adds Work Later wheel acceleration, fixes Codex++ scroll-restore timing, improves Questions opening performance, and blocks Prompt under nearby host floating layers.",
+      "Official Navigation and L3/Fiber research code is retained, but both runtime fuses remain false because automatic deep scans caused real-host main-thread jank.",
+      "The dedicated fast-path checkpoint is versioned so future navigation work can resume from v0.5.2 without reactivating frozen research runtime paths.",
+      "The Work model-selection popup was not independently reproduced during final acceptance; only the reproduced thread hover-card case is recorded as real runtime PASS.",
+      "The CodexPlusPlusScriptMarket external submission remains deferred and is not part of this release carrier."
     ]
   },
   "current_task": {
-    "goal": "Seal Project Relay Phase 1 Core schema v2 after successful Fresh Codex Skill auto-discovery acceptance.",
+    "goal": "Finalize and publish GPT TalkEnhancer v0.5.2 while preserving the validated navigation fast-path checkpoint for future work.",
     "status": "completed",
     "scope": [
-      "Project Relay acceptance metadata",
-      "Fresh Codex repository Skill discovery closure"
+      "v0.5.2 product stabilization release",
+      "Navigation fast-path checkpoint",
+      "Codex++ single-file distribution",
+      "Project Relay release checkpoint"
     ],
     "source": {
       "kind": "current_user_request",
       "reference": null,
-      "note": "User approved final Project Relay sealing after the independent Fresh Codex discovery acceptance passed."
+      "note": "The user explicitly approved saving the fast-path work for later continuation and formally releasing v0.5.2."
     },
-    "authorization_note": "This record documents completed work only and does not authorize future commit, push, tag, deletion, force-push, Hooks, Guard, custom agent configuration, permission changes, or automatic continuation."
+    "authorization_note": "This record documents the user-authorized v0.5.2 release scope only. It does not authorize future commits, pushes, tags, deletions, market submissions, permission changes, or reactivation of frozen Official Navigation/L3 runtime research."
   },
-  "open_items": [],
+  "open_items": [
+    {
+      "id": "work-model-popup-independent-runtime-check",
+      "description": "The Work model-selection popup was not independently reproduced during v0.5.2 final acceptance. The generalized nearby host floating-layer blocker is implemented, but this exact popup remains a non-blocking future observation item.",
+      "kind": "pending_validation",
+      "evidence_refs": [
+        "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+        "docs/KNOWN-ISSUES.zh-CN.md"
+      ],
+      "blocker": false
+    },
+    {
+      "id": "codexplusplus-script-market-submission",
+      "description": "CodexPlusPlusScriptMarket submission remains intentionally deferred and is separate from the v0.5.2 GitHub release.",
+      "kind": "suggestion",
+      "evidence_refs": [
+        "docs/CODEXPLUSPLUS-SCRIPT-MARKET.md"
+      ],
+      "blocker": false
+    }
+  ],
   "verification": [
     {
-      "claim": "The Project Relay schema v2 isolated fixture suite completed with 18 passing cases, no failures, and no blocked cases.",
+      "claim": "GPT TalkEnhancer v0.5.2 completed the full automated suite with 233 passing tests and no failures.",
       "kind": "test",
       "status": "passed",
-      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "observed_at": "2026-09-10T09:54:52.3007371+09:00",
       "scope": [
-        ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
-        ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1"
+        "npm run check",
+        "product source and tests"
       ],
-      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
+      "evidence_ref": "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
       "limitations": [
-        "The suite uses isolated local Git fixtures and does not prove automatic Skill discovery in a fresh Codex task."
+        "Synthetic tests do not replace real Codex Desktop runtime acceptance."
       ]
     },
     {
-      "claim": "Both Project Relay PowerShell files parsed with zero syntax errors and the Skill package structure is present.",
-      "kind": "inspection",
+      "claim": "v0.5.2 build, market build, market node syntax check, and git diff check completed successfully.",
+      "kind": "build",
       "status": "passed",
-      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
+      "observed_at": "2026-09-10T09:54:52.3007371+09:00",
       "scope": [
-        ".agents/skills/project-continuity/SKILL.md",
-        ".agents/skills/project-continuity/scripts/Test-ProjectContinuity.ps1",
-        ".agents/skills/project-continuity/tests/Test-ProjectContinuity.Tests.ps1"
+        "npm run build",
+        "npm run build:market",
+        "node --check dist/market/gpt-talk-enhancer.js",
+        "git diff --check"
       ],
-      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
-      "limitations": [
-        "Static structure validation does not prove host-side automatic Skill discovery."
-      ]
+      "evidence_ref": "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+      "limitations": []
     },
     {
-      "claim": "GPT TalkEnhancer v0.5.1 previously passed its documented 173/173 automated acceptance and real Chat/Work runtime acceptance.",
-      "kind": "document_claim",
-      "status": "historical",
-      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
-      "scope": [
-        "GPT TalkEnhancer v0.5.1 historical acceptance"
-      ],
-      "evidence_ref": "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
-      "limitations": [
-        "Project Relay migration did not rerun product tests or real-host acceptance because product execution paths were not modified."
-      ]
-    },
-    {
-      "claim": "Product npm/build/runtime acceptance was not rerun as part of this Project Relay-only carrier.",
-      "kind": "test",
-      "status": "not_run",
-      "observed_at": "2026-09-08T18:10:16.3699002+09:00",
-      "scope": [
-        "Product source and build paths"
-      ],
-      "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
-      "limitations": [
-        "No product execution path is changed by this carrier."
-      ]
-    },
-    {
-      "claim": "A separately started Fresh Codex task automatically discovered and used the repository project-continuity Skill, then restored main at d3dfb60 with a clean worktree, metadata_status=valid, checkpoint_state=committed, and freshness=matches.",
+      "claim": "Real Codex Desktop acceptance passed for Questions performance, Work Later smoothness, Codex++ bottom-bounce prevention, Local thread position preservation, and the reproduced thread hover-card Prompt blocker.",
       "kind": "runtime",
       "status": "passed",
-      "observed_at": "2026-09-09T11:13:10.3465128+09:00",
+      "observed_at": "2026-09-10T09:54:52.3007371+09:00",
       "scope": [
-        "Fresh Codex repository Skill auto-discovery",
-        "Project Relay read-only restore"
+        "Questions panel",
+        "Work Earlier/Later navigation",
+        "Codex++ scroll restore",
+        "Local thread switch position",
+        "thread hover-card Prompt visibility"
+      ],
+      "evidence_ref": "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+      "limitations": [
+        "The Work model-selection popup itself was not independently reproduced during the final acceptance window."
+      ]
+    },
+    {
+      "claim": "The v0.5.2 Market single-file installed into the authorized Codex++ User Scripts path matches the release artifact SHA-256.",
+      "kind": "inspection",
+      "status": "passed",
+      "observed_at": "2026-09-10T09:54:52.3007371+09:00",
+      "scope": [
+        "dist/market/gpt-talk-enhancer.js",
+        "Codex++ installed single-file"
+      ],
+      "evidence_ref": "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+      "limitations": [
+        "The installed file is outside the repository and is not a versioned Project Relay content reference."
+      ]
+    },
+    {
+      "claim": "Project Relay Phase 1 Core schema v2 remains the continuity protocol inherited by the v0.5.2 mainline.",
+      "kind": "document_claim",
+      "status": "historical",
+      "observed_at": "2026-09-10T09:54:52.3007371+09:00",
+      "scope": [
+        "Project Relay Phase 1 Core"
       ],
       "evidence_ref": "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md",
       "limitations": [
-        "This runtime acceptance result was reported by the user from the separate fresh Codex task; it was not executed by the isolated fixture suite or by this sealing command."
+        "The revision 4 release checkpoint must still pass Restore prepared before commit and committed after commit."
       ]
     }
   ],
   "relevant_refs": [
     "README.md",
-    "docs/DOM-CONTRACT.md",
-    "docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md",
+    "docs/V0.5.2-FINAL-ACCEPTANCE.zh-CN.md",
+    "docs/V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md",
+    "docs/V0.5.2-WIP-CHECKPOINT.zh-CN.md",
     "docs/KNOWN-ISSUES.zh-CN.md",
+    "docs/CODEXPLUSPLUS-SCRIPT-MARKET.md",
     "docs/PROJECT-RELAY-CORE-ACCEPTANCE.md"
   ],
   "handoff_ref": null

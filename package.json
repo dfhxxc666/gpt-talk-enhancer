@@ -1,6 +1,6 @@
 {
   "name": "gpt-talk-enhancer",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "description": "Desktop-first ChatGPT/Codex conversation timeline and prompt library with a hybrid Codex++ host architecture.",

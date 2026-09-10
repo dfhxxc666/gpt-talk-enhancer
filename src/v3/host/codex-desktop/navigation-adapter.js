@@ -27,6 +27,7 @@ export class NavigationAdapter {
     chatMotionProgressWaitMs = 8,
     chatEarlierJumpScale = 1.35,
     chatBoundaryHydrationWaitMs = 1800,
+    chatFastPathWaitMs = 220,
     maxAlignFrames = 8,
     postSettleWaitMs = 160,
     mountedFastSettleWaitMs = 120,
@@ -49,6 +50,7 @@ export class NavigationAdapter {
     this.chatMotionProgressWaitMs = chatMotionProgressWaitMs;
     this.chatEarlierJumpScale = Math.max(1, Number(chatEarlierJumpScale) || 1);
     this.chatBoundaryHydrationWaitMs = Math.max(this.hydrationWaitMs, Number(chatBoundaryHydrationWaitMs) || 0);
+    this.chatFastPathWaitMs = Math.max(0, Number(chatFastPathWaitMs) || 0);
     this.maxAlignFrames = maxAlignFrames;
     this.postSettleWaitMs = postSettleWaitMs;
     this.mountedFastSettleWaitMs = mountedFastSettleWaitMs;
@@ -56,9 +58,16 @@ export class NavigationAdapter {
     this.compatibility = createNavigationCompatibility();
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
     const steps = [];
-    const finish = (result) => ({ ...result, steps: steps.slice() });
+    const fastPath = { attempted: false, succeeded: false, fallbackReason: null };
+    const finish = (result) => ({
+      ...result,
+      fastAttempted: fastPath.attempted,
+      fastSucceeded: fastPath.succeeded,
+      fallbackReason: fastPath.fallbackReason,
+      steps: steps.slice()
+    });
     const recordStep = (entry) => {
       steps.push(entry);
       if (steps.length > NAVIGATION_TRACE_LIMIT) steps.splice(0, steps.length - NAVIGATION_TRACE_LIMIT);
@@ -107,6 +116,110 @@ export class NavigationAdapter {
     const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
     const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
 
+    const initialFastPlan = planChatPredictiveFastPath({
+      allowed: allowChatPredictiveFastPath,
+      identity: conversationIdentity,
+      indexState,
+      snapshot
+    });
+    if (initialFastPlan.eligible) {
+      fastPath.attempted = true;
+      const fastStartedAt = nowMs(this.window);
+      const stability = await this.awaitChatFastPathStability({
+        container,
+        targetOrder: indexState.targetOrder,
+        orderById: indexState.orderById,
+        getIndexState,
+        isCurrent: isNavigationCurrent
+      });
+      snapshot = stability.after ?? snapshot;
+      if (stability.state === "superseded") {
+        fastPath.fallbackReason = "superseded";
+        recordStep(createNavigationTraceStep({
+          mode: "chat-fast", direction: -1,
+          elapsedMs: nowMs(this.window) - fastStartedAt,
+          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+          before: stability.before, after: stability.after,
+          outcome: { state: "superseded", progressed: false }
+        }));
+        return finish(failure("superseded", turnId));
+      }
+      if (!stability.stable) {
+        fastPath.fallbackReason = "unstable-extent";
+        recordStep(createNavigationTraceStep({
+          mode: "chat-fast", direction: -1,
+          elapsedMs: nowMs(this.window) - fastStartedAt,
+          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+          before: stability.before, after: stability.after,
+          outcome: { progressed: false }
+        }));
+      } else {
+        indexState = getIndexState();
+        const stablePlan = planChatPredictiveFastPath({
+          allowed: true,
+          identity: conversationIdentity,
+          indexState,
+          snapshot: stability.after
+        });
+        if (!stablePlan.eligible) {
+          fastPath.fallbackReason = stablePlan.reason;
+          recordStep(createNavigationTraceStep({
+            mode: "chat-fast", direction: -1,
+            elapsedMs: nowMs(this.window) - fastStartedAt,
+            jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
+            before: stability.before, after: stability.after,
+            outcome: { progressed: false }
+          }));
+        } else {
+          const fastBefore = stability.after;
+          const predictedLogical = stablePlan.predictedLogical;
+          const fastJumpPx = Math.abs(Number(fastBefore.logicalPosition) - Number(predictedLogical));
+          const outcome = await this.awaitHydrationProgress({
+            turnId,
+            targetOrder: indexState.targetOrder,
+            previousSnapshot: fastBefore,
+            direction: -1,
+            container,
+            isCurrent: isNavigationCurrent,
+            orderById: indexState.orderById,
+            getIndexState,
+            waitMs: this.chatFastPathWaitMs,
+            allowMotionProgress: false,
+            scrollAction: () => setLogicalScrollPosition(container, predictedLogical, readScrollModel(container, this.window))
+          });
+          recordStep(createNavigationTraceStep({
+            mode: "chat-fast", direction: -1,
+            elapsedMs: nowMs(this.window) - fastStartedAt,
+            jumpPx: fastJumpPx, waitMs: this.chatFastPathWaitMs,
+            targetOrder: indexState.targetOrder,
+            before: fastBefore, after: outcome.snapshot, outcome
+          }));
+          if (outcome.state === "superseded") {
+            fastPath.fallbackReason = "superseded";
+            return finish(failure("superseded", turnId));
+          }
+          probes += fastJumpPx >= 1 ? 1 : 0;
+          indexState = getIndexState();
+          snapshot = outcome.snapshot ?? this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+          if (outcome.progressed) lastProgressAt = nowMs(this.window);
+          if (outcome.candidate) {
+            const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+            if (aligned.ok) {
+              fastPath.succeeded = true;
+              fastPath.fallbackReason = null;
+              return finish(aligned);
+            }
+            fastPath.fallbackReason = aligned.reason ?? "fast-verify-failed";
+            if (!retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+            indexState = getIndexState();
+            snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+          } else {
+            fastPath.fallbackReason = outcome.progressed ? "target-not-mounted" : "no-structural-progress";
+          }
+        }
+      }
+    }
+
     while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
       && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
       const loopNow = nowMs(this.window);
@@ -152,13 +265,13 @@ export class NavigationAdapter {
       snapshot = currentSnapshot;
 
       const targetBeforeVisible = visibleOrders.length > 0 && targetOrder < visibleOrders[0];
-      const localWorkEarlier = conversationIdentity?.host === "local"
+      const targetAfterVisible = visibleOrders.length > 0 && targetOrder > visibleOrders[visibleOrders.length - 1];
+      const localWorkWheel = conversationIdentity?.host === "local"
         && conversationIdentity?.source === "sidebar-local"
         && model.isColumnReverse
-        && direction < 0
-        && targetBeforeVisible;
+        && ((direction < 0 && targetBeforeVisible) || (direction > 0 && targetAfterVisible));
 
-      if (localWorkEarlier) {
+      if (localWorkWheel) {
         if (!workCompatibilityNotified) {
           workCompatibilityNotified = true;
           this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
@@ -172,11 +285,12 @@ export class NavigationAdapter {
           isCurrent: isNavigationCurrent,
           orderById,
           turnCount: indexState.turns.length,
+          direction,
           getIndexState
         });
         recordStep(createNavigationTraceStep({
           mode: "work-wheel",
-          direction: -1,
+          direction,
           elapsedMs: nowMs(this.window) - stepStartedAt,
           jumpPx: outcome.step,
           waitMs: outcome.waitMs,
@@ -461,7 +575,26 @@ export class NavigationAdapter {
     return promise;
   }
 
-  async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, getIndexState = null }) {
+  async awaitChatFastPathStability({ container, targetOrder, orderById = null, getIndexState = null, isCurrent = () => true } = {}) {
+    const readIndex = () => typeof getIndexState === "function" ? getIndexState() : null;
+    const firstIndex = readIndex();
+    const firstTargetOrder = Number.isFinite(firstIndex?.targetOrder) ? Number(firstIndex.targetOrder) : targetOrder;
+    const firstOrderById = firstIndex?.orderById ?? orderById;
+    const before = this.readHydrationSnapshot(container, firstTargetOrder, firstOrderById);
+    await nextFrame(this.window);
+    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
+    await nextFrame(this.window);
+    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
+    const lastIndex = readIndex();
+    const lastTargetOrder = Number.isFinite(lastIndex?.targetOrder) ? Number(lastIndex.targetOrder) : targetOrder;
+    const lastOrderById = lastIndex?.orderById ?? orderById;
+    const after = this.readHydrationSnapshot(container, lastTargetOrder, lastOrderById);
+    const sameIndex = firstIndex?.signature == null || lastIndex?.signature == null || firstIndex.signature === lastIndex.signature;
+    const stable = Boolean(sameIndex && chatFastSnapshotStable(before, after));
+    return { state: stable ? "stable" : "unstable", stable, before, after };
+  }
+
+  async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, direction = -1, getIndexState = null }) {
     if (!container || !isCurrent()) return { state: "superseded", progressed: false, moved: false };
     const indexState = typeof getIndexState === "function" ? getIndexState() : null;
     const currentTargetOrder = Number.isFinite(indexState?.targetOrder) ? Number(indexState.targetOrder) : targetOrder;
@@ -476,17 +609,19 @@ export class NavigationAdapter {
       turnCount: currentTurnCount,
       targetDistance: previousSnapshot?.targetDistance,
       logicalPosition: model.logicalPosition,
-      minLogicalPosition: model.minLogicalPosition
+      minLogicalPosition: model.minLogicalPosition,
+      maxLogicalPosition: model.maxLogicalPosition,
+      direction
     });
-    const nextLogical = clamp(model.logicalPosition - step, model.minLogicalPosition, model.maxLogicalPosition);
+    const nextLogical = clamp(model.logicalPosition + direction * step, model.minLogicalPosition, model.maxLogicalPosition);
     const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
-    dispatchWheelEvent(container, this.window, -step);
+    dispatchWheelEvent(container, this.window, direction * step);
     const waitMs = moved ? this.workWheelWaitMs : this.hydrationWaitMs;
     const outcome = await this.awaitHydrationProgress({
       turnId,
       targetOrder: currentTargetOrder,
       previousSnapshot,
-      direction: -1,
+      direction,
       container,
       isCurrent,
       orderById: currentOrderById,
@@ -870,14 +1005,54 @@ export function hydrationStepSize(model = {}, visibleOrders = [], targetOrder = 
   return Math.min(span, Math.max(viewport * multiplier, proportional));
 }
 
-export function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0 } = {}) {
+export function predictChatFastLogicalPosition({ targetOrder = null, maxKnownOrder = null, minLogicalPosition = 0, maxLogicalPosition = 0 } = {}) {
+  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || Number(maxKnownOrder) <= 0) return null;
+  const min = Number(minLogicalPosition) || 0;
+  const max = Math.max(min, Number(maxLogicalPosition) || 0);
+  const ratio = clamp(Number(targetOrder) / Number(maxKnownOrder), 0, 1);
+  return Math.round(min + (max - min) * ratio);
+}
+
+export function chatFastSnapshotStable(before, after, tolerance = 2) {
+  if (!before || !after) return false;
+  const beforeOrders = (before.visibleOrders ?? []).join("|");
+  const afterOrders = (after.visibleOrders ?? []).join("|");
+  if (!beforeOrders || beforeOrders !== afterOrders) return false;
+  if (Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) > tolerance) return false;
+  if (Math.abs(Number(after.maxLogicalPosition) - Number(before.maxLogicalPosition)) > tolerance) return false;
+  if (Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition)) > tolerance) return false;
+  if (Math.abs(Number(after.clientHeight) - Number(before.clientHeight)) > tolerance) return false;
+  return Number(after.maxLogicalPosition) > Math.max(1, Number(after.clientHeight) || 0);
+}
+
+export function planChatPredictiveFastPath({ allowed = false, identity = null, indexState = null, snapshot = null } = {}) {
+  if (!allowed) return { eligible: false, reason: "not-authorized", predictedLogical: null };
+  if (identity?.host !== "chatgpt" || identity?.stable !== true) return { eligible: false, reason: "unstable-identity", predictedLogical: null };
+  const targetOrder = Number(indexState?.targetOrder);
+  const maxKnownOrder = Number(indexState?.maxKnownOrder);
+  const visibleOrders = (snapshot?.visibleOrders ?? []).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || maxKnownOrder < 20) return { eligible: false, reason: "insufficient-index", predictedLogical: null };
+  const knownOrders = [...new Set([...(indexState?.orderById?.values?.() ?? [])].filter(Number.isFinite))].sort((a, b) => a - b);
+  if (knownOrders.length !== maxKnownOrder + 1 || knownOrders[0] !== 0 || knownOrders.at(-1) !== maxKnownOrder) return { eligible: false, reason: "non-contiguous-index", predictedLogical: null };
+  if (visibleOrders.length < 2 || targetOrder >= visibleOrders[0]) return { eligible: false, reason: "not-far-earlier", predictedLogical: null };
+  const distance = turnWindowDistance(targetOrder, visibleOrders);
+  if (!(distance > 20)) return { eligible: false, reason: "near-target", predictedLogical: null };
+  if (!(Number(snapshot?.maxLogicalPosition) > Math.max(1, Number(snapshot?.clientHeight) || 0))) return { eligible: false, reason: "insufficient-scroll-extent", predictedLogical: null };
+  const predictedLogical = predictChatFastLogicalPosition({ targetOrder, maxKnownOrder, minLogicalPosition: 0, maxLogicalPosition: snapshot.maxLogicalPosition });
+  if (!Number.isFinite(predictedLogical) || predictedLogical >= Number(snapshot.logicalPosition) - Math.max(180, Number(snapshot.clientHeight) || 180)) return { eligible: false, reason: "prediction-too-small", predictedLogical: null };
+  return { eligible: true, reason: null, predictedLogical };
+}
+
+export function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0, maxLogicalPosition = Number.POSITIVE_INFINITY, direction = -1 } = {}) {
   const safeViewport = Math.max(240, Number(viewport) || 737);
   const base = Math.min(Math.max(240, Number(configuredStep) || 720), safeViewport);
   if (Number(turnCount) <= 12) return Math.round(Math.max(180, Math.min(base, safeViewport * 0.5)));
   const distance = Math.max(0, Number(targetDistance) || 0);
   const scale = distance > 40 ? 1.35 : distance > 20 ? 1.2 : 1;
   const desired = Math.min(base * scale, safeViewport * 1.35);
-  const remaining = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  const remaining = direction > 0
+    ? Math.max(0, Number(maxLogicalPosition) - Number(logicalPosition))
+    : Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
   return Math.round(remaining > 0 ? Math.min(desired, remaining) : desired);
 }
 

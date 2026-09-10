@@ -85,11 +85,12 @@ export class AppShell {
   setSurface(surface) {
     this.surface = surface;
     const timelineVisible = surface === SURFACE.CONVERSATION;
-    const promptVisible = surface === SURFACE.CONVERSATION || surface === SURFACE.NEW_CHAT;
+    const promptBlocked = Boolean(this.host?.isPromptOverlayBlocked?.());
+    const promptVisible = (surface === SURFACE.CONVERSATION || surface === SURFACE.NEW_CHAT) && !promptBlocked;
     this.rail?.setVisible(timelineVisible);
     this.questionList?.setVisible(timelineVisible);
     this.promptTrigger?.setVisible(promptVisible);
-    if (surface === SURFACE.SETTINGS) this.promptPanel?.setOpen?.(false);
+    if (!promptVisible) this.promptPanel?.setOpen?.(false);
     this.promptPanel?.setVisible(promptVisible);
     if (this.hostElement?.getAttribute?.("data-gte-surface") !== surface) this.hostElement?.setAttribute?.("data-gte-surface", surface);
   }

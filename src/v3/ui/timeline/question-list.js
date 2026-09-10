@@ -21,6 +21,7 @@ export class QuestionListPanel {
     this.programmaticScrollTop = null;
     this.renderCount = 0;
     this.activeUpdateCount = 0;
+    this.openFollowGeneration = 0;
     this.boundResize = () => this.updatePosition();
   }
 
@@ -80,12 +81,16 @@ export class QuestionListPanel {
   }
 
   setOpen(open) {
-    this.opened = Boolean(open);
+    const nextOpen = Boolean(open);
+    const openingAnchor = nextOpen && !this.opened ? this.getAnchorRect?.() ?? null : null;
+    this.opened = nextOpen;
     if (this.element) this.element.hidden = !this.opened;
     if (this.opened) {
       this.manualBrowse = false;
-      this.updatePosition();
-      this.scrollActiveIntoView();
+      this.updatePosition(openingAnchor);
+      this.scheduleActiveFollow();
+    } else {
+      this.openFollowGeneration += 1;
     }
     this.onOpenChange(this.opened);
   }
@@ -101,9 +106,9 @@ export class QuestionListPanel {
     if (this.opened) this.updatePosition();
   }
 
-  updatePosition() {
+  updatePosition(anchorOverride = null) {
     if (!this.opened || !this.element) return;
-    const anchor = this.getAnchorRect?.();
+    const anchor = anchorOverride ?? this.getAnchorRect?.();
     if (!anchor) return;
     const viewportWidth = Number(this.window?.visualViewport?.width ?? this.window?.innerWidth ?? 1280);
     const viewportHeight = Number(this.window?.visualViewport?.height ?? this.window?.innerHeight ?? 800);
@@ -205,6 +210,16 @@ export class QuestionListPanel {
     queueMicrotask(() => { this.suppressScroll = false; this.programmaticScrollTop = null; });
   }
 
+  scheduleActiveFollow() {
+    const generation = ++this.openFollowGeneration;
+    const run = () => {
+      if (!this.opened || generation !== this.openFollowGeneration) return;
+      this.scrollActiveIntoView();
+    };
+    if (typeof this.window?.requestAnimationFrame === "function") this.window.requestAnimationFrame(run);
+    else (this.window?.setTimeout ?? setTimeout)(run, 0);
+  }
+
   scrollActiveIntoView() {
     const row = this.findRow(this.activeTurnId);
     if (!row) return;
@@ -240,6 +255,7 @@ export class QuestionListPanel {
   }
 
   destroy() {
+    this.openFollowGeneration += 1;
     this.window?.removeEventListener?.("resize", this.boundResize);
     this.window?.visualViewport?.removeEventListener?.("resize", this.boundResize);
     this.element?.remove?.();

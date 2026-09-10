@@ -1,6 +1,6 @@
 # GPT TalkEnhancer Known Issues
 
-本文记录 GPT TalkEnhancer Desktop 已确认的问题、0.5.0 修复结果与 0.5.1 性能收口。`v0.5.0` 保留为上一版正确性基线，`v0.4.5` 仍是冻结的 0.4.x 历史基线。
+本文记录 GPT TalkEnhancer Desktop 已确认的问题与历史修复结果。v0.5.2 为当前稳定性与快路径基线；v0.5.1 保留为上一版 Navigation Performance 基线。
 
 ## UI-001：全屏 + 折叠左侧栏时 Timeline 跟随侧栏 hover 隐显
 
@@ -127,3 +127,59 @@
 ### 结论
 
 0.5.1 以当前参数冻结 Navigation 性能基线。继续激进提速的边际收益已不足以抵消正确性与 Restore 回归风险。
+
+## OPT-002：Work Later 向下加载慢且有顿挫
+
+- 类型：Performance / Local Work virtualization
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.2
+- 收口：2026-09-10
+
+v0.5.1 的 Local Work Earlier 已使用专用 wheel hydration，但 Later 仍回退到通用 progressive path。v0.5.2 将 stable `sidebar-local + column-reverse` 的 Later 纳入同一 Work wheel engine，使用正方向 wheel、约 120ms cadence、距离自适应 step，并在 physical tail 附近收敛。
+
+真实验收：**向下卡顿感消失。**
+
+## WORK-002：Codex++ 保留位置与 GPT TalkEnhancer 导航发生 restore 冲突
+
+- 类型：Codex++ interoperability / scroll restore
+- 状态：Fixed / Real runtime PASS
+- 版本：0.5.2
+- 收口：2026-09-10
+
+两个相关现象已分别修复：
+
+1. Codex++ 开启“切换对话保留位置”后，Timeline 导航完成发生底部回弹。当前在 Local Work 导航进入 settle 前先 `markPointerIntent`，verified 后继续 `saveNow`。
+2. 用户手动浏览到新位置后切换 thread，再返回可能恢复旧保存点。当前在离开 stable Local thread 前，于 sidebar click capture phase 先 `saveNow(current thread, current scroll)`。
+
+真实验收：**底部回弹消失；`Q63 → 切走 → 返回 Q54` 不再出现。**
+
+## UI-003：宿主临时浮层覆盖 Prompt Trigger
+
+- 类型：Desktop UI / Prompt overlay compatibility
+- 状态：Fixed for reproduced hover-card case / Real runtime PASS
+- 版本：0.5.2
+- 收口：2026-09-10
+
+Prompt Trigger 使用宿主浮层 blocker：visible dialog / aria-modal 直接阻止；非模态 popper/menu/listbox/tooltip 只有进入 composer/Prompt 邻近区域时阻止，远处普通 tooltip 不受影响。
+
+真实验收：左侧 thread hover card 场景 **PASS**，浮层出现时 Prompt 隐藏，关闭后恢复。
+
+Work 模型选择 popup 本轮未再次稳定复现，因此该具体场景不单独记作真实验收；当前通用 blocker 已覆盖同类宿主浮层条件。
+
+## RESEARCH-001：Official Navigation / Fiber 自动深扫造成主线程卡顿
+
+- 类型：Research / performance guard
+- 状态：Runtime frozen in v0.5.2
+- 版本：0.5.2
+- 收口：2026-09-10
+
+L3 exact key-join、adaptive rescan 和 mutation recovery 在研究阶段保留，但真实 Codex Desktop 证明自动 Fiber/key-join 深扫会明显拖慢主线程。
+
+v0.5.2 固定：
+
+```js
+const OFFICIAL_NAVIGATION_RUNTIME_ENABLED = false;
+const L3_RUNTIME_ENABLED = false;
+```
+
+正常 Timeline 点击不自动运行这些研究扫描；只保留手动 one-shot 研究入口。详细基线见 `V0.5.2-FAST-PATH-CHECKPOINT.zh-CN.md`。

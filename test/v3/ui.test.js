@@ -33,6 +33,46 @@ test("Question List renders Qxx rows and active updates do not rerender", () => 
   assert.equal(panel.findRow("q18").classList.contains("is-active"), true);
 });
 
+test("Question List opens without forcing active-row scroll in the click stack", () => {
+  const document = new FakeDocument();
+  const root = new FakeElement();
+  let scheduledFrame = null;
+  let anchorReads = 0;
+  let anchorReadWhileHidden = null;
+  const window = {
+    innerWidth: 1000,
+    innerHeight: 800,
+    visualViewport: { width: 1000, height: 800, addEventListener() {}, removeEventListener() {} },
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame(callback) { scheduledFrame = callback; return 1; }
+  };
+  let panel = null;
+  panel = new QuestionListPanel({
+    document,
+    window,
+    getAnchorRect: () => {
+      anchorReads += 1;
+      anchorReadWhileHidden = panel.element.hidden;
+      return { left: 950, top: 100, bottom: 688, width: 28, height: 588 };
+    }
+  });
+  panel.mount(root);
+  panel.setTurns(makeTurns(20));
+  panel.setActive("q17");
+  let scrollCalls = 0;
+  panel.findRow("q17").scrollIntoView = () => { scrollCalls += 1; };
+
+  panel.setOpen(true);
+
+  assert.equal(anchorReads, 1);
+  assert.equal(anchorReadWhileHidden, true);
+  assert.equal(panel.element.hidden, false);
+  assert.equal(scrollCalls, 0);
+  assert.equal(typeof scheduledFrame, "function");
+  scheduledFrame();
+  assert.equal(scrollCalls, 1);
+});
 test("Question List pending target is distinct from verified active state", () => {
   const panel = new QuestionListPanel({ document: new FakeDocument() });
   panel.mount(new FakeElement());
@@ -267,7 +307,27 @@ test("AppShell surface matrix hides/shows Timeline and Prompt correctly", () => 
 });
 
 
-test("AppShell closes Prompt Panel when entering Settings", () => {
+
+test("AppShell hides Prompt for a host modal without hiding the conversation Timeline", () => {
+  let blocked = true;
+  const shell = new AppShell({ host: { isPromptOverlayBlocked: () => blocked } });
+  const calls = [];
+  shell.rail = { setVisible: (value) => calls.push(["rail", value]) };
+  shell.questionList = { setVisible: (value) => calls.push(["list", value]) };
+  shell.promptTrigger = { setVisible: (value) => calls.push(["trigger", value]) };
+  shell.promptPanel = {
+    setOpen: (value) => calls.push(["open", value]),
+    setVisible: (value) => calls.push(["prompt", value])
+  };
+
+  shell.setSurface(SURFACE.CONVERSATION);
+  assert.deepEqual(calls, [["rail", true], ["list", true], ["trigger", false], ["open", false], ["prompt", false]]);
+
+  calls.length = 0;
+  blocked = false;
+  shell.setSurface(SURFACE.CONVERSATION);
+  assert.deepEqual(calls, [["rail", true], ["list", true], ["trigger", true], ["prompt", true]]);
+});test("AppShell closes Prompt Panel when entering Settings", () => {
   const shell = new AppShell({});
   let open = true;
   let visible = true;

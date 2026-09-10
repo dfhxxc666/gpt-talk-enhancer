@@ -13,11 +13,22 @@ export class ComposerAdapter {
 
   getComposerForm() {
     const composer = this.getComposer();
-    return composer?.closest?.("form") ?? composer?.parentElement ?? null;
+    if (!composer) return null;
+    const composerRect = composer.getBoundingClientRect?.() ?? null;
+    const form = composer.closest?.("form") ?? null;
+    if (form && isUsableComposerAnchor(form.getBoundingClientRect?.() ?? null, composerRect)) return form;
+    const parent = composer.parentElement ?? null;
+    if (parent && isUsableComposerAnchor(parent.getBoundingClientRect?.() ?? null, composerRect)) return parent;
+    return composer;
   }
 
   getComposerRect() {
-    return this.getComposerForm()?.getBoundingClientRect?.() ?? null;
+    const composer = this.getComposer();
+    if (!composer) return null;
+    const composerRect = composer.getBoundingClientRect?.() ?? null;
+    const anchor = this.getComposerForm();
+    const anchorRect = anchor?.getBoundingClientRect?.() ?? null;
+    return isUsableComposerAnchor(anchorRect, composerRect) ? anchorRect : composerRect;
   }
 
   insertText(text) {
@@ -79,4 +90,19 @@ function dispatchInput(composer, windowRef) {
   const EventCtor = windowRef?.InputEvent ?? windowRef?.Event;
   if (!EventCtor) return;
   composer.dispatchEvent?.(new EventCtor("input", { bubbles: true }));
+}
+
+function isUsableComposerAnchor(anchorRect, composerRect) {
+  if (!isFiniteRect(anchorRect) || !isFiniteRect(composerRect)) return false;
+  const composerHeight = Math.max(1, Number(composerRect.height) || Number(composerRect.bottom) - Number(composerRect.top) || 1);
+  const anchorHeight = Math.max(0, Number(anchorRect.height) || Number(anchorRect.bottom) - Number(anchorRect.top) || 0);
+  const topGap = Math.abs(Number(anchorRect.top) - Number(composerRect.top));
+  const bottomGap = Math.abs(Number(anchorRect.bottom) - Number(composerRect.bottom));
+  const maxHeight = Math.max(240, composerHeight * 6);
+  return anchorHeight <= maxHeight && topGap <= 160 && bottomGap <= 180;
+}
+
+function isFiniteRect(rect) {
+  if (!rect) return false;
+  return [rect.left, rect.top, rect.right, rect.bottom].every((value) => Number.isFinite(Number(value)));
 }

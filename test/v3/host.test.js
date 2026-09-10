@@ -6,8 +6,9 @@ import { TurnAdapter, TURN_ID_PRIORITY } from "../../src/v3/host/codex-desktop/t
 import { ConversationAdapter, isStableLocalThreadIdentity, parseSidebarConversationKey } from "../../src/v3/host/codex-desktop/conversation-adapter.js";
 import { CodexDesktopHost, computeTailActiveTurnId } from "../../src/v3/host/codex-desktop/codex-host.js";
 import { SurfaceDetector } from "../../src/v3/host/codex-desktop/surface-detector.js";
+import { OverlayDetector } from "../../src/v3/host/codex-desktop/overlay-detector.js";
 import { ComposerAdapter } from "../../src/v3/host/codex-desktop/composer-adapter.js";
-import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, hydrationJumpScale, chatFarCoalescedJump, workWheelStepSize, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
+import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, hydrationJumpScale, chatFarCoalescedJump, workWheelStepSize, predictChatFastLogicalPosition, chatFastSnapshotStable, planChatPredictiveFastPath, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
 import { evaluateHostContract, classifyTurnIdMode, HOST_CONTRACT_REVISION } from "../../src/v3/host/codex-desktop/host-contract.js";
 import { FakeDocument, FakeElement, fakeWindow } from "./fake-dom.js";
 
@@ -218,6 +219,66 @@ test("TurnAdapter reads current Desktop user-message tone inside fallback virtua
   assert.equal(turns[0].id, "fallback-turn-0");
   assert.equal(turns[0].text, "真实桌面端用户问题");
 });
+
+test("OverlayDetector treats visible host dialogs as Prompt blockers", () => {
+  const document = new FakeDocument();
+  const detector = new OverlayDetector({ document });
+  assert.equal(detector.isBlockingDialogOpen(), false);
+
+  const dialog = new FakeElement("div");
+  dialog.setAttribute("role", "dialog");
+  document.setSelector("[role='dialog']", dialog);
+  assert.equal(detector.isBlockingDialogOpen(), true);
+
+  dialog.hidden = true;
+  assert.equal(detector.isBlockingDialogOpen(), false);
+  dialog.hidden = false;
+  dialog.setAttribute("aria-hidden", "true");
+  assert.equal(detector.isBlockingDialogOpen(), false);
+
+  document.setSelector("[role='dialog']", null);
+  const modal = new FakeElement("div");
+  modal.setAttribute("aria-modal", "true");
+  document.setSelector("[aria-modal='true']", modal);
+  assert.equal(detector.isBlockingDialogOpen(), true);
+});
+
+test("OverlayDetector blocks Prompt only when a visible floating layer reaches the composer zone", () => {
+  const document = new FakeDocument();
+  const detector = new OverlayDetector({ document });
+  const composerRect = { left: 440, top: 600, right: 1080, bottom: 680, width: 640, height: 80 };
+  const floating = new FakeElement("div");
+  floating.rect = { left: 120, top: 200, right: 320, bottom: 320, width: 200, height: 120 };
+  document.setSelector("[data-radix-popper-content-wrapper]", floating);
+
+  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
+
+  floating.rect = { left: 250, top: 520, right: 520, bottom: 650, width: 270, height: 130 };
+  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), true);
+
+  floating.hidden = true;
+  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
+  floating.hidden = false;
+  floating.setAttribute("aria-hidden", "true");
+  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
+});
+
+test("CodexDesktopHost passes the current composer rect into Prompt floating-layer blocking", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const host = new CodexDesktopHost({ document, window });
+  const composerRect = { left: 440, top: 600, right: 1080, bottom: 680, width: 640, height: 80 };
+  let seen = null;
+  host.getComposerRect = () => composerRect;
+  host.overlay = {
+    isBlockingDialogOpen: () => false,
+    isPromptFloatingLayerOpen: (payload) => { seen = payload; return true; }
+  };
+
+  assert.equal(host.isPromptOverlayBlocked(), true);
+  assert.deepEqual(seen, { composerRect });
+});
+
 test("SurfaceDetector covers new chat, conversation, media, settings, plugin manager and other", () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
@@ -246,6 +307,23 @@ test("SurfaceDetector covers new chat, conversation, media, settings, plugin man
   assert.equal(detector.getSurface(), SURFACE.SETTINGS);
   window.location.pathname = "/plugins";
   assert.equal(detector.getSurface(), SURFACE.PLUGIN_MANAGER);
+});
+
+test("ComposerAdapter rejects a page-sized form and uses the local composer container", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const pageForm = new FakeElement("form");
+  pageForm.rect = { left: 240, top: 0, right: 1327, bottom: 820, width: 1087, height: 820 };
+  const local = new FakeElement("div");
+  local.rect = { left: 415, top: 690, right: 1150, bottom: 770, width: 735, height: 80 };
+  const composer = new FakeElement("textarea");
+  composer.rect = { left: 438, top: 715, right: 1110, bottom: 755, width: 672, height: 40 };
+  pageForm.append(local);
+  local.append(composer);
+  document.setSelector("#prompt-textarea", composer);
+  const adapter = new ComposerAdapter({ document, window });
+  assert.equal(adapter.getComposerForm(), local);
+  assert.deepEqual(adapter.getComposerRect(), local.rect);
 });
 
 test("ComposerAdapter inserts with readback repeatedly without sending", () => {
@@ -486,7 +564,7 @@ test("ChatGPT regular hydration uses the shorter motion gate", async () => {
   assert.equal(typeof result.steps.at(-1)?.elapsedMs, "number");
 });
 
-test("Local regular hydration keeps the default motion gate", async () => {
+test("Non-sidebar Local regular hydration keeps the default motion gate", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   const delays = [];
@@ -512,7 +590,7 @@ test("Local regular hydration keeps the default motion gate", async () => {
   container.scrollTop = -1200;
   const nav = new NavigationAdapter({
     window, turnAdapter,
-    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "local", source: "sidebar-local" }) },
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "local", source: "other-local" }) },
     motionProgressWaitMs: 45, chatMotionProgressWaitMs: 7, hydrationWaitMs: 200, postSettleWaitMs: 0, maxPostSettleCorrections: 0
   });
   const turns = Array.from({ length: 8 }, (_, order) => ({ id: "q" + (order + 1), order }));
@@ -544,12 +622,110 @@ test("ChatGPT far Earlier coalesces only while far from target and boundary", ()
   assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "local", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000 }).coalesced, false);
 });
 
+test("Chat predictive fast-path planning is Chat-only, contiguous and far-Earlier", () => {
+  const orderById = new Map(Array.from({ length: 76 }, (_, order) => ["q" + (order + 1), order]));
+  const indexState = { targetOrder: 0, maxKnownOrder: 75, orderById };
+  const snapshot = { visibleOrders: [69, 70, 71, 72, 73, 74, 75], scrollHeight: 76000, clientHeight: 800, maxLogicalPosition: 75200, logicalPosition: 75200 };
+  const plan = planChatPredictiveFastPath({ allowed: true, identity: { host: "chatgpt", stable: true }, indexState, snapshot });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.predictedLogical, 0);
+  assert.equal(predictChatFastLogicalPosition({ targetOrder: 19, maxKnownOrder: 75, maxLogicalPosition: 75200 }), 19051);
+  assert.equal(planChatPredictiveFastPath({ allowed: true, identity: { host: "local", stable: true }, indexState, snapshot }).eligible, false);
+  const gapped = new Map(orderById); gapped.delete("q25");
+  assert.equal(planChatPredictiveFastPath({ allowed: true, identity: { host: "chatgpt", stable: true }, indexState: { ...indexState, orderById: gapped }, snapshot }).reason, "non-contiguous-index");
+});
+
+test("Chat fast-path stability rejects moving extent or virtual window", () => {
+  const base = { visibleOrders: [69, 70, 71], scrollHeight: 76000, clientHeight: 800, maxLogicalPosition: 75200, logicalPosition: 75200 };
+  assert.equal(chatFastSnapshotStable(base, { ...base }), true);
+  assert.equal(chatFastSnapshotStable(base, { ...base, scrollHeight: 77000, maxLogicalPosition: 76200 }), false);
+  assert.equal(chatFastSnapshotStable(base, { ...base, visibleOrders: [68, 69, 70] }), false);
+});
+
+test("Chat predictive fast path verifies an unmounted Q1 after one predicted jump", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const target = new FakeElement();
+  target.rect = { top: 150, bottom: 250, left: 0, right: 800, width: 800, height: 100 };
+  const container = new FakeElement();
+  container.rect = { top: 30, bottom: 830, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 76000;
+  let physicalTop = 0;
+  let writes = 0;
+  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { writes += 1; physicalTop = value; } });
+  const visible = Array.from({ length: 7 }, (_, i) => ({ id: "q" + (70 + i), order: 69 + i }));
+  const turnAdapter = {
+    resolveTurn: (id) => writes >= 1 && id === "q1" ? target : null,
+    verifyTurnElement: (id, element) => id === "q1" && element === target,
+    getVisibleTurns: () => visible
+  };
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
+    },
+    chatFastPathWaitMs: 5, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const turns = Array.from({ length: 76 }, (_, order) => ({ id: "q" + (order + 1), order }));
+  const result = await nav.navigateToTurn("q1", { turns, allowChatPredictiveFastPath: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.fastAttempted, true);
+  assert.equal(result.fastSucceeded, true);
+  assert.equal(result.fallbackReason, null);
+  assert.equal(result.steps[0]?.mode, "chat-fast");
+  assert.equal(result.steps[0]?.jumpPx, 75200);
+  assert.equal(result.steps.some((step) => step.mode === "chat-progressive" || step.mode === "chat-coalesced"), false);
+});
+
+test("Chat predictive fast miss falls back to the stable coalesced path", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const target = new FakeElement();
+  target.rect = { top: 150, bottom: 250, left: 0, right: 800, width: 800, height: 100 };
+  const container = new FakeElement();
+  container.rect = { top: 30, bottom: 830, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 76000;
+  let physicalTop = 0;
+  let writes = 0;
+  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { writes += 1; physicalTop = value; } });
+  const visible = Array.from({ length: 7 }, (_, i) => ({ id: "q" + (70 + i), order: 69 + i }));
+  const turnAdapter = {
+    resolveTurn: (id) => writes >= 2 && id === "q20" ? target : null,
+    verifyTurnElement: (id, element) => id === "q20" && element === target,
+    getVisibleTurns: () => visible
+  };
+  const nav = new NavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
+    },
+    chatFastPathWaitMs: 0, chatMotionProgressWaitMs: 1, hydrationWaitMs: 5, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const turns = Array.from({ length: 76 }, (_, order) => ({ id: "q" + (order + 1), order }));
+  const result = await nav.navigateToTurn("q20", { turns, allowChatPredictiveFastPath: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.fastAttempted, true);
+  assert.equal(result.fastSucceeded, false);
+  assert.equal(result.fallbackReason, "no-structural-progress");
+  assert.equal(result.steps[0]?.mode, "chat-fast");
+  assert.ok(result.steps.slice(1).some((step) => step.mode === "chat-coalesced" || step.mode === "chat-progressive"));
+});
+
 test("Work Earlier wheel step adapts to distance while preserving short-history and boundary safety", () => {
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 10, targetDistance: 60, logicalPosition: 5000 }), 400);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 10, logicalPosition: 5000 }), 720);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 30, logicalPosition: 5000 }), 864);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 5000 }), 972);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 500 }), 500);
+  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 1000, minLogicalPosition: 0, maxLogicalPosition: 1500, direction: 1 }), 500);
 });
 
 test("accelerated Work cadence keeps the conservative boundary wait", () => {
@@ -1245,6 +1421,70 @@ test("long reverse Work uses monotonic wheel-progressive hydration for earlier h
   assert.ok(writes.every((value, index) => index === 0 || value <= writes[index - 1]));
 });
 
+test("long forward Work uses wheel-progressive hydration for later history", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const ids = Array.from({ length: 40 }, (_, index) => `stable-${index}`);
+  const ranges = [[0, 1, 2, 3], [8, 9, 10, 11], [20, 21, 22, 23], [36, 37, 38, 39]];
+  let stage = 0;
+  let compatCalls = 0;
+  const wheelDeltas = [];
+  window.__codexThreadScrollHandlers = { markPointerIntent(event) { if (event?.target) compatCalls += 1; } };
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
+  const turnAdapter = {
+    resolveTurn: (id) => stage >= 3 && id === ids[39] ? target : null,
+    verifyTurnElement: (id, element) => id === ids[39] && element === target,
+    getVisibleTurns: () => ranges[stage].map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
+  container.clientHeight = 200;
+  container.scrollHeight = 1800;
+  let physicalTop = -1600;
+  const writes = [];
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; writes.push(value); },
+    configurable: true
+  });
+  container.dispatchEvent = (event) => {
+    if (event?.type === "wheel") {
+      wheelDeltas.push(event.deltaY);
+      if (stage < 3) stage += 1;
+    }
+    return true;
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
+    },
+    workWheelStepPx: 200,
+    workWheelWaitMs: 2,
+    hydrationWaitMs: 20,
+    maxNavigationMs: 1000,
+    postSettleWaitMs: 0,
+    maxPostSettleCorrections: 0
+  });
+  const trace = [];
+  const result = await nav.navigateToTurn(ids[39], {
+    turns: ids.map((id, order) => ({ id, order })),
+    onTraceStep: (entry) => trace.push(entry)
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(stage, 3);
+  assert.equal(compatCalls, 1);
+  assert.ok(wheelDeltas.length >= 3);
+  assert.ok(wheelDeltas.every((value) => value > 0));
+  assert.ok(writes.every((value, index) => index === 0 || value >= writes[index - 1]));
+  assert.ok(trace.some((entry) => entry.mode === "work-wheel" && entry.direction === 1));
+});
+
 test("reverse Work keeps moving through delayed DOM updates instead of failing after two wheel steps", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
@@ -1604,4 +1844,49 @@ test("Host contract classifies stable, fallback and mixed turn id modes", () => 
   assert.equal(classifyTurnIdMode([{ id: "fallback-turn-1" }]), "fallback");
   assert.equal(classifyTurnIdMode([{ id: "uuid-a" }, { id: "uuid-b" }]), "stable");
   assert.equal(classifyTurnIdMode([{ id: "fallback-turn-1" }, { id: "uuid-b" }]), "mixed");
+});
+// Auto official-bridge / Work active-line regression coverage.
+test("CodexDesktopHost resolves an official marker key through a current turn DOM reference", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const node = new FakeElement("div");
+  node.setAttribute("data-turn-id", "turn-q23");
+  document.getElementById = (id) => id === "official-marker-q23" ? node : null;
+  const host = new CodexDesktopHost({ document, window });
+  assert.equal(host.resolveOfficialNavigationMarkerKey("official-marker-q23"), "turn-q23");
+});
+
+test("Local Work active tracking samples inside the target instead of the exact navigation edge", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const host = new CodexDesktopHost({ document, window });
+  const container = new FakeElement("div");
+  container.rect = { top: 0, bottom: 800, left: 0, right: 800, width: 800, height: 800 };
+  container.style.flexDirection = "column";
+  const q22 = new FakeElement("div"); q22.rect = { top: 80, bottom: 126, left: 0, right: 800, width: 800, height: 46 };
+  const q23 = new FakeElement("div"); q23.rect = { top: 126, bottom: 176, left: 0, right: 800, width: 800, height: 50 };
+  host.getVisibleTurns = () => [{ id: "q22" }, { id: "q23" }];
+  host.resolveTurn = (id) => id === "q22" ? q22 : q23;
+  host.getScrollContainer = () => container;
+  host.getConversationIdentity = () => ({ id: "local:A", host: "local", source: "sidebar-local", stable: true, kind: "local" });
+  assert.equal(host.getActiveTurnId(), "q23");
+  host.getConversationIdentity = () => ({ id: "chat:A", host: "chatgpt", source: "sidebar-chatgpt", stable: true, kind: "conversation" });
+  assert.equal(host.getActiveTurnId(), "q22");
+});
+
+test("CodexDesktopHost forwards explicit navigation intent to Codex++ scroll restore handlers", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const container = new FakeElement();
+  container.isConnected = true;
+  const calls = [];
+  window.__codexThreadScrollHandlers = {
+    markPointerIntent(event) { calls.push(event); }
+  };
+  const host = new CodexDesktopHost({ document, window });
+  host.conversation.getScrollContainer = () => container;
+  assert.equal(host.notifyNavigationIntent(), true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.target, container);
+  assert.equal(calls[0]?.type, "pointerdown");
 });
