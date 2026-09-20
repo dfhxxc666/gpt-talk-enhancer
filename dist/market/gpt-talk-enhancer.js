@@ -6072,6 +6072,63 @@ const CHAT_SCROLL_DIAGNOSTIC_LIMIT = 40;
 const CHAT_BOOTSTRAP_MAX_FAILURES = 3;
 const CHAT_BOOTSTRAP_RETRY_DELAYS_MS = [220, 700, 1500];
 
+function analyzeChatIndexOrderHealth(turns = []) {
+  const records = (Array.isArray(turns) ? turns : []).filter((turn) => turn?.id);
+  if (!records.length) {
+    return {
+      healthy: true,
+      corrupt: false,
+      count: 0,
+      orderCount: 0,
+      uniqueOrderCount: 0,
+      min: null,
+      max: null,
+      duplicateOrders: [],
+      missingOrders: [],
+      invalidOrderCount: 0
+    };
+  }
+
+  const counts = new Map();
+  let invalidOrderCount = 0;
+  for (const turn of records) {
+    const order = Number(turn?.order);
+    if (!Number.isInteger(order) || order < 0) {
+      invalidOrderCount += 1;
+      continue;
+    }
+    counts.set(order, (counts.get(order) ?? 0) + 1);
+  }
+  const orders = [...counts.keys()].sort((a, b) => a - b);
+  const duplicateOrders = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([order]) => order)
+    .sort((a, b) => a - b);
+  const min = orders.length ? orders[0] : null;
+  const max = orders.length ? orders.at(-1) : null;
+  const missingOrders = [];
+  if (min === 0 && Number.isInteger(max)) {
+    for (let order = 0; order <= max; order += 1) {
+      if (!counts.has(order)) missingOrders.push(order);
+    }
+  }
+  const corrupt = invalidOrderCount > 0
+    || duplicateOrders.length > 0
+    || (min === 0 && missingOrders.length > 0);
+  return {
+    healthy: !corrupt,
+    corrupt,
+    count: records.length,
+    orderCount: records.length - invalidOrderCount,
+    uniqueOrderCount: orders.length,
+    min,
+    max,
+    duplicateOrders,
+    missingOrders,
+    invalidOrderCount
+  };
+}
+
 function reconcileChatVisibleTurns(index, visibleRecords = [], diagnostics = null) {
   const records = (Array.isArray(visibleRecords) ? visibleRecords : [])
     .filter((record) => record?.id)
@@ -6161,6 +6218,7 @@ function reconcileChatVisibleTurns(index, visibleRecords = [], diagnostics = nul
   const orientation = useReverseWindow ? "reverse-window" : "forward-window";
   const selectedOffset = useReverseWindow ? reverseSharedOffset : sharedOffset;
   const output = [];
+  const stagedOrders = new Map();
   const turnDiagnostics = [];
 
   for (let position = 0; position < records.length; position += 1) {
@@ -6240,6 +6298,14 @@ function reconcileChatVisibleTurns(index, visibleRecords = [], diagnostics = nul
         }
       }
     }
+    const stagedId = stagedOrders.get(Number(candidate.order)) ?? null;
+    if (stagedId && stagedId !== String(candidate.id)) {
+      diag.reason = "staged-order-collision";
+      diag.stagedOccupant = true;
+      turnDiagnostics.push(diag);
+      continue;
+    }
+    stagedOrders.set(Number(candidate.order), String(candidate.id));
     output.push(candidate);
     diag.accepted = true;
     diag.reason = "accepted";
@@ -7714,7 +7780,8 @@ class TalkEnhancerV3App {
           index,
           identity: conversationIdentity,
           visibleRecords: visible,
-          trustedVisible
+          trustedVisible,
+          reconcileDiagnostics
         });
       }
       index.setVisible(trustedVisible);
@@ -8048,7 +8115,14 @@ class TalkEnhancerV3App {
     this.chatBootstrapSampleTimer = null;
   }
 
-  maybeStartChatTrueTopBootstrap({ conversationId, index, identity, visibleRecords = [], trustedVisible = [] } = {}) {
+  maybeStartChatTrueTopBootstrap({
+    conversationId,
+    index,
+    identity,
+    visibleRecords = [],
+    trustedVisible = [],
+    reconcileDiagnostics = null
+  } = {}) {
     const chatConversation = Boolean(identity?.stable && identity.host === "chatgpt");
     if (!chatConversation || !conversationId || !index) return false;
     const explicitChatVisible = this.getChatBootstrapVisibleTurns();
@@ -8061,12 +8135,34 @@ class TalkEnhancerV3App {
     const syntheticChat = (String(conversationId).startsWith("pinned-chat:")
       || String(conversationId).startsWith("project-chat:"))
       && identity?.source === "inferred-visible-chat";
-    const repairIncompletePinnedCache = syntheticChat
-      && existingTurns.length > 0
-      && (Array.isArray(trustedVisible) ? trustedVisible.length : 0) === 0
-      && !existingVisibleOverlap
+    const pureDomExisting = existingTurns.length > 0
       && existingTurns.every((turn) => turn?.source === "dom");
-    if (existingTurns.length !== 0 && !repairIncompletePinnedCache) return false;
+    const preRepairOrderHealth = analyzeChatIndexOrderHealth(existingTurns);
+    const conflictCount = (Array.isArray(reconcileDiagnostics?.turns) ? reconcileDiagnostics.turns : [])
+      .filter((entry) => entry?.reason === "occupied-order" || entry?.reason === "staged-order-collision")
+      .length;
+    const repairCorruptDomChatIndex = pureDomExisting && preRepairOrderHealth.corrupt;
+    const repairConflictedDomChatIndex = pureDomExisting && conflictCount > 0;
+    const repairIncompletePinnedCache = syntheticChat
+      && pureDomExisting
+      && (Array.isArray(trustedVisible) ? trustedVisible.length : 0) === 0
+      && !existingVisibleOverlap;
+    const repairExistingChatIndex = repairIncompletePinnedCache
+      || repairCorruptDomChatIndex
+      || repairConflictedDomChatIndex;
+    const repairReason = repairCorruptDomChatIndex
+      ? "corrupt-dom-orders"
+      : repairConflictedDomChatIndex
+        ? "conflicted-dom-orders"
+        : repairIncompletePinnedCache
+          ? "incomplete-synthetic-cache"
+          : null;
+    if (repairCorruptDomChatIndex || repairConflictedDomChatIndex) {
+      this.chatBootstrapAttempted.delete(conversationId);
+      this.chatBootstrapFailures.delete(conversationId);
+      this.chatEarlierHydrationExhausted.delete(conversationId);
+    }
+    if (existingTurns.length !== 0 && !repairExistingChatIndex) return false;
     if (!visible.length) return false;
     const container = this.host.getScrollContainer?.() ?? null;
     if (!container || container.isConnected === false) return false;
@@ -8083,7 +8179,10 @@ class TalkEnhancerV3App {
         ? "absolute"
         : null;
     if (!bootstrapMode) return false;
-    if (bootstrapMode === "uuid" && Array.isArray(trustedVisible) && trustedVisible.length) return false;
+    if (bootstrapMode === "uuid"
+      && Array.isArray(trustedVisible)
+      && trustedVisible.length
+      && !repairExistingChatIndex) return false;
     if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
     if (this.chatEarlierHydrationPromise || this.chatBootstrapHydrationPromise) return true;
     if (this.chatBootstrapAttempted.has(conversationId)) return false;
@@ -8232,7 +8331,7 @@ class TalkEnhancerV3App {
             source: "dom",
             visible: false
           }));
-          const replaced = repairIncompletePinnedCache
+          const replaced = repairExistingChatIndex
             ? currentIndex.replaceDomSnapshot?.(snapshot) === true
             : false;
           if (!replaced) currentIndex.mergeMany(snapshot);
@@ -8261,6 +8360,11 @@ class TalkEnhancerV3App {
           partialWindows: collectorStats.partial,
           fallbackOrderWindows: collectorStats.fallbackOrder,
           repairedIncompleteCache: Boolean(bootstrapped && repairIncompletePinnedCache),
+          repairedCorruptDomIndex: Boolean(bootstrapped && repairCorruptDomChatIndex),
+          repairedConflictedDomIndex: Boolean(bootstrapped && repairConflictedDomChatIndex),
+          repairReason,
+          repairConflictCount: conflictCount,
+          preRepairOrderHealth,
           bootstrapMode,
           collectionMode,
           sweepResult: sweepResult?.reason ?? null,
@@ -8333,6 +8437,11 @@ class TalkEnhancerV3App {
       partialWindows: collectorStats.partial,
       fallbackOrderWindows: collectorStats.fallbackOrder,
       repairedIncompleteCache: false,
+      repairedCorruptDomIndex: false,
+      repairedConflictedDomIndex: false,
+      repairReason,
+      repairConflictCount: conflictCount,
+      preRepairOrderHealth,
       bootstrapMode,
       collectionMode: "running",
       sweepResult: null,
@@ -8558,12 +8667,34 @@ class TalkEnhancerV3App {
     const conversationId = this.currentConversationId;
     const index = conversationId ? this.getTurnIndex(conversationId) : null;
     if (!index) return { ok: false, reason: "no-conversation" };
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    const chatOrderHealth = identity?.stable && identity.host === "chatgpt"
+      ? analyzeChatIndexOrderHealth(index.getOrdered?.() ?? [])
+      : null;
+    const repairableChatIndex = Boolean(
+      chatOrderHealth?.corrupt
+      && (index.getOrdered?.() ?? []).every((turn) => turn?.source === "dom")
+    );
+    if (this.chatBootstrapHydrationPromise || repairableChatIndex) {
+      if (repairableChatIndex) {
+        this.chatBootstrapAttempted.delete(conversationId);
+        this.chatBootstrapFailures.delete(conversationId);
+        this.scheduleRefresh("chat-index-repair-before-navigation");
+      }
+      this.shell?.showToast?.("正在修复时间线…");
+      return {
+        ok: false,
+        verified: false,
+        target: turnId,
+        reason: "chat-index-repairing",
+        orderHealth: chatOrderHealth
+      };
+    }
     const record = index.get(turnId);
     const targetOrder = Number.isFinite(record?.order) ? Number(record.order) : null;
     this.cancelWorkEarlierHydration();
     this.cancelChatEarlierHydration();
     const requestId = ++this.navigationRequestId;
-    const identity = this.host.getConversationIdentity?.() ?? null;
     const navigationRun = this.beginNavigationRun({ targetOrder, identity });
     this.clearNavigationUxTimer();
     this.setNavigationUx({ state: "pending", target: turnId, targetOrder, pendingVisible: false }, "navigate-start");
@@ -8841,7 +8972,12 @@ class TalkEnhancerV3App {
       explicitConversationNodes: { count: explicitNodes.length },
       visibleTurns: { ...summarizeOrders(visibleTurns), idModes: idModeCounts(visibleTurns) },
       chatVisibleTurns: { ...summarizeOrders(chatVisibleTurns), idModes: idModeCounts(chatVisibleTurns) },
-      timelineIndex: { ...summarizeOrders(knownTurns), idModes: idModeCounts(knownTurns), cacheRestoredTurns: this.cacheHydrationCounts.get(internalConversationId) ?? 0 },
+      timelineIndex: {
+        ...summarizeOrders(knownTurns),
+        idModes: idModeCounts(knownTurns),
+        cacheRestoredTurns: this.cacheHydrationCounts.get(internalConversationId) ?? 0,
+        orderHealth: analyzeChatIndexOrderHealth(knownTurns)
+      },
       visibleContent: Boolean(this.host?.conversation?.hasVisibleConversationContent?.()),
       stableConversationRoot: Boolean(this.host?.conversation?.getStableConversationRoot?.()),
       shell: {
@@ -9237,7 +9373,7 @@ function waitMs(windowRef, ms) {
   return new Promise((resolve) => set(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-Object.assign(exports, { VERSION, reconcileChatVisibleTurns, resolvePinnedChatConversationCandidate, TalkEnhancerV3App, registerBundle });
+Object.assign(exports, { VERSION, analyzeChatIndexOrderHealth, reconcileChatVisibleTurns, resolvePinnedChatConversationCandidate, TalkEnhancerV3App, registerBundle });
 
 },
   };
