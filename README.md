@@ -35,11 +35,11 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 - v0.5.3 单文件 SHA-256：576B45744AD682405C42831670906059A5E4EE60E8CC601E0C42E699C26A9627
 - v0.5.3 Desktop bundle SHA-256：19B003F9A02A61828C6DF4286508BB31AE8DC521F5C66D0CC74134AEA51737CA
 
-v0.5.3 正式验收见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。v0.5.2 的验收与研究文档继续保留为历史记录，但该版本已因后续实机问题回退。
+v0.5.3 正式验收见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。v0.5.4 仅作为 Fast Path Research 收口，不发布 runtime/tag；最终研究结果见 docs/V0.5.4-RESEARCH-CLOSEOUT.zh-CN.md。v0.5.2 的验收与研究文档继续保留为历史记录，但该版本已因后续实机问题回退。
 
 v0.5.2、v0.5.1、v0.5.0 与 v0.4.5 均保留原 tag；当前推荐稳定发布线为 v0.5.3。
 
-main 已将 v0.5.2 回退后的 Chat / Work 稳定性修复正式收口为 v0.5.3；后续快路径研究进入 v0.5.4 独立阶段。
+main 已将 v0.5.2 回退后的 Chat / Work 稳定性修复正式收口为 v0.5.3；v0.5.4 Fast Path Research 已完成 Work 跨会话验证并因 Chat Timeline 架构风险收口，下一阶段进入 v0.6 Architecture Reset。
 
 ## 环境要求
 
@@ -278,10 +278,10 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 
 ## 已知问题
 
-当前问题与历史修复记录见 docs/KNOWN-ISSUES.zh-CN.md。v0.5.2 后续实机使用发现问题并已回退；其后的稳定性修复已在 v0.5.3 收口。下一阶段为 v0.5.4 Fast Path Research，产品功能继续留到 v0.6.0。
+当前问题与历史修复记录见 docs/KNOWN-ISSUES.zh-CN.md。v0.5.2 后续实机使用发现问题并已回退；其后的稳定性修复已在 v0.5.3 收口。v0.5.4 Research 已封存 Work Official Marker 验证结果，并因 Chat Timeline repair 风险停止继续堆叠 heuristic；下一阶段改为 v0.6 Architecture Reset。
 
 ## Roadmap
 
 - v0.5.3：Recovery & Consolidation，已完成并冻结为当前稳定基线。详见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。
-- v0.5.4：Fast Path Research。继续研究 Chat / Work 导航快路径，但实验默认关闭，正常运行时保持 v0.5.3 baseline。主计划见 docs/V0.5.4-FAST-PATH-RESEARCH-PLAN.zh-CN.md；当前未验证 Official Marker 研究快照见 docs/V0.5.4-OFFICIAL-MARKER-RESEARCH-CHECKPOINT.zh-CN.md。
-- v0.6.0：Product Features。优先 Timeline Search + Prompt Library v2，并在完整回归保护下逐步拆分 bootstrap.js。详见 docs/V0.6.0-PLAN.zh-CN.md。
+- v0.5.4：Fast Path Research，已完成研究收口，不发布 runtime/tag。Work Official Marker 已跨 3 个真实 Work 验证，Chat research 因 Timeline blocker 暂停。最终结果见 docs/V0.5.4-RESEARCH-CLOSEOUT.zh-CN.md；详细过程见 docs/V0.5.4-OFFICIAL-MARKER-RESEARCH-CHECKPOINT.zh-CN.md。
+- v0.6.0：Architecture Reset。先做 Chat Safety、Core/Host 解耦和 Thin Host Injector；Official Plugin 仅作为可选能力验证，不进入 Timeline correctness critical path。主方案见 docs/V0.6-ARCHITECTURE-RESET.zh-CN.md；反向评审见 docs/V0.6-ARCHITECTURE-RESET-REVIEW.zh-CN.md。原 Timeline Search + Prompt Library v2 计划降为 post-reset backlog，见 docs/V0.6.0-PLAN.zh-CN.md。
