@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import { SURFACE } from "../../src/v3/host/host-interface.js";
 import { ConversationCapture, matchConversationRequest, parseConversationPayload } from "../../src/v3/host/codex-desktop/conversation-capture.js";
 import { TurnAdapter, TURN_ID_PRIORITY } from "../../src/v3/host/codex-desktop/turn-adapter.js";
+import { WorkTurnAdapter } from "../../src/v3/host/codex-desktop/work-turn-adapter.js";
 import { ConversationAdapter, isStableLocalThreadIdentity, parseSidebarConversationKey } from "../../src/v3/host/codex-desktop/conversation-adapter.js";
 import { CodexDesktopHost, computeTailActiveTurnId } from "../../src/v3/host/codex-desktop/codex-host.js";
 import { SurfaceDetector } from "../../src/v3/host/codex-desktop/surface-detector.js";
 import { OverlayDetector } from "../../src/v3/host/codex-desktop/overlay-detector.js";
 import { ComposerAdapter } from "../../src/v3/host/codex-desktop/composer-adapter.js";
-import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, hydrationJumpScale, chatFarCoalescedJump, workWheelStepSize, predictChatFastLogicalPosition, chatFastSnapshotStable, planChatPredictiveFastPath, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
+import { NavigationAdapter, computeActiveTurnId, chooseHydrationDirection, hydrationStepSize, hydrationJumpScale, chatFarCoalescedJump, workWheelStepSize, rectInActivationZone, hasTurnWindowProgress, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress } from "../../src/v3/host/codex-desktop/navigation-adapter.js";
+import { WorkNavigationAdapter } from "../../src/v3/host/codex-desktop/work-navigation-adapter.js";
 import { evaluateHostContract, classifyTurnIdMode, HOST_CONTRACT_REVISION } from "../../src/v3/host/codex-desktop/host-contract.js";
 import { FakeDocument, FakeElement, fakeWindow } from "./fake-dom.js";
 
@@ -61,6 +63,146 @@ test("Turn ID priority prefers stable container UUID attributes", () => {
 });
 
 
+test("TurnAdapter marks explicit fallback order absolute and UUID fallback order window-local", () => {
+  const document = new FakeDocument();
+  const fallback = new FakeElement();
+  fallback.setAttribute("data-turn-key", "fallback-turn-40");
+  fallback.innerText = "absolute";
+  const stable = new FakeElement();
+  stable.setAttribute("data-turn-key", "550e8400-e29b-41d4-a716-446655440000");
+  stable.innerText = "window";
+  document.setSelector("[data-markdown-text-tone='user-message']", [fallback, stable]);
+  const adapter = new TurnAdapter({ document, clock: () => 42 });
+  const turns = adapter.getVisibleTurns();
+  const absolute = turns.find((turn) => turn.id === "fallback-turn-40");
+  const windowLocal = turns.find((turn) => turn.id === "550e8400-e29b-41d4-a716-446655440000");
+  assert.equal(absolute.order, 40);
+  assert.equal(absolute.orderTrust, "absolute");
+  assert.equal(absolute.windowOrder, 0);
+  assert.equal(windowLocal.order, 1);
+  assert.equal(windowLocal.orderTrust, "window");
+  assert.equal(windowLocal.windowOrder, 1);
+});
+
+test("TurnAdapter discovers explicit data-turn user containers without legacy user-message markers", () => {
+  const document = new FakeDocument();
+  const wrapper = new FakeElement();
+  wrapper.setAttribute("data-content-search-turn-key", "uuid-explicit-user");
+  const user = new FakeElement();
+  user.setAttribute("data-turn", "user");
+  user.innerText = "explicit user turn";
+  user.closest = (selector) => selector === "[data-content-search-turn-key]" ? wrapper : null;
+  document.setSelector("[data-turn='user']", [user]);
+  const adapter = new TurnAdapter({ document, clock: () => 42 });
+  const turns = adapter.getVisibleTurns();
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].id, "uuid-explicit-user");
+  assert.equal(turns[0].text, "explicit user turn");
+});
+
+test("TurnAdapter keeps attachment-only explicit user turns with a stable placeholder", () => {
+  const document = new FakeDocument();
+  const wrapper = new FakeElement();
+  wrapper.setAttribute("data-content-search-turn-key", "uuid-attachment-user");
+  const user = new FakeElement();
+  user.setAttribute("data-turn", "user");
+  user.innerText = "";
+  user.childElementCount = 1;
+  user.closest = (selector) => selector === "[data-content-search-turn-key]" ? wrapper : null;
+  document.setSelector("[data-turn='user']", [user]);
+  const adapter = new TurnAdapter({ document, clock: () => 42 });
+  const turns = adapter.getVisibleTurns();
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].id, "uuid-attachment-user");
+  assert.equal(turns[0].text, "[图片或文件]");
+});
+test("TurnAdapter discovers image-only fallback question shells without user markers", () => {
+  const document = new FakeDocument();
+  const shell = new FakeElement();
+  shell.setAttribute("data-turn-key", "fallback-turn-2");
+  shell.innerText = "assistant text must not become question text";
+  shell.querySelector = (selector) => selector === "img" ? new FakeElement("img") : null;
+  document.setSelector("[data-turn-key^='fallback-turn-']", [shell]);
+  const turns = new TurnAdapter({ document, clock: () => 42 }).getVisibleTurns();
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].id, "fallback-turn-2");
+  assert.equal(turns[0].order, 2);
+  assert.equal(turns[0].orderTrust, "absolute");
+  assert.equal(turns[0].text, "[图片或文件]");
+});
+
+test("TurnAdapter keeps semantic user text when a fallback question shell also contains media", () => {
+  const document = new FakeDocument();
+  const shell = new FakeElement();
+  shell.setAttribute("data-turn-key", "fallback-turn-3");
+  shell.querySelector = (selector) => selector === "img" ? new FakeElement("img") : null;
+  const user = new FakeElement();
+  user.setAttribute("data-markdown-text-tone", "user-message");
+  user.innerText = "real user text";
+  user.closest = (selector) => selector === "[data-turn-key]" ? shell : null;
+  document.setSelector("[data-markdown-text-tone='user-message']", [user]);
+  document.setSelector("[data-turn-key^='fallback-turn-']", [shell]);
+  const turns = new TurnAdapter({ document, clock: () => 42 }).getVisibleTurns();
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].id, "fallback-turn-3");
+  assert.equal(turns[0].text, "real user text");
+});
+
+test("TurnAdapter assigns mixed-selector user turns window order from DOM order", () => {
+  const document = new FakeDocument();
+  const firstWrapper = new FakeElement();
+  firstWrapper.setAttribute("data-content-search-turn-key", "uuid-first");
+  const secondWrapper = new FakeElement();
+  secondWrapper.setAttribute("data-content-search-turn-key", "uuid-second");
+  const first = new FakeElement();
+  first.setAttribute("data-markdown-text-tone", "user-message");
+  first.innerText = "first";
+  first.closest = (selector) => selector === "[data-content-search-turn-key]" ? firstWrapper : null;
+  const second = new FakeElement();
+  second.setAttribute("data-turn", "user");
+  second.innerText = "second";
+  second.closest = (selector) => selector === "[data-content-search-turn-key]" ? secondWrapper : null;
+  first.compareDocumentPosition = (other) => other === second ? 4 : 0;
+  second.compareDocumentPosition = (other) => other === first ? 2 : 0;
+  document.setSelector("[data-turn='user']", [second]);
+  document.setSelector("[data-markdown-text-tone='user-message']", [first]);
+  const turns = new TurnAdapter({ document, clock: () => 42 }).getVisibleTurns();
+  const byId = new Map(turns.map((turn) => [turn.id, turn]));
+  assert.equal(byId.get("uuid-first")?.windowOrder, 0);
+  assert.equal(byId.get("uuid-second")?.windowOrder, 1);
+});
+test("TurnAdapter exposes visualOrder independently from reverse DOM window order", () => {
+  const document = new FakeDocument();
+  const q2Wrapper = new FakeElement();
+  q2Wrapper.setAttribute("data-content-search-turn-key", "uuid-q2");
+  const q1Wrapper = new FakeElement();
+  q1Wrapper.setAttribute("data-content-search-turn-key", "uuid-q1");
+
+  const q2 = new FakeElement();
+  q2.setAttribute("data-turn", "user");
+  q2.innerText = "Q2";
+  q2.rect = { top: 320, bottom: 380, left: 0, right: 500, width: 500, height: 60 };
+  q2.closest = (selector) => selector === "[data-content-search-turn-key]" ? q2Wrapper : null;
+
+  const q1 = new FakeElement();
+  q1.setAttribute("data-markdown-text-tone", "user-message");
+  q1.innerText = "Q1";
+  q1.rect = { top: 180, bottom: 240, left: 0, right: 500, width: 500, height: 60 };
+  q1.closest = (selector) => selector === "[data-content-search-turn-key]" ? q1Wrapper : null;
+
+  q2.compareDocumentPosition = (other) => other === q1 ? 4 : 0;
+  q1.compareDocumentPosition = (other) => other === q2 ? 2 : 0;
+  document.setSelector("[data-turn='user']", [q2]);
+  document.setSelector("[data-markdown-text-tone='user-message']", [q1]);
+
+  const turns = new TurnAdapter({ document, clock: () => 42 }).getVisibleTurns();
+  const byId = new Map(turns.map((turn) => [turn.id, turn]));
+  assert.equal(byId.get("uuid-q2")?.windowOrder, 0);
+  assert.equal(byId.get("uuid-q1")?.windowOrder, 1);
+  assert.equal(byId.get("uuid-q1")?.visualOrder, 0);
+  assert.equal(byId.get("uuid-q2")?.visualOrder, 1);
+});
+
 test("TurnAdapter resolves display-contents Local turn keys to a geometry-bearing user anchor", () => {
   const document = new FakeDocument();
   const turnId = "01a07668-7ccc-7bc3-88ae-4aa4741b5560";
@@ -88,6 +230,27 @@ test("ConversationAdapter resolves selected Codex Desktop ChatGPT sidebar key", 
   const adapter = new ConversationAdapter({ document, window });
   assert.equal(adapter.getConversationId(), "6a9beb3b-2c98-83ea-aa51-e2ff5c52ef78");
   assert.equal(parseSidebarConversationKey("chatgpt:conversation:abc"), "abc");
+});
+
+test("ConversationAdapter uses inferred pinned Chat identity only when direct identity is unavailable", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const root = new FakeElement();
+  root.rect = { top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600 };
+  const user = new FakeElement();
+  const rootSelector = "[data-thread-find-target='conversation']";
+  const contentSelector = "[data-markdown-text-tone='user-message'], [data-turn-key], [data-content-search-turn-key], [data-turn-id], [data-turn-id-container]";
+  document.setSelector(rootSelector, root);
+  document.setSelector(contentSelector, user);
+  const adapter = new ConversationAdapter({ document, window });
+  assert.equal(adapter.setInferredChatConversationId("chatgpt:conversation:inferred-chat"), true);
+  assert.deepEqual(adapter.getConversationIdentity(), {
+    id: "inferred-chat", source: "inferred-visible-chat", host: "chatgpt", kind: "conversation", stable: true
+  });
+  window.location.pathname = "/c/direct-chat";
+  assert.deepEqual(adapter.getConversationIdentity(), {
+    id: "direct-chat", source: "route", host: "chatgpt", kind: "conversation", stable: true
+  });
 });
 
 test("ConversationAdapter accepts only stable namespaced Local Thread identity", () => {
@@ -158,6 +321,80 @@ test("ConversationAdapter prefers an explicit stable Local selection over stale 
   assert.deepEqual(adapter.getConversationIdentity(), { id: localId, source: "sidebar-local", host: "local", kind: "local", stable: true });
 });
 
+test("WorkTurnAdapter stays isolated from Chat-only media fallback and order metadata", () => {
+  const document = new FakeDocument();
+  const shell = new FakeElement();
+  shell.setAttribute("data-turn-key", "fallback-turn-9");
+  shell.querySelector = (selector) => selector === "img" ? new FakeElement("img") : null;
+  document.setSelector("[data-turn-key^='fallback-turn-']", [shell]);
+  const work = new WorkTurnAdapter({ document, clock: () => 42 });
+  assert.deepEqual(work.getVisibleTurns(), []);
+
+  const message = new FakeElement();
+  message.setAttribute("data-content-search-turn-key", "01a057ce-32ff-75b3-83fb-4179df90399f");
+  message.innerText = "work question";
+  document.setSelector("[data-markdown-text-tone='user-message']", [message]);
+  const [turn] = work.getVisibleTurns();
+  assert.equal(turn.id, "01a057ce-32ff-75b3-83fb-4179df90399f");
+  assert.equal(Object.hasOwn(turn, "orderTrust"), false);
+  assert.equal(Object.hasOwn(turn, "windowOrder"), false);
+});
+
+test("CodexDesktopHost hard-routes Chat and Work to separate turn adapters", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const shell = new FakeElement();
+  shell.setAttribute("data-turn-key", "fallback-turn-2");
+  shell.querySelector = (selector) => selector === "img" ? new FakeElement("img") : null;
+  document.setSelector("[data-turn-key^='fallback-turn-']", [shell]);
+  const host = new CodexDesktopHost({ document, window });
+  assert.notEqual(host.chatTurns, host.workTurns);
+  host.conversation.getConversationIdentity = () => ({ id: "chat-a", host: "chatgpt", source: "sidebar-chatgpt", stable: true });
+  host.conversation.getConversationId = () => "chat-a";
+  assert.equal(host.getTurnAdapter(), host.chatTurns);
+  assert.equal(host.getVisibleTurns().length, 1);
+
+  host.conversation.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", host: "local", source: "sidebar-local", stable: true, kind: "local" });
+  host.conversation.getConversationId = () => "local:01a057ce-32ff-75b3-83fb-4179df90399f";
+  assert.equal(host.getTurnAdapter(), host.workTurns);
+  assert.equal(host.getVisibleTurns().length, 0);
+});
+
+test("CodexDesktopHost hard-routes Chat and Work to separate navigation adapters", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const host = new CodexDesktopHost({ document, window });
+  assert.notEqual(host.chatNavigation, host.workNavigation);
+  assert.equal(host.chatNavigation.turnAdapter, host.chatTurns);
+  assert.equal(host.workNavigation.turnAdapter, host.workTurns);
+  const calls = [];
+  host.chatNavigation.navigateToTurn = async () => { calls.push("chat"); return { ok: true, verified: true }; };
+  host.workNavigation.navigateToTurn = async () => { calls.push("work"); return { ok: true, verified: true }; };
+
+  host.conversation.getConversationIdentity = () => ({ id: "chat-a", host: "chatgpt", source: "sidebar-chatgpt", stable: true });
+  host.conversation.getConversationId = () => "chat-a";
+  await host.navigateToTurn("q1");
+
+  host.conversation.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", host: "local", source: "sidebar-local", stable: true, kind: "local" });
+  host.conversation.getConversationId = () => "local:01a057ce-32ff-75b3-83fb-4179df90399f";
+  await host.navigateToTurn("q1");
+  assert.deepEqual(calls, ["chat", "work"]);
+});
+
+test("CodexDesktopHost keeps the last stable host mode through a transient identity gap", () => {
+  const host = new CodexDesktopHost({ document: new FakeDocument(), window: fakeWindow() });
+  let identity = { id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", host: "local", source: "sidebar-local", stable: true, kind: "local" };
+  let id = identity.id;
+  host.conversation.getConversationIdentity = () => identity;
+  host.conversation.getConversationId = () => id;
+  assert.equal(host.getHostMode(), "work");
+  identity = null;
+  id = null;
+  assert.equal(host.getHostMode(), "work");
+  assert.equal(host.getTurnAdapter(), host.workTurns);
+  assert.equal(host.getNavigationAdapter(), host.workNavigation);
+});
+
 test("CodexDesktopHost combines host and upstream navigation cancellation", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
@@ -219,66 +456,6 @@ test("TurnAdapter reads current Desktop user-message tone inside fallback virtua
   assert.equal(turns[0].id, "fallback-turn-0");
   assert.equal(turns[0].text, "真实桌面端用户问题");
 });
-
-test("OverlayDetector treats visible host dialogs as Prompt blockers", () => {
-  const document = new FakeDocument();
-  const detector = new OverlayDetector({ document });
-  assert.equal(detector.isBlockingDialogOpen(), false);
-
-  const dialog = new FakeElement("div");
-  dialog.setAttribute("role", "dialog");
-  document.setSelector("[role='dialog']", dialog);
-  assert.equal(detector.isBlockingDialogOpen(), true);
-
-  dialog.hidden = true;
-  assert.equal(detector.isBlockingDialogOpen(), false);
-  dialog.hidden = false;
-  dialog.setAttribute("aria-hidden", "true");
-  assert.equal(detector.isBlockingDialogOpen(), false);
-
-  document.setSelector("[role='dialog']", null);
-  const modal = new FakeElement("div");
-  modal.setAttribute("aria-modal", "true");
-  document.setSelector("[aria-modal='true']", modal);
-  assert.equal(detector.isBlockingDialogOpen(), true);
-});
-
-test("OverlayDetector blocks Prompt only when a visible floating layer reaches the composer zone", () => {
-  const document = new FakeDocument();
-  const detector = new OverlayDetector({ document });
-  const composerRect = { left: 440, top: 600, right: 1080, bottom: 680, width: 640, height: 80 };
-  const floating = new FakeElement("div");
-  floating.rect = { left: 120, top: 200, right: 320, bottom: 320, width: 200, height: 120 };
-  document.setSelector("[data-radix-popper-content-wrapper]", floating);
-
-  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
-
-  floating.rect = { left: 250, top: 520, right: 520, bottom: 650, width: 270, height: 130 };
-  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), true);
-
-  floating.hidden = true;
-  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
-  floating.hidden = false;
-  floating.setAttribute("aria-hidden", "true");
-  assert.equal(detector.isPromptFloatingLayerOpen({ composerRect }), false);
-});
-
-test("CodexDesktopHost passes the current composer rect into Prompt floating-layer blocking", () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  const host = new CodexDesktopHost({ document, window });
-  const composerRect = { left: 440, top: 600, right: 1080, bottom: 680, width: 640, height: 80 };
-  let seen = null;
-  host.getComposerRect = () => composerRect;
-  host.overlay = {
-    isBlockingDialogOpen: () => false,
-    isPromptFloatingLayerOpen: (payload) => { seen = payload; return true; }
-  };
-
-  assert.equal(host.isPromptOverlayBlocked(), true);
-  assert.deepEqual(seen, { composerRect });
-});
-
 test("SurfaceDetector covers new chat, conversation, media, settings, plugin manager and other", () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
@@ -307,23 +484,6 @@ test("SurfaceDetector covers new chat, conversation, media, settings, plugin man
   assert.equal(detector.getSurface(), SURFACE.SETTINGS);
   window.location.pathname = "/plugins";
   assert.equal(detector.getSurface(), SURFACE.PLUGIN_MANAGER);
-});
-
-test("ComposerAdapter rejects a page-sized form and uses the local composer container", () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  const pageForm = new FakeElement("form");
-  pageForm.rect = { left: 240, top: 0, right: 1327, bottom: 820, width: 1087, height: 820 };
-  const local = new FakeElement("div");
-  local.rect = { left: 415, top: 690, right: 1150, bottom: 770, width: 735, height: 80 };
-  const composer = new FakeElement("textarea");
-  composer.rect = { left: 438, top: 715, right: 1110, bottom: 755, width: 672, height: 40 };
-  pageForm.append(local);
-  local.append(composer);
-  document.setSelector("#prompt-textarea", composer);
-  const adapter = new ComposerAdapter({ document, window });
-  assert.equal(adapter.getComposerForm(), local);
-  assert.deepEqual(adapter.getComposerRect(), local.rect);
 });
 
 test("ComposerAdapter inserts with readback repeatedly without sending", () => {
@@ -564,7 +724,7 @@ test("ChatGPT regular hydration uses the shorter motion gate", async () => {
   assert.equal(typeof result.steps.at(-1)?.elapsedMs, "number");
 });
 
-test("Non-sidebar Local regular hydration keeps the default motion gate", async () => {
+test("Local regular hydration keeps the default motion gate", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   const delays = [];
@@ -590,7 +750,7 @@ test("Non-sidebar Local regular hydration keeps the default motion gate", async 
   container.scrollTop = -1200;
   const nav = new NavigationAdapter({
     window, turnAdapter,
-    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "local", source: "other-local" }) },
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ host: "local", source: "sidebar-local" }) },
     motionProgressWaitMs: 45, chatMotionProgressWaitMs: 7, hydrationWaitMs: 200, postSettleWaitMs: 0, maxPostSettleCorrections: 0
   });
   const turns = Array.from({ length: 8 }, (_, order) => ({ id: "q" + (order + 1), order }));
@@ -622,110 +782,12 @@ test("ChatGPT far Earlier coalesces only while far from target and boundary", ()
   assert.equal(chatFarCoalescedJump({ baseJump: 5600, host: "local", direction: -1, targetBeforeVisible: true, targetDistance: 60, logicalPosition: 40000 }).coalesced, false);
 });
 
-test("Chat predictive fast-path planning is Chat-only, contiguous and far-Earlier", () => {
-  const orderById = new Map(Array.from({ length: 76 }, (_, order) => ["q" + (order + 1), order]));
-  const indexState = { targetOrder: 0, maxKnownOrder: 75, orderById };
-  const snapshot = { visibleOrders: [69, 70, 71, 72, 73, 74, 75], scrollHeight: 76000, clientHeight: 800, maxLogicalPosition: 75200, logicalPosition: 75200 };
-  const plan = planChatPredictiveFastPath({ allowed: true, identity: { host: "chatgpt", stable: true }, indexState, snapshot });
-  assert.equal(plan.eligible, true);
-  assert.equal(plan.predictedLogical, 0);
-  assert.equal(predictChatFastLogicalPosition({ targetOrder: 19, maxKnownOrder: 75, maxLogicalPosition: 75200 }), 19051);
-  assert.equal(planChatPredictiveFastPath({ allowed: true, identity: { host: "local", stable: true }, indexState, snapshot }).eligible, false);
-  const gapped = new Map(orderById); gapped.delete("q25");
-  assert.equal(planChatPredictiveFastPath({ allowed: true, identity: { host: "chatgpt", stable: true }, indexState: { ...indexState, orderById: gapped }, snapshot }).reason, "non-contiguous-index");
-});
-
-test("Chat fast-path stability rejects moving extent or virtual window", () => {
-  const base = { visibleOrders: [69, 70, 71], scrollHeight: 76000, clientHeight: 800, maxLogicalPosition: 75200, logicalPosition: 75200 };
-  assert.equal(chatFastSnapshotStable(base, { ...base }), true);
-  assert.equal(chatFastSnapshotStable(base, { ...base, scrollHeight: 77000, maxLogicalPosition: 76200 }), false);
-  assert.equal(chatFastSnapshotStable(base, { ...base, visibleOrders: [68, 69, 70] }), false);
-});
-
-test("Chat predictive fast path verifies an unmounted Q1 after one predicted jump", async () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
-  const target = new FakeElement();
-  target.rect = { top: 150, bottom: 250, left: 0, right: 800, width: 800, height: 100 };
-  const container = new FakeElement();
-  container.rect = { top: 30, bottom: 830, left: 0, right: 800, width: 800, height: 800 };
-  container.clientHeight = 800;
-  container.scrollHeight = 76000;
-  let physicalTop = 0;
-  let writes = 0;
-  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { writes += 1; physicalTop = value; } });
-  const visible = Array.from({ length: 7 }, (_, i) => ({ id: "q" + (70 + i), order: 69 + i }));
-  const turnAdapter = {
-    resolveTurn: (id) => writes >= 1 && id === "q1" ? target : null,
-    verifyTurnElement: (id, element) => id === "q1" && element === target,
-    getVisibleTurns: () => visible
-  };
-  const nav = new NavigationAdapter({
-    window, turnAdapter,
-    conversationAdapter: {
-      getScrollContainer: () => container,
-      getConversationIdentity: () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
-    },
-    chatFastPathWaitMs: 5, postSettleWaitMs: 0, maxPostSettleCorrections: 0
-  });
-  const turns = Array.from({ length: 76 }, (_, order) => ({ id: "q" + (order + 1), order }));
-  const result = await nav.navigateToTurn("q1", { turns, allowChatPredictiveFastPath: true });
-  assert.equal(result.ok, true);
-  assert.equal(result.verified, true);
-  assert.equal(result.fastAttempted, true);
-  assert.equal(result.fastSucceeded, true);
-  assert.equal(result.fallbackReason, null);
-  assert.equal(result.steps[0]?.mode, "chat-fast");
-  assert.equal(result.steps[0]?.jumpPx, 75200);
-  assert.equal(result.steps.some((step) => step.mode === "chat-progressive" || step.mode === "chat-coalesced"), false);
-});
-
-test("Chat predictive fast miss falls back to the stable coalesced path", async () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
-  const target = new FakeElement();
-  target.rect = { top: 150, bottom: 250, left: 0, right: 800, width: 800, height: 100 };
-  const container = new FakeElement();
-  container.rect = { top: 30, bottom: 830, left: 0, right: 800, width: 800, height: 800 };
-  container.clientHeight = 800;
-  container.scrollHeight = 76000;
-  let physicalTop = 0;
-  let writes = 0;
-  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { writes += 1; physicalTop = value; } });
-  const visible = Array.from({ length: 7 }, (_, i) => ({ id: "q" + (70 + i), order: 69 + i }));
-  const turnAdapter = {
-    resolveTurn: (id) => writes >= 2 && id === "q20" ? target : null,
-    verifyTurnElement: (id, element) => id === "q20" && element === target,
-    getVisibleTurns: () => visible
-  };
-  const nav = new NavigationAdapter({
-    window, turnAdapter,
-    conversationAdapter: {
-      getScrollContainer: () => container,
-      getConversationIdentity: () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
-    },
-    chatFastPathWaitMs: 0, chatMotionProgressWaitMs: 1, hydrationWaitMs: 5, postSettleWaitMs: 0, maxPostSettleCorrections: 0
-  });
-  const turns = Array.from({ length: 76 }, (_, order) => ({ id: "q" + (order + 1), order }));
-  const result = await nav.navigateToTurn("q20", { turns, allowChatPredictiveFastPath: true });
-  assert.equal(result.ok, true);
-  assert.equal(result.verified, true);
-  assert.equal(result.fastAttempted, true);
-  assert.equal(result.fastSucceeded, false);
-  assert.equal(result.fallbackReason, "no-structural-progress");
-  assert.equal(result.steps[0]?.mode, "chat-fast");
-  assert.ok(result.steps.slice(1).some((step) => step.mode === "chat-coalesced" || step.mode === "chat-progressive"));
-});
-
 test("Work Earlier wheel step adapts to distance while preserving short-history and boundary safety", () => {
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 10, targetDistance: 60, logicalPosition: 5000 }), 400);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 10, logicalPosition: 5000 }), 720);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 40, targetDistance: 30, logicalPosition: 5000 }), 864);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 5000 }), 972);
   assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 500 }), 500);
-  assert.equal(workWheelStepSize({ configuredStep: 720, viewport: 800, turnCount: 80, targetDistance: 60, logicalPosition: 1000, minLogicalPosition: 0, maxLogicalPosition: 1500, direction: 1 }), 500);
 });
 
 test("accelerated Work cadence keeps the conservative boundary wait", () => {
@@ -1421,135 +1483,6 @@ test("long reverse Work uses monotonic wheel-progressive hydration for earlier h
   assert.ok(writes.every((value, index) => index === 0 || value <= writes[index - 1]));
 });
 
-test("long forward Work uses wheel-progressive hydration for later history", async () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
-  const ids = Array.from({ length: 40 }, (_, index) => `stable-${index}`);
-  const ranges = [[0, 1, 2, 3], [8, 9, 10, 11], [20, 21, 22, 23], [36, 37, 38, 39]];
-  let stage = 0;
-  let compatCalls = 0;
-  const wheelDeltas = [];
-  window.__codexThreadScrollHandlers = { markPointerIntent(event) { if (event?.target) compatCalls += 1; } };
-  const target = new FakeElement();
-  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
-  const turnAdapter = {
-    resolveTurn: (id) => stage >= 3 && id === ids[39] ? target : null,
-    verifyTurnElement: (id, element) => id === ids[39] && element === target,
-    getVisibleTurns: () => ranges[stage].map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
-  };
-  const container = new FakeElement();
-  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
-  container.clientHeight = 200;
-  container.scrollHeight = 1800;
-  let physicalTop = -1600;
-  const writes = [];
-  Object.defineProperty(container, "scrollTop", {
-    get: () => physicalTop,
-    set: (value) => { physicalTop = value; writes.push(value); },
-    configurable: true
-  });
-  container.dispatchEvent = (event) => {
-    if (event?.type === "wheel") {
-      wheelDeltas.push(event.deltaY);
-      if (stage < 3) stage += 1;
-    }
-    return true;
-  };
-  const nav = new NavigationAdapter({
-    window,
-    turnAdapter,
-    conversationAdapter: {
-      getScrollContainer: () => container,
-      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
-    },
-    workWheelStepPx: 200,
-    workWheelWaitMs: 2,
-    hydrationWaitMs: 20,
-    maxNavigationMs: 1000,
-    postSettleWaitMs: 0,
-    maxPostSettleCorrections: 0
-  });
-  const trace = [];
-  const result = await nav.navigateToTurn(ids[39], {
-    turns: ids.map((id, order) => ({ id, order })),
-    onTraceStep: (entry) => trace.push(entry)
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.verified, true);
-  assert.equal(stage, 3);
-  assert.equal(compatCalls, 1);
-  assert.ok(wheelDeltas.length >= 3);
-  assert.ok(wheelDeltas.every((value) => value > 0));
-  assert.ok(writes.every((value, index) => index === 0 || value >= writes[index - 1]));
-  assert.ok(trace.some((entry) => entry.mode === "work-wheel" && entry.direction === 1));
-});
-
-test("Local Work tail target backtracks from physical bottom when the final user turn is virtualized above a long assistant reply", async () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
-  const ids = Array.from({ length: 71 }, (_, index) => `stable-${index}`);
-  let backtrackSignals = 0;
-  let compatCalls = 0;
-  const wheelDeltas = [];
-  const writes = [];
-  const target = new FakeElement();
-  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
-  window.__codexThreadScrollHandlers = { markPointerIntent() { compatCalls += 1; } };
-  const turnAdapter = {
-    resolveTurn: (id) => backtrackSignals >= 3 && id === ids[70] ? target : null,
-    verifyTurnElement: (id, element) => id === ids[70] && element === target,
-    getVisibleTurns: () => (backtrackSignals >= 3 ? [67, 68, 69, 70] : [60, 61, 62, 63, 64, 65, 66, 67, 68, 69])
-      .map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
-  };
-  const container = new FakeElement();
-  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
-  container.clientHeight = 200;
-  container.scrollHeight = 6400;
-  let physicalTop = 0;
-  Object.defineProperty(container, "scrollTop", {
-    get: () => physicalTop,
-    set: (value) => { physicalTop = value; writes.push(value); },
-    configurable: true
-  });
-  container.dispatchEvent = (event) => {
-    if (event?.type === "wheel") {
-      wheelDeltas.push(event.deltaY);
-      if (event.deltaY < 0) backtrackSignals += 1;
-    }
-    return true;
-  };
-  const nav = new NavigationAdapter({
-    window,
-    turnAdapter,
-    conversationAdapter: {
-      getScrollContainer: () => container,
-      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
-    },
-    workWheelStepPx: 200,
-    workWheelWaitMs: 2,
-    hydrationWaitMs: 20,
-    maxNavigationMs: 1000,
-    postSettleWaitMs: 0,
-    maxPostSettleCorrections: 0
-  });
-  const trace = [];
-  const result = await nav.navigateToTurn(ids[70], {
-    turns: ids.map((id, order) => ({ id, order })),
-    onTraceStep: (entry) => trace.push(entry)
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.verified, true);
-  assert.equal(result.targetOrder, 70);
-  assert.equal(backtrackSignals, 3);
-  assert.equal(compatCalls, 1);
-  assert.ok(wheelDeltas.length >= 3);
-  assert.ok(wheelDeltas.every((value) => value < 0));
-  assert.ok(writes.some((value) => value < 0));
-  assert.ok(trace.some((entry) => entry.mode === "work-tail-backtrack" && entry.direction === -1));
-});
-
 test("reverse Work keeps moving through delayed DOM updates instead of failing after two wheel steps", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
@@ -1910,48 +1843,685 @@ test("Host contract classifies stable, fallback and mixed turn id modes", () => 
   assert.equal(classifyTurnIdMode([{ id: "uuid-a" }, { id: "uuid-b" }]), "stable");
   assert.equal(classifyTurnIdMode([{ id: "fallback-turn-1" }, { id: "uuid-b" }]), "mixed");
 });
-// Auto official-bridge / Work active-line regression coverage.
-test("CodexDesktopHost resolves an official marker key through a current turn DOM reference", () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
-  const node = new FakeElement("div");
-  node.setAttribute("data-turn-id", "turn-q23");
-  document.getElementById = (id) => id === "official-marker-q23" ? node : null;
-  const host = new CodexDesktopHost({ document, window });
-  assert.equal(host.resolveOfficialNavigationMarkerKey("official-marker-q23"), "turn-q23");
+test("Chat navigation ignores window-local UUID orders unless the global index knows them", () => {
+  const turnAdapter = {
+    getVisibleTurns: () => [
+      { id: "uuid-window-a", order: 0, orderTrust: "window" },
+      { id: "uuid-known", order: 1, orderTrust: "window" },
+      { id: "fallback-turn-40", order: 40, orderTrust: "absolute" }
+    ]
+  };
+  const nav = new NavigationAdapter({
+    window: fakeWindow(),
+    turnAdapter,
+    conversationAdapter: {
+      getConversationIdentity: () => ({ host: "chatgpt", source: "sidebar-chatgpt" })
+    }
+  });
+  assert.deepEqual(nav.readVisibleOrders(new Map([["uuid-known", 55]])), [40, 55]);
 });
 
-test("Local Work active tracking samples inside the target instead of the exact navigation edge", () => {
+test("Chat Earlier keeps its direction through unknown UUID windows until the target mounts", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
+  const windows = [
+    ["uuid-a1", "uuid-a2"],
+    ["uuid-b1", "uuid-b2"],
+    ["uuid-c1", "uuid-c2"],
+    ["target-q3", "uuid-d2"]
+  ];
+  let stage = 0;
+  const turnAdapter = {
+    resolveTurn: (id) => stage >= 3 && id === "target-q3" ? target : null,
+    verifyTurnElement: (id, element) => id === "target-q3" && element === target,
+    getVisibleTurns: () => windows[stage].map((id, order) => ({ id, order, orderTrust: "window" }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 12000;
+  let physicalTop = 0;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => {
+      physicalTop = value;
+      if (stage < 3) stage += 1;
+    },
+    configurable: true
+  });
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-a", host: "chatgpt", source: "sidebar-chatgpt", stable: true })
+    },
+    maxHydrationSteps: 8,
+    maxConsecutiveStalls: 2,
+    hydrationWaitMs: 10,
+    chatMotionProgressWaitMs: 1,
+    postSettleWaitMs: 0,
+    maxPostSettleCorrections: 0,
+    maxNavigationMs: 500
+  });
+  const turns = Array.from({ length: 70 }, (_, order) => ({ id: order === 2 ? "target-q3" : `known-${order}`, order }));
+  const result = await nav.navigateToTurn("target-q3", { turns });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.verified, true);
+  assert.equal(stage, 3);
+  assert.ok(result.steps.length >= 3);
+  assert.ok(result.steps.every((step) => step.direction === -1));
+});
+
+test("Chat unknown UUID window replacement counts as structural hydration progress", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  let stage = 0;
+  const windows = [
+    ["uuid-a1", "uuid-a2"],
+    ["uuid-b1", "uuid-b2"]
+  ];
+  const turnAdapter = {
+    resolveTurn: () => null,
+    verifyTurnElement: () => false,
+    getVisibleTurns: () => windows[stage].map((id, order) => ({ id, order, orderTrust: "window" }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 840, left: 0, right: 800, width: 800, height: 800 };
+  container.clientHeight = 800;
+  container.scrollHeight = 12000;
+  container.scrollTop = -11200;
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ host: "chatgpt", source: "sidebar-chatgpt" })
+    },
+    hydrationWaitMs: 40
+  });
+  const before = nav.readHydrationSnapshot(container, 2, new Map());
+  window.setTimeout(() => { stage = 1; }, 5);
+  const outcome = await nav.awaitHydrationProgress({
+    turnId: "target-q3",
+    targetOrder: 2,
+    previousSnapshot: before,
+    direction: -1,
+    container,
+    isCurrent: () => true,
+    orderById: new Map(),
+    waitMs: 40,
+    allowMotionProgress: false
+  });
+  assert.equal(outcome.state, "progress", JSON.stringify(outcome));
+  assert.equal(outcome.progressed, true);
+});
+
+test("Restored v0.5.2 Work Later uses positive wheel hydration on the isolated Work navigator", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const ids = Array.from({ length: 40 }, (_, index) => `work-${index}`);
+  const ranges = [[0,1,2,3],[8,9,10,11],[20,21,22,23],[36,37,38,39]];
+  let stage = 0;
+  const wheelDeltas = [];
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
+  const turnAdapter = {
+    resolveTurn: (id) => stage >= 3 && id === ids[39] ? target : null,
+    verifyTurnElement: (id, element) => id === ids[39] && element === target,
+    getVisibleTurns: () => ranges[stage].map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
+  container.clientHeight = 200;
+  container.scrollHeight = 1800;
+  let physicalTop = -1600;
+  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { physicalTop = value; }, configurable: true });
+  container.dispatchEvent = (event) => { if (event?.type === "wheel") { wheelDeltas.push(event.deltaY); if (stage < 3) stage += 1; } return true; };
+  window.__codexThreadScrollHandlers = { markPointerIntent() {} };
+  const nav = new WorkNavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true }) },
+    workWheelStepPx: 200, workWheelWaitMs: 2, hydrationWaitMs: 20, maxNavigationMs: 1000, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const result = await nav.navigateToTurn(ids[39], { turns: ids.map((id, order) => ({ id, order })) });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.verified, true);
+  assert.ok(wheelDeltas.length >= 3);
+  assert.ok(wheelDeltas.every((value) => value > 0));
+});
+
+test("Restored Work tail backtracks from physical bottom to the final user turn", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const ids = Array.from({ length: 71 }, (_, index) => `work-tail-${index}`);
+  let backtracks = 0;
+  const target = new FakeElement();
+  target.rect = { top: 160, bottom: 240, left: 0, right: 800, width: 800, height: 80 };
+  const turnAdapter = {
+    resolveTurn: (id) => backtracks >= 3 && id === ids[70] ? target : null,
+    verifyTurnElement: (id, element) => id === ids[70] && element === target,
+    getVisibleTurns: () => (backtracks >= 3 ? [67,68,69,70] : [60,61,62,63,64,65,66,67,68,69]).map((globalOrder, localOrder) => ({ id: ids[globalOrder], order: localOrder }))
+  };
+  const container = new FakeElement();
+  container.rect = { top: 40, bottom: 240, left: 0, right: 800, width: 800, height: 200 };
+  container.clientHeight = 200;
+  container.scrollHeight = 6400;
+  let physicalTop = 0;
+  Object.defineProperty(container, "scrollTop", { get: () => physicalTop, set: (value) => { physicalTop = value; }, configurable: true });
+  container.dispatchEvent = (event) => { if (event?.type === "wheel" && event.deltaY < 0) backtracks += 1; return true; };
+  window.__codexThreadScrollHandlers = { markPointerIntent() {} };
+  const nav = new WorkNavigationAdapter({
+    window, turnAdapter,
+    conversationAdapter: { getScrollContainer: () => container, getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true }) },
+    workWheelStepPx: 200, workWheelWaitMs: 2, hydrationWaitMs: 20, maxNavigationMs: 1000, postSettleWaitMs: 0, maxPostSettleCorrections: 0
+  });
+  const trace = [];
+  const result = await nav.navigateToTurn(ids[70], { turns: ids.map((id, order) => ({ id, order })), onTraceStep: (entry) => trace.push(entry) });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.verified, true);
+  assert.equal(backtracks, 3);
+  assert.ok(trace.some((entry) => entry.mode === "work-tail-backtrack" && entry.direction === -1));
+});
+
+test("CodexDesktopHost restored navigation intent uses only the active Work navigator", () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   const host = new CodexDesktopHost({ document, window });
-  const container = new FakeElement("div");
-  container.rect = { top: 0, bottom: 800, left: 0, right: 800, width: 800, height: 800 };
-  container.style.flexDirection = "column";
-  const q22 = new FakeElement("div"); q22.rect = { top: 80, bottom: 126, left: 0, right: 800, width: 800, height: 46 };
-  const q23 = new FakeElement("div"); q23.rect = { top: 126, bottom: 176, left: 0, right: 800, width: 800, height: 50 };
-  host.getVisibleTurns = () => [{ id: "q22" }, { id: "q23" }];
-  host.resolveTurn = (id) => id === "q22" ? q22 : q23;
-  host.getScrollContainer = () => container;
-  host.getConversationIdentity = () => ({ id: "local:A", host: "local", source: "sidebar-local", stable: true, kind: "local" });
-  assert.equal(host.getActiveTurnId(), "q23");
-  host.getConversationIdentity = () => ({ id: "chat:A", host: "chatgpt", source: "sidebar-chatgpt", stable: true, kind: "conversation" });
-  assert.equal(host.getActiveTurnId(), "q22");
-});
-
-test("CodexDesktopHost forwards explicit navigation intent to Codex++ scroll restore handlers", () => {
-  const document = new FakeDocument();
-  const window = fakeWindow(document);
   const container = new FakeElement();
   container.isConnected = true;
-  const calls = [];
-  window.__codexThreadScrollHandlers = {
-    markPointerIntent(event) { calls.push(event); }
-  };
-  const host = new CodexDesktopHost({ document, window });
   host.conversation.getScrollContainer = () => container;
+  host.conversation.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  let workCalls = 0;
+  let chatCalls = 0;
+  host.workNavigation.notifyCodexPlusScrollIntent = (received) => { if (received === container) workCalls += 1; return true; };
+  host.chatNavigation.notifyCodexPlusScrollIntent = () => { chatCalls += 1; return true; };
   assert.equal(host.notifyNavigationIntent(), true);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0]?.target, container);
-  assert.equal(calls[0]?.type, "pointerdown");
+  assert.equal(workCalls, 1);
+  assert.equal(chatCalls, 0);
+});
+
+test("ComposerAdapter restored v0.5.2 anchor rejects a page-sized form", () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  const pageForm = new FakeElement("form");
+  pageForm.rect = { left: 240, top: 0, right: 1327, bottom: 820, width: 1087, height: 820 };
+  const local = new FakeElement("div");
+  local.rect = { left: 415, top: 690, right: 1150, bottom: 770, width: 735, height: 80 };
+  const composer = new FakeElement("textarea");
+  composer.rect = { left: 438, top: 715, right: 1110, bottom: 755, width: 672, height: 40 };
+  pageForm.append(local); local.append(composer);
+  composer.closest = (selector) => selector === "form" ? pageForm : null;
+  document.setSelector("#prompt-textarea", composer);
+  const adapter = new ComposerAdapter({ document, window });
+  assert.equal(adapter.getComposerForm(), local);
+});
+
+test("OverlayDetector restored v0.5.2 blocks visible host dialog", () => {
+  const document = new FakeDocument();
+  const dialog = new FakeElement("div");
+  dialog.setAttribute("role", "dialog");
+  dialog.rect = { left: 100, top: 100, right: 500, bottom: 400, width: 400, height: 300 };
+  document.setSelector("[role='dialog']", dialog);
+  const detector = new OverlayDetector({ document });
+  assert.equal(detector.isBlockingDialogOpen(), true);
+});
+
+
+test("Chat Load All history hydrator reaches the true top across lazy-loaded batches", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 240;
+  container.scrollHeight = 1040;
+  let scrollTop = 400;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => scrollTop,
+    set: (value) => { scrollTop = value; },
+    configurable: true
+  });
+  let batches = 0;
+  let visibleCount = 4;
+  const nativeSetTimeout = setTimeout;
+  window.setTimeout = (callback, delayMs) => nativeSetTimeout(() => {
+    if (Number(delayMs) === 4 && scrollTop === 0 && batches < 2) {
+      batches += 1;
+      visibleCount += 3;
+      container.scrollHeight += 300;
+      scrollTop = 300;
+    }
+    callback();
+  }, 0);
+  window.clearTimeout = clearTimeout;
+  const turnAdapter = {
+    getVisibleTurns: () => Array.from({ length: visibleCount }, (_, index) => ({ id: `chat-${index}`, order: index, orderTrust: "absolute" })),
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-a", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
+    },
+    hydrationWaitMs: 1,
+    chatBoundaryHydrationWaitMs: 4
+  });
+  let progress = 0;
+  const result = await nav.hydrateEarlierHistory({
+    isCurrent: () => true,
+    maxSteps: 20,
+    maxBoundaryStalls: 2,
+    onProgress: () => { progress += 1; }
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.reason, "earlier-boundary-exhausted");
+  assert.equal(batches, 2);
+  assert.ok(progress >= 2);
+  assert.equal(scrollTop, 0);
+});
+
+test("Chat loaded-history sweep covers the full column-reverse range with bounded viewport steps", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 700;
+  container.scrollHeight = 4900;
+  container.scrollTop = -4200;
+  const maxLogical = 4200;
+  const samples = [];
+  const turnAdapter = {
+    getVisibleTurns: () => {
+      const logical = Math.max(0, Math.min(maxLogical, maxLogical + Number(container.scrollTop || 0)));
+      const bucket = Math.min(8, Math.floor(logical / 525));
+      return [
+        { id: "sweep-q-" + (bucket + 1), order: bucket, orderTrust: "absolute" },
+        { id: "sweep-q-" + (bucket + 2), order: bucket + 1, orderTrust: "absolute" }
+      ];
+    },
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-sweep", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
+    },
+    hydrationWaitMs: 1
+  });
+
+  const result = await nav.sweepLoadedChatHistory({
+    isCurrent: () => true,
+    stepRatio: 0.75,
+    settleWaitMs: 0,
+    onWindow: ({ logicalPosition, turns }) => samples.push({ logicalPosition, ids: turns.map((turn) => turn.id) })
+  });
+
+  assert.equal(result.reason, "sweep-complete");
+  assert.equal(result.ok, true);
+  assert.ok(samples.length >= 8);
+  assert.equal(samples[0].logicalPosition, 0);
+  assert.equal(samples.at(-1).logicalPosition, maxLogical);
+  for (let i = 1; i < samples.length; i += 1) {
+    assert.ok(samples[i].logicalPosition >= samples[i - 1].logicalPosition);
+    assert.ok(samples[i].logicalPosition - samples[i - 1].logicalPosition <= 700 * 0.75 + 1);
+  }
+});
+
+test("Chat loaded-history sweep tolerates a transient null identity only when the caller still owns the operation", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 700;
+  container.scrollHeight = 700;
+  container.scrollTop = 0;
+  const turnAdapter = {
+    getVisibleTurns: () => [
+      { id: "12345678-1234-4234-8234-000000000001", order: 0, orderTrust: "window", text: "Q1" }
+    ],
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  const conversationAdapter = {
+    getScrollContainer: () => container,
+    getConversationIdentity: () => null
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter,
+    hydrationWaitMs: 1
+  });
+
+  const owned = await nav.sweepLoadedChatHistory({
+    isCurrent: () => true,
+    settleWaitMs: 0
+  });
+  assert.equal(owned.reason, "sweep-complete");
+  assert.equal(owned.ok, true);
+
+  const rejected = await nav.sweepLoadedChatHistory({
+    isCurrent: () => false,
+    settleWaitMs: 0
+  });
+  assert.equal(rejected.reason, "not-chat");
+  assert.equal(rejected.ok, false);
+});
+
+test("Chat history hydrator advances on early structural progress without waiting the full boundary ceiling", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column" });
+  let fakeNow = 0;
+  window.performance = { now: () => fakeNow };
+  const delays = [];
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 240;
+  container.scrollHeight = 1000;
+  container.scrollTop = 0;
+  let visibleCount = 2;
+  let pollCount = 0;
+  window.setTimeout = (callback, ms) => {
+    const delayMs = Number(ms) || 0;
+    delays.push(delayMs);
+    fakeNow += delayMs;
+    if (delayMs === 5) {
+      pollCount += 1;
+      if (pollCount === 2) {
+        visibleCount = 3;
+        container.scrollHeight = 1200;
+      }
+    }
+    callback();
+    return 1;
+  };
+  window.clearTimeout = () => {};
+  const turnAdapter = {
+    getVisibleTurns: () => Array.from({ length: visibleCount }, (_, index) => ({
+      id: "chat-fast-" + index,
+      order: index,
+      orderTrust: "absolute"
+    })),
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  const nav = new NavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "chat-fast", source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true })
+    },
+    hydrationWaitMs: 1,
+    chatBoundaryHydrationWaitMs: 40
+  });
+
+  const result = await nav.hydrateEarlierHistory({
+    isCurrent: () => true,
+    maxSteps: 4,
+    maxBoundaryStalls: 1,
+    boundaryWaitMs: 40,
+    boundaryPollMs: 5
+  });
+
+  assert.equal(result.reason, "earlier-boundary-exhausted");
+  assert.ok(pollCount >= 2);
+  assert.deepEqual(delays.slice(0, 2), [5, 5]);
+  assert.equal(delays.includes(40), false);
+});
+
+test("Work history hydrator keeps sending Earlier wheel across lazy-loaded batches until the true top", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 240;
+  container.scrollHeight = 1040;
+  let physicalTop = -800;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; },
+    configurable: true
+  });
+  let batches = 0;
+  let visibleCount = 4;
+  const wheelDeltas = [];
+  const turnAdapter = {
+    getVisibleTurns: () => Array.from({ length: visibleCount }, (_, index) => ({ id: `work-history-${index}`, order: index })),
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  container.dispatchEvent = (event) => {
+    if (event?.type !== "wheel") return true;
+    wheelDeltas.push(event.deltaY);
+    const max = Math.max(0, Number(container.scrollHeight) - Number(container.clientHeight));
+    const logical = Math.max(0, Math.min(max, max + Number(physicalTop)));
+    if (event.deltaY < 0 && logical <= 24 && batches < 2) {
+      batches += 1;
+      visibleCount += 4;
+      container.scrollHeight += 400;
+    }
+    return true;
+  };
+  window.__codexThreadScrollHandlers = { markPointerIntent() {} };
+  const nav = new WorkNavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
+    },
+    workWheelStepPx: 240,
+    workWheelWaitMs: 1,
+    hydrationWaitMs: 4
+  });
+  assert.equal(nav.isEarlierBoundary(), true);
+  let progressEvents = 0;
+  const result = await nav.hydrateEarlierHistory({
+    maxSteps: 24,
+    maxBoundaryStalls: 2,
+    isCurrent: () => true,
+    onProgress: () => { progressEvents += 1; }
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.reason, "earlier-boundary-exhausted");
+  assert.equal(batches, 2);
+  assert.ok(progressEvents >= 2);
+  assert.ok(wheelDeltas.length >= 4);
+  assert.ok(wheelDeltas.every((delta) => delta < 0));
+});
+
+
+test("Work history hydrator can start away from the Earlier boundary after explicit intent", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 240;
+  container.scrollHeight = 1040;
+  let physicalTop = -400;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; },
+    configurable: true
+  });
+  let batches = 0;
+  const turnAdapter = {
+    getVisibleTurns: () => [{ id: "work-earliest", order: 0 }],
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  container.dispatchEvent = (event) => {
+    if (event?.type !== "wheel") return true;
+    const max = Math.max(0, Number(container.scrollHeight) - Number(container.clientHeight));
+    const logical = Math.max(0, Math.min(max, max + Number(physicalTop)));
+    if (event.deltaY < 0 && logical <= 24 && batches < 1) {
+      batches += 1;
+      container.scrollHeight += 400;
+    }
+    return true;
+  };
+  window.__codexThreadScrollHandlers = { markPointerIntent() {} };
+  const nav = new WorkNavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
+    },
+    workWheelStepPx: 240,
+    workWheelWaitMs: 1,
+    hydrationWaitMs: 4
+  });
+  assert.equal(nav.isEarlierBoundary(), false);
+  const result = await nav.hydrateEarlierHistory({ maxSteps: 16, maxBoundaryStalls: 2, isCurrent: () => true });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(batches, 1);
+  assert.equal(result.reason, "earlier-boundary-exhausted");
+});
+
+test("CodexDesktopHost protects the official Work scroll-to-bottom button from Codex++ restore rebound", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const host = new CodexDesktopHost({ document, window });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 800;
+  container.scrollHeight = 6400;
+  container.rect = { left: 240, right: 1240, top: 80, bottom: 760, width: 1000, height: 680 };
+  let physicalTop = -2800;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; },
+    configurable: true
+  });
+  host.conversation.getScrollContainer = () => container;
+  host.conversation.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  let intentCalls = 0;
+  let saveCalls = 0;
+  window.__codexThreadScrollHandlers = {
+    markPointerIntent() { intentCalls += 1; },
+    saveNow() { saveCalls += 1; }
+  };
+  const button = new FakeElement("button");
+  button.rect = { left: 720, right: 760, top: 650, bottom: 690, width: 40, height: 40 };
+  assert.equal(host.handleHostPointerDown({ target: button }), true);
+  physicalTop = 0;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(intentCalls, 1);
+  assert.equal(saveCalls, 1);
+
+  const sideButton = new FakeElement("button");
+  sideButton.rect = { left: 1100, right: 1140, top: 650, bottom: 690, width: 40, height: 40 };
+  assert.equal(host.handleHostPointerDown({ target: sideButton }), false);
+  assert.equal(intentCalls, 1);
+});
+
+
+test("Work Load Earlier stops after exactly one lazy-loaded history batch", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 240;
+  container.scrollHeight = 1040;
+  let physicalTop = -400;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; },
+    configurable: true
+  });
+  let batches = 0;
+  let visibleCount = 4;
+  const turnAdapter = {
+    getVisibleTurns: () => Array.from({ length: visibleCount }, (_, index) => ({ id: `work-batch-${index}`, order: index })),
+    resolveTurn: () => null,
+    verifyTurnElement: () => false
+  };
+  container.dispatchEvent = (event) => {
+    if (event?.type !== "wheel") return true;
+    const max = Math.max(0, Number(container.scrollHeight) - Number(container.clientHeight));
+    const logical = Math.max(0, Math.min(max, max + Number(physicalTop)));
+    if (event.deltaY < 0 && logical <= 24 && batches < 2) {
+      batches += 1;
+      visibleCount += 4;
+      container.scrollHeight += 400;
+    }
+    return true;
+  };
+  window.__codexThreadScrollHandlers = { markPointerIntent() {} };
+  const nav = new WorkNavigationAdapter({
+    window,
+    turnAdapter,
+    conversationAdapter: {
+      getScrollContainer: () => container,
+      getConversationIdentity: () => ({ id: "local:test", source: "sidebar-local", host: "local", kind: "local", stable: true })
+    },
+    workWheelStepPx: 240,
+    workWheelWaitMs: 1,
+    hydrationWaitMs: 4
+  });
+  const result = await nav.hydrateEarlierHistory({
+    maxSteps: 24,
+    maxBoundaryStalls: 2,
+    stopAfterBatch: true,
+    isCurrent: () => true
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.reason, "earlier-batch-loaded");
+  assert.equal(batches, 1);
+});
+
+test("CodexDesktopHost snaps a near-tail official Work bottom jump to the exact physical tail before saving", async () => {
+  const document = new FakeDocument();
+  const window = fakeWindow(document);
+  window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
+  const host = new CodexDesktopHost({ document, window });
+  const container = new FakeElement();
+  container.isConnected = true;
+  container.clientHeight = 800;
+  container.scrollHeight = 6400;
+  container.rect = { left: 240, right: 1240, top: 80, bottom: 760, width: 1000, height: 680 };
+  let physicalTop = -2800;
+  Object.defineProperty(container, "scrollTop", {
+    get: () => physicalTop,
+    set: (value) => { physicalTop = value; },
+    configurable: true
+  });
+  host.conversation.getScrollContainer = () => container;
+  host.conversation.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
+  let intentCalls = 0;
+  let saveCalls = 0;
+  window.__codexThreadScrollHandlers = {
+    markPointerIntent() { intentCalls += 1; },
+    saveNow() { saveCalls += 1; }
+  };
+  const button = new FakeElement("button");
+  button.rect = { left: 720, right: 760, top: 650, bottom: 690, width: 40, height: 40 };
+  assert.equal(host.handleHostPointerDown({ target: button }), true);
+  setTimeout(() => { physicalTop = -24; }, 20);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(intentCalls, 1);
+  assert.equal(physicalTop, 0);
+  assert.equal(saveCalls, 1);
 });

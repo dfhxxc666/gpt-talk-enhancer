@@ -255,6 +255,17 @@ class TurnIndex {
     return this.getOrdered();
   }
 
+  replaceDomSnapshot(records = []) {
+    const existing = [...this.records.values()];
+    if (existing.some((record) => record.source !== "dom")) return false;
+    const next = (Array.isArray(records) ? records : []).filter((record) => record?.id);
+    if (!next.length) return false;
+    this.records.clear();
+    this.aliases.clear();
+    this.mergeMany(next.map((record) => ({ ...record, source: "dom" })));
+    return true;
+  }
+
   setVisible(visibleRecords = []) {
     for (const record of this.records.values()) record.visible = false;
     for (const record of visibleRecords) {
@@ -265,6 +276,62 @@ class TurnIndex {
       this.upsert({ ...record, id: canonicalId, source: "dom", visible: true });
     }
     this.reconcileLegacyAliases(visibleRecords);
+  }
+
+  reassignDomOrders(assignments = []) {
+    const normalized = [];
+    const ids = new Set();
+    const orders = new Set();
+    for (const assignment of Array.isArray(assignments) ? assignments : []) {
+      const id = String(assignment?.id ?? "").trim();
+      const order = Number(assignment?.order);
+      if (!id || !Number.isFinite(order) || order < 0 || ids.has(id) || orders.has(order)) return false;
+      const record = this.records.get(id);
+      if (!record || record.source !== "dom") return false;
+      ids.add(id);
+      orders.add(order);
+      normalized.push({ record, order });
+    }
+    if (normalized.length < 2) return false;
+    for (const { record, order } of normalized) record.order = order;
+    return true;
+  }
+
+  setAlias(aliasId, canonicalId) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical) return false;
+    this.aliases.set(alias, canonical);
+    return true;
+  }
+
+  replaceLegacyAnchor(aliasId, canonicalId) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical) return false;
+    const record = this.records.get(alias);
+    if (!record || record.source?.includes("capture")) return false;
+    const selfOrder = legacyTurnOrder(alias) ?? fallbackOrder(alias);
+    if (selfOrder === null || Number(record.order) !== selfOrder) return false;
+    const existing = this.records.get(canonical);
+    if (existing && Number(existing.order) !== selfOrder) return false;
+    this.aliases.set(alias, canonical);
+    this.records.delete(alias);
+    return true;
+  }
+  replaceStaleDomAnchor(aliasId, canonicalId, { order = null, text = "" } = {}) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical || !Number.isFinite(order)) return false;
+    const record = this.records.get(alias);
+    if (!record || record.source !== "dom" || Number(record.order) !== Number(order)) return false;
+    const expectedText = cleanText(text);
+    if (!expectedText || cleanText(record.text) !== expectedText) return false;
+    const existing = this.records.get(canonical);
+    if (existing && (Number(existing.order) !== Number(order) || cleanText(existing.text) !== expectedText)) return false;
+    this.aliases.set(alias, canonical);
+    this.records.delete(alias);
+    return true;
   }
 
   resolveCanonicalId(id) {
@@ -322,7 +389,7 @@ class TurnIndex {
     }
 
     for (const [legacyId, legacyRecord] of [...this.records.entries()]) {
-      const legacyOrder = legacyTurnOrder(legacyId);
+      const legacyOrder = legacyTurnOrder(legacyId) ?? fallbackOrder(legacyId);
       if (legacyOrder === null || Number(legacyRecord.order) !== legacyOrder) continue;
       const stableId = stableByOrder.get(legacyOrder);
       if (!stableId || stableId === legacyId) continue;
@@ -655,6 +722,168 @@ class TimelineCache {
     const entry = root.conversations[id];
     if (!entry || !Array.isArray(entry.turns)) return [];
     const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
+    if (hasDuplicateOrders(turns)) {
+      this.signatures.delete(id);
+      return trustedOrderAnchors(turns);
+    }
+    this.signatures.set(id, turnSignature(turns));
+    return turns;
+  }
+
+  save(conversationId, turns = []) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return false;
+    const normalized = normalizeTurns(turns, this.maxTurnsPerConversation);
+    if (hasDuplicateOrders(normalized)) return false;
+    const signature = turnSignature(normalized);
+    if (this.signatures.get(id) === signature) return false;
+
+    const root = this.#readRoot();
+    root.conversations[id] = {
+      conversationId: id,
+      updatedAt: this.clock(),
+      turns: normalized
+    };
+    root.conversations = pruneConversations(root.conversations, this.maxConversations);
+    const saved = Boolean(this.storage?.write?.(this.key, root));
+    if (saved) this.signatures.set(id, signature);
+    return saved;
+  }
+
+  getStats() {
+    const root = this.#readRoot();
+    const entries = Object.values(root.conversations);
+    return {
+      schemaVersion: TIMELINE_CACHE_SCHEMA_VERSION,
+      conversations: entries.length,
+      turns: entries.reduce((total, entry) => total + (Array.isArray(entry?.turns) ? entry.turns.length : 0), 0)
+    };
+  }
+
+  listConversations() {
+    const root = this.#readRoot();
+    return Object.values(root.conversations)
+      .filter((entry) => entry && normalizeConversationId(entry.conversationId))
+      .map((entry) => ({
+        conversationId: normalizeConversationId(entry.conversationId),
+        updatedAt: Number(entry.updatedAt) || 0,
+        turns: normalizeTurns(entry.turns, this.maxTurnsPerConversation)
+      }))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  #readRoot() {
+    const value = this.storage?.read?.(this.key, null);
+    if (!value || value.schemaVersion !== TIMELINE_CACHE_SCHEMA_VERSION || !isPlainObject(value.conversations)) {
+      return { schemaVersion: TIMELINE_CACHE_SCHEMA_VERSION, conversations: {} };
+    }
+    return { schemaVersion: TIMELINE_CACHE_SCHEMA_VERSION, conversations: { ...value.conversations } };
+  }
+}
+
+function normalizeCachedTurn(input = {}) {
+  if (!input?.id) return null;
+  return {
+    id: String(input.id),
+    order: Number.isFinite(input.order) ? Number(input.order) : 0,
+    text: normalizeWhitespace(input.text),
+    shortText: normalizeWhitespace(input.shortText ?? input.text),
+    type: String(input.type ?? "text"),
+    lastSeen: Number.isFinite(input.lastSeen) ? Number(input.lastSeen) : 0
+  };
+}
+
+function normalizeTurns(turns, limit) {
+  const byId = new Map();
+  for (const turn of Array.isArray(turns) ? turns : []) {
+    const normalized = normalizeCachedTurn(turn);
+    if (normalized) byId.set(normalized.id, normalized);
+  }
+  return [...byId.values()]
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
+    .slice(0, Math.max(0, Number(limit) || 0));
+}
+
+function hasDuplicateOrders(turns) {
+  const seen = new Set();
+  for (const turn of turns) {
+    if (!Number.isFinite(turn?.order)) continue;
+    const order = Number(turn.order);
+    if (seen.has(order)) return true;
+    seen.add(order);
+  }
+  return false;
+}
+
+function trustedOrderAnchors(turns) {
+  const byOrder = new Map();
+  for (const turn of turns) {
+    const order = trustedOrderFromId(turn?.id);
+    if (order === null || Number(turn?.order) !== order) continue;
+    const current = byOrder.get(order);
+    if (!current || /^fallback-turn-\d+$/.test(String(turn.id))) byOrder.set(order, turn);
+  }
+  return [...byOrder.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+}
+
+function trustedOrderFromId(id) {
+  const match = String(id ?? "").match(/^(?:fallback-turn|turn-index)-(\d+)$/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function turnSignature(turns) {
+  return turns.map((turn) => [turn.id, turn.order, turn.text, turn.shortText, turn.type].join("\u0000")).join("\u0001");
+}
+
+function pruneConversations(conversations, limit) {
+  const entries = Object.entries(conversations ?? {})
+    .filter(([, entry]) => entry && Array.isArray(entry.turns))
+    .sort((a, b) => Number(b[1].updatedAt || 0) - Number(a[1].updatedAt || 0))
+    .slice(0, Math.max(1, Number(limit) || 1));
+  return Object.fromEntries(entries);
+}
+
+function normalizeConversationId(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeWhitespace(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+Object.assign(exports, { TIMELINE_CACHE_KEY, TIMELINE_CACHE_SCHEMA_VERSION, TimelineCache, normalizeCachedTurn });
+
+},
+"src/v3/core/work-timeline-cache.js": (module, exports, __require) => {
+const WORK_TIMELINE_CACHE_KEY = "gpt-talk-enhancer.timeline-cache.work.v1";
+const TIMELINE_CACHE_SCHEMA_VERSION = 1;
+
+class WorkTimelineCache {
+  constructor({
+    storage,
+    key = WORK_TIMELINE_CACHE_KEY,
+    clock = () => Date.now(),
+    maxConversations = 80,
+    maxTurnsPerConversation = 1000
+  } = {}) {
+    this.storage = storage;
+    this.key = key;
+    this.clock = clock;
+    this.maxConversations = maxConversations;
+    this.maxTurnsPerConversation = maxTurnsPerConversation;
+    this.signatures = new Map();
+  }
+
+  load(conversationId) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return [];
+    const root = this.#readRoot();
+    const entry = root.conversations[id];
+    if (!entry || !Array.isArray(entry.turns)) return [];
+    const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
     this.signatures.set(id, turnSignature(turns));
     return turns;
   }
@@ -743,7 +972,77 @@ function normalizeWhitespace(value) {
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
-Object.assign(exports, { TIMELINE_CACHE_KEY, TIMELINE_CACHE_SCHEMA_VERSION, TimelineCache, normalizeCachedTurn });
+Object.assign(exports, { WORK_TIMELINE_CACHE_KEY, TIMELINE_CACHE_SCHEMA_VERSION, WorkTimelineCache, normalizeCachedTurn });
+
+},
+"src/v3/core/question-display.js": (module, exports, __require) => {
+const REQUEST_LABEL = /^(?:my request|request|\u6211\u7684\u8bf7\u6c42|\u6211\u7684\u95ee\u9898)$/i;
+const WRAPPER_LABEL = /^(?:selected text|selection\s+\d+)$/i;
+
+function normalizeQuestionDisplayText(value) {
+  const raw = String(value ?? "").replace(/\r\n?/g, "\n").trim();
+  if (!raw) return "";
+
+  const request = extractRequestSection(raw);
+  const candidate = request || stripWrapperLabels(raw);
+  const cleaned = cleanMarkdownNoise(candidate);
+  if (cleaned) return cleaned;
+
+  return collapseWhitespace(stripWrapperLabels(raw)) || collapseWhitespace(raw);
+}
+
+function extractRequestSection(value) {
+  const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
+  let matchIndex = -1;
+  let inline = "";
+  for (let index = 0; index < lines.length; index += 1) {
+    const parsed = parseLabelLine(lines[index]);
+    if (!parsed || !REQUEST_LABEL.test(parsed.label)) continue;
+    matchIndex = index;
+    inline = parsed.rest;
+  }
+  if (matchIndex < 0) return "";
+  return [inline, ...lines.slice(matchIndex + 1)].filter(Boolean).join("\n").trim();
+}
+
+function stripWrapperLabels(value) {
+  return String(value ?? "")
+    .split("\n")
+    .filter((line) => {
+      const parsed = parseLabelLine(line);
+      if (parsed && WRAPPER_LABEL.test(parsed.label)) return false;
+      const heading = String(line ?? "").match(/^\s*#{1,6}\s+(.+?)\s*$/);
+      return !(heading && WRAPPER_LABEL.test(heading[1].trim()));
+    })
+    .join("\n");
+}
+
+function parseLabelLine(line) {
+  const match = String(line ?? "").match(/^\s*(?:#{1,6}\s*)?([^:\uFF1A]+)[:\uFF1A]\s*(.*)$/);
+  if (!match) return null;
+  return { label: match[1].trim(), rest: match[2].trim() };
+}
+
+function cleanMarkdownNoise(value) {
+  return collapseWhitespace(
+    String(value ?? "")
+      .replace(/```[\s\S]*?```/g, " [code] ")
+      .replace(/~~~[\s\S]*?~~~/g, " [code] ")
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+      .replace(/\[([^\]]+)\]\((?:https?:\/\/|www\.)[^)]+\)/gi, "$1")
+      .replace(/https?:\/\/\S+/gi, " ")
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+      .replace(/^\s*>\s?/gm, "")
+      .replace(/^\s*[-*+]\s+/gm, "")
+      .replace(/^\s*\d+[.)]\s+/gm, "")
+      .replace(/`([^`]+)`/g, "$1")
+  );
+}
+
+function collapseWhitespace(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+Object.assign(exports, { normalizeQuestionDisplayText, extractRequestSection });
 
 },
 "src/v3/host/host-interface.js": (module, exports, __require) => {
@@ -802,13 +1101,27 @@ class ConversationAdapter {
   constructor({ document, window } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
+    this.inferredChatConversationId = null;
   }
 
   getConversationId() {
     return this.getConversationIdentity()?.id ?? null;
   }
 
-  getConversationIdentity() {
+  setInferredChatConversationId(value) {
+    const raw = String(value ?? "").trim();
+    const id = raw && !raw.startsWith("local:") ? parseSidebarConversationKey(raw) : raw;
+    this.inferredChatConversationId = id || null;
+    return Boolean(this.inferredChatConversationId);
+  }
+
+  clearInferredChatConversationId() {
+    const changed = Boolean(this.inferredChatConversationId);
+    this.inferredChatConversationId = null;
+    return changed;
+  }
+
+  getDirectConversationIdentity() {
     const pathname = String(this.window?.location?.pathname ?? "");
     const routeMatch = pathname.match(/\/(?:c|conversation|chat)\/([^/?#]+)/i);
     if (routeMatch?.[1]) {
@@ -835,6 +1148,21 @@ class ConversationAdapter {
     return explicitId
       ? { id: String(explicitId), source: "dom-explicit", host: null, kind: null, stable: false }
       : null;
+  }
+
+  getConversationIdentity() {
+    const direct = this.getDirectConversationIdentity();
+    if (direct?.stable) return direct;
+    if (this.inferredChatConversationId && this.hasVisibleConversationContent()) {
+      return {
+        id: this.inferredChatConversationId,
+        source: "inferred-visible-chat",
+        host: "chatgpt",
+        kind: "conversation",
+        stable: true
+      };
+    }
+    return direct;
   }
 
   getSelectedLocalThreadRow() {
@@ -915,6 +1243,221 @@ const TURN_ID_ATTRIBUTES = [
 ];
 
 const USER_SELECTORS = [
+  "[data-turn='user']",
+"[data-message-author-role='user']",
+  "[data-testid='user-message']",
+  "[data-user-message-bubble='true']",
+  "[data-markdown-text-tone='user-message']",
+  "[data-message-author='user']"
+];
+
+const FALLBACK_MEDIA_SELECTORS = TURN_ID_ATTRIBUTES.map((attribute) => `[${attribute}^='fallback-turn-']`);
+const FALLBACK_MEDIA_CONTENT_SELECTORS = [
+  "img",
+  "[data-testid*='file']",
+  "[data-file]",
+  "[data-attachment]",
+  "[aria-label*='file' i]",
+  "[aria-label*='image' i]"
+];
+
+const TURN_GEOMETRY_SELECTORS = [
+  "[data-turn='user']",
+"[data-local-conversation-user-anchor='true']",
+  "[data-user-message-bubble='true']",
+  "[data-message-author-role='user']",
+  "[data-testid='user-message']",
+  "[data-markdown-text-tone='user-message']",
+  "[data-message-author='user']"
+];
+
+class TurnAdapter {
+  constructor({ document, clock = () => Date.now() } = {}) {
+    this.document = document ?? globalThis.document;
+    this.clock = clock;
+  }
+
+  getVisibleTurns() {
+    const seen = new Set();
+    const candidates = [];
+    for (const selector of USER_SELECTORS) {
+      for (const message of this.document?.querySelectorAll?.(selector) ?? []) {
+        const container = this.getTurnContainer(message);
+        const id = this.getTurnId(container) ?? this.getTurnId(message);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        candidates.push({ id, message, container, placeholderText: null, discoveryOrder: candidates.length });
+      }
+    }
+    for (const selector of FALLBACK_MEDIA_SELECTORS) {
+      for (const container of this.document?.querySelectorAll?.(selector) ?? []) {
+        const id = this.getTurnId(container);
+        if (!id || seen.has(id) || !/^fallback-turn-\d+$/.test(String(id))) continue;
+        if (!hasFallbackMediaContent(container)) continue;
+        seen.add(id);
+        candidates.push({ id, message: null, container, placeholderText: "[图片或文件]", discoveryOrder: candidates.length });
+      }
+    }
+    candidates.sort(compareDomCandidateOrder);
+    const visualOrderById = rankCandidatesByVisualTop(candidates, (candidate) => {
+      const target = this.getTurnGeometryElement(candidate?.message ?? candidate?.container ?? null);
+      return target?.getBoundingClientRect?.() ?? null;
+    });
+    const turns = [];
+    for (let windowOrder = 0; windowOrder < candidates.length; windowOrder += 1) {
+      const { id, message, container, placeholderText } = candidates[windowOrder];
+      const orderInfo = this.getTurnOrderInfo(container, windowOrder);
+      turns.push({
+        id,
+        order: orderInfo.order,
+        orderTrust: orderInfo.trust,
+        windowOrder,
+        visualOrder: visualOrderById.get(String(id)) ?? null,
+        text: placeholderText ?? this.readTurnText(message, container),
+        type: "text",
+        source: "dom",
+        lastSeen: this.clock(),
+        visible: true
+      });
+    }
+    return turns.sort((a, b) => a.order - b.order);
+  }
+
+  resolveTurn(turnId) {
+    if (!turnId) return null;
+    const escaped = cssEscape(String(turnId));
+    for (const attribute of TURN_ID_ATTRIBUTES) {
+      const elements = this.document?.querySelectorAll?.(`[${attribute}="${escaped}"]`) ?? [];
+      for (const element of elements) {
+        const candidate = this.getTurnGeometryElement(element);
+        if (candidate && this.verifyTurnElement(turnId, candidate)) return candidate;
+      }
+    }
+    return null;
+  }
+
+  getTurnGeometryElement(element) {
+    if (!element) return null;
+    if (hasUsableRect(element.getBoundingClientRect?.())) return element;
+    for (const selector of TURN_GEOMETRY_SELECTORS) {
+      const candidate = element.querySelector?.(selector);
+      if (candidate && hasUsableRect(candidate.getBoundingClientRect?.())) return candidate;
+    }
+    return element;
+  }
+
+  verifyTurnElement(turnId, element) {
+    return Boolean(element && this.getTurnId(element) === String(turnId));
+  }
+
+  getTurnContainer(element) {
+    if (!element?.closest) return element ?? null;
+    for (const attribute of TURN_ID_ATTRIBUTES) {
+      const found = element.closest(`[${attribute}]`);
+      if (found) return found;
+    }
+    return element.closest("article") ?? element;
+  }
+
+  getTurnId(element) {
+    if (!element?.getAttribute) return null;
+    for (const attribute of TURN_ID_ATTRIBUTES) {
+      const value = element.getAttribute(attribute);
+      if (value) return String(value);
+    }
+    if (!element.closest) return null;
+    for (const attribute of TURN_ID_ATTRIBUTES) {
+      const owner = element.closest(`[${attribute}]`);
+      const value = owner?.getAttribute?.(attribute);
+      if (value) return String(value);
+    }
+    return null;
+  }
+
+  getTurnOrder(element, fallback = 0) {
+    return this.getTurnOrderInfo(element, fallback).order;
+  }
+
+  getTurnOrderInfo(element, fallback = 0) {
+    const fallbackId = this.getTurnId(element);
+    const fallbackMatch = String(fallbackId ?? "").match(/^fallback-turn-(\d+)$/);
+    if (fallbackMatch) return { order: Number.parseInt(fallbackMatch[1], 10), trust: "absolute" };
+    for (const attribute of ["data-turn-index", "data-message-index", "aria-posinset"]) {
+      const value = Number.parseInt(element?.getAttribute?.(attribute) ?? "", 10);
+      if (Number.isFinite(value)) return { order: value, trust: "absolute" };
+    }
+    return { order: fallback, trust: "window" };
+  }
+
+  readTurnText(message, container) {
+    const target = message ?? container;
+    const text = String(target?.innerText ?? target?.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (text) return text;
+    if (Number(target?.childElementCount) > 0 || Number(container?.childElementCount) > 0) return "[图片或文件]";
+    return "";
+  }
+}
+
+
+function hasFallbackMediaContent(container) {
+  for (const selector of FALLBACK_MEDIA_CONTENT_SELECTORS) {
+    try {
+      if (container?.querySelector?.(selector)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function rankCandidatesByVisualTop(candidates = [], readRect = () => null) {
+  if (!Array.isArray(candidates) || candidates.length < 2) return new Map();
+  const rows = candidates.map((candidate, index) => {
+    const rect = readRect(candidate);
+    const top = Number(rect?.top);
+    return { id: String(candidate?.id ?? ""), top, index };
+  });
+  if (rows.some((row) => !row.id || !Number.isFinite(row.top))) return new Map();
+  const distinct = new Set(rows.map((row) => row.top));
+  if (distinct.size !== rows.length) return new Map();
+  rows.sort((a, b) => a.top - b.top || a.index - b.index);
+  return new Map(rows.map((row, visualOrder) => [row.id, visualOrder]));
+}
+
+function compareDomCandidateOrder(left, right) {
+  if (left === right) return 0;
+  const leftNode = left?.message ?? left?.container ?? null;
+  const rightNode = right?.message ?? right?.container ?? null;
+  try {
+    const relation = leftNode?.compareDocumentPosition?.(rightNode);
+    if (Number.isFinite(relation)) {
+      if (relation & 4) return -1;
+      if (relation & 2) return 1;
+    }
+  } catch {}
+  return Number(left?.discoveryOrder ?? 0) - Number(right?.discoveryOrder ?? 0);
+}
+function hasUsableRect(rect) {
+  return Boolean(rect && Number(rect.width) > 0 && Number(rect.height) > 0);
+}
+
+function cssEscape(value) {
+  if (globalThis.CSS?.escape) return globalThis.CSS.escape(value);
+  return String(value).replace(/[\\"\]\[]/g, "\\$&");
+}
+
+const TURN_ID_PRIORITY = Object.freeze([...TURN_ID_ATTRIBUTES]);
+
+Object.assign(exports, { TurnAdapter, cssEscape, TURN_ID_PRIORITY });
+
+},
+"src/v3/host/codex-desktop/work-turn-adapter.js": (module, exports, __require) => {
+const TURN_ID_ATTRIBUTES = [
+  "data-turn-id-container",
+  "data-turn-id",
+  "data-content-search-turn-key",
+  "data-turn-key"
+];
+
+const USER_SELECTORS = [
   "[data-message-author-role='user']",
   "[data-testid='user-message']",
   "[data-user-message-bubble='true']",
@@ -931,7 +1474,7 @@ const TURN_GEOMETRY_SELECTORS = [
   "[data-message-author='user']"
 ];
 
-class TurnAdapter {
+class WorkTurnAdapter {
   constructor({ document, clock = () => Date.now() } = {}) {
     this.document = document ?? globalThis.document;
     this.clock = clock;
@@ -1040,7 +1583,7 @@ function cssEscape(value) {
 
 const TURN_ID_PRIORITY = Object.freeze([...TURN_ID_ATTRIBUTES]);
 
-Object.assign(exports, { TurnAdapter, cssEscape, TURN_ID_PRIORITY });
+Object.assign(exports, { WorkTurnAdapter, cssEscape, TURN_ID_PRIORITY });
 
 },
 "src/v3/host/codex-desktop/composer-adapter.js": (module, exports, __require) => {
@@ -1426,7 +1969,6 @@ const { clamp, createScrollModel, scrollTopFromLogical } = __require("src/v3/cor
 
 const FALLBACK_TURN = /^fallback-turn-(\d+)$/;
 const NAVIGATION_TRACE_LIMIT = 16;
-const WORK_TAIL_BACKTRACK_MAX_STEPS = 32;
 const HYDRATION_ATTRIBUTES = [
   "data-turn-key",
   "data-content-search-turn-key",
@@ -1452,7 +1994,6 @@ class NavigationAdapter {
     chatMotionProgressWaitMs = 8,
     chatEarlierJumpScale = 1.35,
     chatBoundaryHydrationWaitMs = 1800,
-    chatFastPathWaitMs = 220,
     maxAlignFrames = 8,
     postSettleWaitMs = 160,
     mountedFastSettleWaitMs = 120,
@@ -1475,7 +2016,6 @@ class NavigationAdapter {
     this.chatMotionProgressWaitMs = chatMotionProgressWaitMs;
     this.chatEarlierJumpScale = Math.max(1, Number(chatEarlierJumpScale) || 1);
     this.chatBoundaryHydrationWaitMs = Math.max(this.hydrationWaitMs, Number(chatBoundaryHydrationWaitMs) || 0);
-    this.chatFastPathWaitMs = Math.max(0, Number(chatFastPathWaitMs) || 0);
     this.maxAlignFrames = maxAlignFrames;
     this.postSettleWaitMs = postSettleWaitMs;
     this.mountedFastSettleWaitMs = mountedFastSettleWaitMs;
@@ -1483,16 +2023,1246 @@ class NavigationAdapter {
     this.compatibility = createNavigationCompatibility();
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
     const steps = [];
-    const fastPath = { attempted: false, succeeded: false, fallbackReason: null };
-    const finish = (result) => ({
-      ...result,
-      fastAttempted: fastPath.attempted,
-      fastSucceeded: fastPath.succeeded,
-      fallbackReason: fastPath.fallbackReason,
-      steps: steps.slice()
+    const finish = (result) => ({ ...result, steps: steps.slice() });
+    const recordStep = (entry) => {
+      steps.push(entry);
+      if (steps.length > NAVIGATION_TRACE_LIMIT) steps.splice(0, steps.length - NAVIGATION_TRACE_LIMIT);
+      try { onTraceStep?.(entry, steps.slice()); } catch {}
+    };
+    if (!turnId) return finish(failure("missing-turn-id", turnId));
+    if (!isCurrent()) return finish(failure("superseded", turnId));
+    const readTurns = () => {
+      try {
+        const current = typeof getTurns === "function" ? getTurns() : turns;
+        return Array.isArray(current) ? current : turns;
+      } catch {
+        return turns;
+      }
+    };
+    const getIndexState = () => createNavigationIndex(turnId, readTurns());
+    let indexState = getIndexState();
+    if (indexState.targetIndex < 0) return finish(failure("unknown-turn", turnId));
+
+    const container = this.conversationAdapter.getScrollContainer();
+    if (!container) return finish(failure("missing-scroll-container", turnId));
+    const isNavigationCurrent = () => isCurrent() && this.conversationAdapter.getScrollContainer() === container;
+    if (!isNavigationCurrent()) return finish(failure("superseded", turnId));
+
+    this.compatibility = createNavigationCompatibility();
+    const startedAt = nowMs(this.window);
+    let lastProgressAt = startedAt;
+    let probes = 0;
+    let consecutiveStalls = 0;
+    let workCompatibilityNotified = false;
+    let chatBoundaryWaitAvailable = true;
+    let chatDirectionHint = null;
+    let snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+    let candidate = this.resolveCandidate(turnId, indexState.targetOrder);
+    const readTargetOrder = () => getIndexState().targetOrder;
+    const readMaxKnownOrder = () => getIndexState().maxKnownOrder;
+    if (candidate) {
+      lastProgressAt = nowMs(this.window);
+      const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder, {
+        mountedFastSettle: Boolean(allowMountedFastSettle)
+      });
+      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+      indexState = getIndexState();
+      snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+    }
+
+    const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
+
+    while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
+      && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
+      const loopNow = nowMs(this.window);
+      if (loopNow - lastProgressAt >= this.inactivityNavigationMs) {
+        return finish(this.navigationFailure("navigation-inactive", turnId, {
+          probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
+          inactiveMs: Math.round(loopNow - lastProgressAt)
+        }));
+      }
+      if (!isNavigationCurrent()) return finish(failure("superseded", turnId));
+
+      const refreshedIndex = getIndexState();
+      if (refreshedIndex.targetIndex < 0) return finish(failure("unknown-turn", turnId));
+      if (refreshedIndex.signature !== indexState.signature) {
+        indexState = refreshedIndex;
+        snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+        consecutiveStalls = 0;
+        lastProgressAt = nowMs(this.window);
+      } else {
+        indexState = refreshedIndex;
+      }
+      const { targetOrder, orderById, maxKnownOrder } = indexState;
+
+      candidate = this.resolveCandidate(turnId, targetOrder);
+      if (candidate) {
+        lastProgressAt = nowMs(this.window);
+        const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+        consecutiveStalls = 0;
+        indexState = getIndexState();
+        snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+        continue;
+      }
+
+      const model = readScrollModel(container, this.window);
+      const visibleOrders = this.readVisibleOrders(orderById);
+      const currentSnapshot = this.readHydrationSnapshot(container, targetOrder, orderById);
+      let direction = chooseHydrationDirection(targetOrder, visibleOrders, model);
+      if (conversationIdentity?.host === "chatgpt") {
+        if (visibleOrders.length === 0 && (chatDirectionHint === -1 || chatDirectionHint === 1)) {
+          direction = chatDirectionHint;
+        } else if (direction === -1 || direction === 1) {
+          chatDirectionHint = direction;
+        }
+      }
+      if (hasHydrationProgress(targetOrder, snapshot, currentSnapshot, direction)) {
+        consecutiveStalls = 0;
+        lastProgressAt = nowMs(this.window);
+      }
+      snapshot = currentSnapshot;
+
+      const targetBeforeVisible = visibleOrders.length > 0
+        ? targetOrder < visibleOrders[0]
+        : conversationIdentity?.host === "chatgpt" && direction < 0 && chatDirectionHint === -1;
+      const localWorkEarlier = conversationIdentity?.host === "local"
+        && conversationIdentity?.source === "sidebar-local"
+        && model.isColumnReverse
+        && direction < 0
+        && targetBeforeVisible;
+
+      if (localWorkEarlier) {
+        if (!workCompatibilityNotified) {
+          workCompatibilityNotified = true;
+          this.notifyCodexPlusScrollIntent(container, isNavigationCurrent);
+        }
+        const stepStartedAt = nowMs(this.window);
+        const outcome = await this.performWorkWheelHydrationStep({
+          turnId,
+          targetOrder,
+          previousSnapshot: currentSnapshot,
+          container,
+          isCurrent: isNavigationCurrent,
+          orderById,
+          turnCount: indexState.turns.length,
+          getIndexState
+        });
+        recordStep(createNavigationTraceStep({
+          mode: "work-wheel",
+          direction: -1,
+          elapsedMs: nowMs(this.window) - stepStartedAt,
+          jumpPx: outcome.step,
+          waitMs: outcome.waitMs,
+          targetOrder,
+          before: currentSnapshot,
+          after: outcome.snapshot,
+          outcome
+        }));
+        if (outcome.state === "superseded") return finish(failure("superseded", turnId));
+        probes += outcome.moved ? 1 : 0;
+        const nextIndex = getIndexState();
+        if (nextIndex.signature !== indexState.signature) {
+          lastProgressAt = nowMs(this.window);
+          consecutiveStalls = 0;
+        }
+        indexState = nextIndex;
+        snapshot = outcome.snapshot ?? this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+        if (outcome.candidate) {
+          lastProgressAt = nowMs(this.window);
+          const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+          consecutiveStalls = 0;
+          indexState = getIndexState();
+          snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+          continue;
+        }
+        if (outcome.progressed || outcome.moved) {
+          consecutiveStalls = 0;
+          lastProgressAt = nowMs(this.window);
+          continue;
+        }
+        return finish(this.navigationFailure("work-wheel-stalled", turnId, {
+          probes, stalls: 1, container, startedAt, getIndexState
+        }));
+      }
+
+      const computedJump = hydrationStepSize(model, visibleOrders, targetOrder);
+      const nudgeScale = consecutiveStalls > 0 ? 0.42 : 1;
+      const hostJumpScale = hydrationJumpScale({
+        host: conversationIdentity?.host,
+        direction,
+        targetBeforeVisible,
+        targetDistance: currentSnapshot.targetDistance,
+        chatEarlierJumpScale: this.chatEarlierJumpScale
+      });
+      const baseJump = computedJump * nudgeScale * hostJumpScale;
+      const coalescedJump = chatFarCoalescedJump({
+        baseJump,
+        host: conversationIdentity?.host,
+        direction,
+        targetBeforeVisible,
+        targetDistance: currentSnapshot.targetDistance,
+        logicalPosition: model.logicalPosition,
+        minLogicalPosition: model.minLogicalPosition,
+        stalled: consecutiveStalls > 0
+      });
+      const jump = Math.max(
+        Math.min(coalescedJump.jumpPx, model.maxLogicalPosition || computedJump),
+        Math.min(180, model.clientHeight || 180)
+      );
+      const regularNextLogical = clamp(
+        model.logicalPosition + direction * jump,
+        model.minLogicalPosition,
+        model.maxLogicalPosition
+      );
+      const endpointLogical = model.isColumnReverse && targetOrder === maxKnownOrder && direction > 0
+        ? model.maxLogicalPosition
+        : null;
+      const nextLogical = endpointLogical == null ? regularNextLogical : endpointLogical;
+      const remainingJumpPx = Math.abs(nextLogical - model.logicalPosition);
+      const moved = remainingJumpPx >= 1;
+      const chatEarlierBoundary = chatBoundaryWaitAvailable
+        && conversationIdentity?.host === "chatgpt"
+        && direction < 0
+        && targetBeforeVisible
+        && nextLogical <= model.minLogicalPosition + 1
+        && remainingJumpPx <= 1;
+      const motionWaitMs = conversationIdentity?.host === "chatgpt" ? this.chatMotionProgressWaitMs : this.motionProgressWaitMs;
+      const stepWaitMs = chatEarlierBoundary ? this.chatBoundaryHydrationWaitMs : this.hydrationWaitMs;
+      const stepStartedAt = nowMs(this.window);
+      const outcome = await this.awaitHydrationProgress({
+        turnId,
+        targetOrder,
+        previousSnapshot: currentSnapshot,
+        direction,
+        container,
+        isCurrent: isNavigationCurrent,
+        orderById,
+        getIndexState,
+        waitMs: stepWaitMs,
+        allowMotionProgress: !chatEarlierBoundary,
+        motionProgressWaitMs: motionWaitMs,
+        scrollAction: moved ? () => setLogicalScrollPosition(container, nextLogical, model) : null
+      });
+      if (chatEarlierBoundary) {
+        chatBoundaryWaitAvailable = Boolean(outcome.candidate || outcome.progressed);
+      }
+      recordStep(createNavigationTraceStep({
+        mode: chatEarlierBoundary ? "chat-boundary" : coalescedJump.coalesced ? "chat-coalesced" : conversationIdentity?.host === "chatgpt" ? "chat-progressive" : "regular-progressive",
+        direction,
+        elapsedMs: nowMs(this.window) - stepStartedAt,
+        jumpPx: remainingJumpPx,
+        waitMs: chatEarlierBoundary ? stepWaitMs : motionWaitMs,
+        targetOrder,
+        before: currentSnapshot,
+        after: outcome.snapshot,
+        outcome
+      }));
+      if (outcome.state === "superseded") return finish(failure("superseded", turnId));
+      probes += moved ? 1 : 0;
+      const nextIndex = getIndexState();
+      if (nextIndex.signature !== indexState.signature) {
+        lastProgressAt = nowMs(this.window);
+        consecutiveStalls = 0;
+      }
+      indexState = nextIndex;
+      snapshot = outcome.snapshot ?? this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+
+      if (outcome.candidate) {
+        lastProgressAt = nowMs(this.window);
+        const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+        if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+        consecutiveStalls = 0;
+        indexState = getIndexState();
+        snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
+        continue;
+      }
+      if (outcome.progressed) {
+        consecutiveStalls = 0;
+        lastProgressAt = nowMs(this.window);
+        continue;
+      }
+
+      consecutiveStalls += 1;
+      if (consecutiveStalls >= this.maxConsecutiveStalls) {
+        indexState = getIndexState();
+        candidate = this.resolveCandidate(turnId, indexState.targetOrder);
+        if (candidate) {
+          const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+          if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+        }
+        return finish(this.navigationFailure("hydration-stalled", turnId, {
+          probes, stalls: consecutiveStalls, container, startedAt, getIndexState
+        }));
+      }
+    }
+
+    indexState = getIndexState();
+    candidate = this.resolveCandidate(turnId, indexState.targetOrder);
+    if (candidate) {
+      const aligned = await this.verifyAndAlign(turnId, candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
+      if (aligned.ok || !retryableAlignmentFailure(aligned.reason)) return finish(aligned);
+    }
+    return finish(this.navigationFailure("navigation-hard-limit", turnId, {
+      probes, stalls: consecutiveStalls, container, startedAt, getIndexState,
+      budgetLimit: probes >= this.maxHydrationSteps && !allowFirstTurnProbeOverrun ? "probes" : "absolute-time"
+    }));
+  }
+
+  navigationFailure(reason, turnId, { probes = 0, stalls = 0, targetOrder = -1, orderById = null, container, startedAt, getIndexState = null, ...extra } = {}) {
+    const indexState = typeof getIndexState === "function" ? getIndexState() : null;
+    const currentTargetOrder = Number.isFinite(indexState?.targetOrder) ? Number(indexState.targetOrder) : targetOrder;
+    const currentOrderById = indexState?.orderById ?? orderById;
+    const latest = this.readHydrationSnapshot(container, currentTargetOrder, currentOrderById);
+    return {
+      ...failure(reason, turnId),
+      probes, stalls,
+      targetOrder: currentTargetOrder,
+      visibleRange: latest.visibleRange,
+      scrollHeight: latest.scrollHeight,
+      maxLogicalPosition: latest.maxLogicalPosition,
+      logicalPosition: latest.logicalPosition,
+      elapsedMs: Math.round(nowMs(this.window) - startedAt),
+      ...extra
+    };
+  }
+
+  async awaitHydrationProgress({ turnId, targetOrder, previousSnapshot, direction, container, isCurrent, orderById = null, getIndexState = null, waitMs = this.hydrationWaitMs, allowMotionProgress = true, motionProgressWaitMs = this.motionProgressWaitMs, scrollAction = null }) {
+    const initialIndex = typeof getIndexState === "function" ? getIndexState() : null;
+    const initialTargetOrder = Number.isFinite(initialIndex?.targetOrder) ? Number(initialIndex.targetOrder) : targetOrder;
+    const initialOrderById = initialIndex?.orderById ?? orderById;
+    const baselineSignature = initialIndex?.signature ?? null;
+    const baseline = previousSnapshot ?? this.readHydrationSnapshot(container, initialTargetOrder, initialOrderById);
+    const allowWindowChangeProgress = this.conversationAdapter.getConversationIdentity?.()?.host === "chatgpt";
+    let observer = null;
+    let timer = null;
+    let motionTimer = null;
+    let rafId = null;
+    let rafChecks = 0;
+    let settled = false;
+    let resolvePromise;
+    const promise = new Promise((resolve) => { resolvePromise = resolve; });
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try { observer?.disconnect?.(); } catch {}
+      if (timer != null) clearTimer(this.window, timer);
+      if (motionTimer != null) clearTimer(this.window, motionTimer);
+      if (rafId != null) this.window?.cancelAnimationFrame?.(rafId);
+      resolvePromise(value);
+    };
+    const readIndex = () => typeof getIndexState === "function" ? getIndexState() : null;
+    const readCurrentSnapshot = () => {
+      const indexState = readIndex();
+      const currentTargetOrder = Number.isFinite(indexState?.targetOrder) ? Number(indexState.targetOrder) : targetOrder;
+      const currentOrderById = indexState?.orderById ?? orderById;
+      return {
+        indexState,
+        targetOrder: currentTargetOrder,
+        snapshot: this.readHydrationSnapshot(container, currentTargetOrder, currentOrderById)
+      };
+    };
+    const evaluate = ({ allowMotionProgress = false } = {}) => {
+      if (settled) return true;
+      if (!isCurrent()) {
+        const current = readCurrentSnapshot();
+        finish({ state: "superseded", progressed: false, snapshot: current.snapshot });
+        return true;
+      }
+      const current = readCurrentSnapshot();
+      const candidate = this.resolveCandidate(turnId, current.targetOrder);
+      if (candidate) {
+        finish({ state: "target", progressed: true, candidate, snapshot: current.snapshot });
+        return true;
+      }
+      if (baselineSignature != null && current.indexState?.signature != null && current.indexState.signature !== baselineSignature) {
+        finish({ state: "progress", progressed: true, indexChanged: true, snapshot: current.snapshot });
+        return true;
+      }
+      if (allowWindowChangeProgress && hasVisibleWindowChanged(baseline, current.snapshot)) {
+        finish({ state: "progress", progressed: true, windowChanged: true, snapshot: current.snapshot });
+        return true;
+      }
+      if (hasHydrationProgress(current.targetOrder, baseline, current.snapshot, direction, { allowMotionProgress })) {
+        finish({ state: "progress", progressed: true, snapshot: current.snapshot });
+        return true;
+      }
+      return false;
+    };
+
+    const MutationObserverCtor = this.window?.MutationObserver;
+    if (typeof MutationObserverCtor === "function" && container) {
+      try {
+        observer = new MutationObserverCtor(() => {
+          evaluate({ allowMotionProgress: false });
+        });
+        observer.observe(container, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: HYDRATION_ATTRIBUTES
+        });
+      } catch {
+        observer = null;
+      }
+    }
+
+    const scheduleFrameCheck = () => {
+      if (settled || rafChecks >= 36 || typeof this.window?.requestAnimationFrame !== "function") return;
+      rafChecks += 1;
+      rafId = this.window.requestAnimationFrame(() => {
+        rafId = null;
+        if (!evaluate({ allowMotionProgress: false })) scheduleFrameCheck();
+      });
+    };
+
+    if (allowMotionProgress) {
+      motionTimer = setTimer(this.window, () => {
+        motionTimer = null;
+        evaluate({ allowMotionProgress: true });
+      }, motionProgressWaitMs);
+    }
+
+    timer = setTimer(this.window, () => {
+      if (evaluate({ allowMotionProgress })) return;
+      const current = readCurrentSnapshot();
+      finish({ state: "stalled", progressed: false, snapshot: current.snapshot });
+    }, Math.max(0, Number(waitMs) || 0));
+    if (!isCurrent()) {
+      const current = readCurrentSnapshot();
+      finish({ state: "superseded", progressed: false, snapshot: current.snapshot });
+      return promise;
+    }
+    try { scrollAction?.(); } catch {}
+    evaluate({ allowMotionProgress: false });
+    scheduleFrameCheck();
+    return promise;
+  }
+
+  async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, getIndexState = null }) {
+    if (!container || !isCurrent()) return { state: "superseded", progressed: false, moved: false };
+    const indexState = typeof getIndexState === "function" ? getIndexState() : null;
+    const currentTargetOrder = Number.isFinite(indexState?.targetOrder) ? Number(indexState.targetOrder) : targetOrder;
+    const currentOrderById = indexState?.orderById ?? orderById;
+    const currentTurnCount = Array.isArray(indexState?.turns) ? indexState.turns.length : turnCount;
+    const model = readScrollModel(container, this.window);
+    const viewport = Math.max(240, Number(model.clientHeight) || 737);
+    const configuredStep = Math.min(Math.max(240, Number(this.workWheelStepPx) || 720), viewport);
+    const step = workWheelStepSize({
+      configuredStep,
+      viewport,
+      turnCount: currentTurnCount,
+      targetDistance: previousSnapshot?.targetDistance,
+      logicalPosition: model.logicalPosition,
+      minLogicalPosition: model.minLogicalPosition
     });
+    const nextLogical = clamp(model.logicalPosition - step, model.minLogicalPosition, model.maxLogicalPosition);
+    const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
+    dispatchWheelEvent(container, this.window, -step);
+    const waitMs = moved ? this.workWheelWaitMs : this.hydrationWaitMs;
+    const outcome = await this.awaitHydrationProgress({
+      turnId,
+      targetOrder: currentTargetOrder,
+      previousSnapshot,
+      direction: -1,
+      container,
+      isCurrent,
+      orderById: currentOrderById,
+      getIndexState,
+      waitMs,
+      allowMotionProgress: false,
+      scrollAction: moved ? () => setLogicalScrollPosition(container, nextLogical, model) : null
+    });
+    return { ...outcome, moved, step, waitMs };
+  }
+
+  notifyCodexPlusScrollIntent(container, isCurrent = () => true) {
+    if (!container || !isCurrent()) {
+      this.compatibility = { ...createNavigationCompatibility(), status: "superseded" };
+      return false;
+    }
+    const handlers = this.window?.__codexThreadScrollHandlers;
+    const markPointerIntent = handlers?.markPointerIntent;
+    if (typeof markPointerIntent !== "function") {
+      this.compatibility = { ...createNavigationCompatibility(), status: "unavailable" };
+      return false;
+    }
+    try {
+      markPointerIntent.call(handlers, { target: container, type: "pointerdown" });
+      this.compatibility = { ...createNavigationCompatibility(), status: "available", notified: true };
+      return true;
+    } catch (error) {
+      this.compatibility = { ...createNavigationCompatibility(), status: "error", error: String(error?.message ?? error ?? "unknown") };
+      return false;
+    }
+  }
+
+  async hydrateEarlierHistory({
+    isCurrent = () => true,
+    onProgress = null,
+    maxSteps = 64,
+    maxBoundaryStalls = 3,
+    boundaryWaitMs = this.chatBoundaryHydrationWaitMs,
+    boundaryPollMs = 120
+  } = {}) {
+    const identity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    if (!identity?.stable || identity.host !== "chatgpt") {
+      return { ok: false, started: false, reason: "not-chat" };
+    }
+    const container = this.conversationAdapter.getScrollContainer?.();
+    if (!container || container.isConnected === false) {
+      return { ok: false, started: false, reason: "missing-scroll-container" };
+    }
+
+    let steps = 0;
+    let stalls = 0;
+    while (steps < Math.max(1, Number(maxSteps) || 1)
+      && stalls < Math.max(1, Number(maxBoundaryStalls) || 1)) {
+      if (!isCurrent() || this.conversationAdapter.getScrollContainer?.() !== container) {
+        return { ok: false, started: true, reason: "superseded", steps, stalls };
+      }
+
+      const model = readScrollModel(container, this.window);
+      const atEarlierBoundary = Math.abs(Number(model.logicalPosition) - Number(model.minLogicalPosition)) <= 1;
+      if (!atEarlierBoundary) {
+        setLogicalScrollPosition(container, model.minLogicalPosition, model);
+        await nextFrame(this.window);
+        await delay(this.window, Math.max(8, Math.min(120, Number(this.hydrationWaitMs) || 45)));
+        steps += 1;
+        try { onProgress?.({ steps, phase: "seek-boundary", snapshot: readChatHistorySnapshot(this.turnAdapter, container, this.window) }); } catch {}
+        continue;
+      }
+
+      const before = readChatHistorySnapshot(this.turnAdapter, container, this.window);
+      const waitLimit = Math.max(1, Number(boundaryWaitMs) || this.chatBoundaryHydrationWaitMs);
+      const poll = Math.max(1, Math.min(waitLimit, Number(boundaryPollMs) || 120));
+      const waitStartedAt = nowMs(this.window);
+      let after = before;
+      let changed = false;
+      while (nowMs(this.window) - waitStartedAt < waitLimit) {
+        await delay(this.window, Math.min(poll, Math.max(1, waitLimit - (nowMs(this.window) - waitStartedAt))));
+        await nextFrame(this.window);
+        if (!isCurrent()) return { ok: false, started: true, reason: "superseded", steps, stalls };
+        after = readChatHistorySnapshot(this.turnAdapter, container, this.window);
+        if (chatHistorySnapshotChanged(before, after)) {
+          changed = true;
+          break;
+        }
+      }
+      steps += 1;
+      if (changed) {
+        stalls = 0;
+        try { onProgress?.({ steps, phase: "history-batch", snapshot: after }); } catch {}
+      } else {
+        stalls += 1;
+      }
+    }
+
+    const snapshot = readChatHistorySnapshot(this.turnAdapter, container, this.window);
+    return {
+      ok: true,
+      started: true,
+      reason: stalls >= Math.max(1, Number(maxBoundaryStalls) || 1) ? "earlier-boundary-exhausted" : "step-limit",
+      steps,
+      stalls,
+      scrollHeight: snapshot.scrollHeight,
+      logicalPosition: snapshot.logicalPosition
+    };
+  }
+
+  async sweepLoadedChatHistory({
+    isCurrent = () => true,
+    onWindow = null,
+    maxSteps = 256,
+    stepRatio = 0.75,
+    settleWaitMs = 8
+  } = {}) {
+    const identity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    if ((!identity?.stable || identity.host !== "chatgpt") && !isCurrent()) {
+      return { ok: false, started: false, reason: "not-chat", steps: 0, windowCount: 0 };
+    }
+    const container = this.conversationAdapter.getScrollContainer?.();
+    if (!container || container.isConnected === false) {
+      return { ok: false, started: false, reason: "missing-scroll-container", steps: 0, windowCount: 0 };
+    }
+
+    const emitWindow = (phase) => {
+      const turns = this.turnAdapter.getVisibleTurns?.() ?? [];
+      const model = readScrollModel(container, this.window);
+      try {
+        onWindow?.({
+          phase,
+          turns,
+          logicalPosition: Number(model.logicalPosition) || 0,
+          maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+          clientHeight: Number(model.clientHeight) || 0
+        });
+      } catch {}
+      return { turns, model };
+    };
+
+    let model = readScrollModel(container, this.window);
+    setLogicalScrollPosition(container, model.minLogicalPosition, model);
+    await nextFrame(this.window);
+    if (settleWaitMs > 0) await delay(this.window, settleWaitMs);
+    if (!isCurrent() || this.conversationAdapter.getScrollContainer?.() !== container) {
+      return { ok: false, started: true, reason: "superseded", steps: 0, windowCount: 0 };
+    }
+
+    let windowCount = 0;
+    emitWindow("sweep-start");
+    windowCount += 1;
+    let steps = 0;
+    while (steps < Math.max(1, Number(maxSteps) || 1)) {
+      if (!isCurrent() || this.conversationAdapter.getScrollContainer?.() !== container) {
+        return { ok: false, started: true, reason: "superseded", steps, windowCount };
+      }
+      model = readScrollModel(container, this.window);
+      const remaining = Number(model.maxLogicalPosition) - Number(model.logicalPosition);
+      if (remaining <= 1) {
+        emitWindow("sweep-end");
+        windowCount += 1;
+        return {
+          ok: true,
+          started: true,
+          reason: "sweep-complete",
+          steps,
+          windowCount,
+          logicalPosition: Number(model.logicalPosition) || 0,
+          maxLogicalPosition: Number(model.maxLogicalPosition) || 0
+        };
+      }
+      const viewport = Math.max(1, Number(model.clientHeight) || 800);
+      const ratio = Math.max(0.25, Math.min(0.9, Number(stepRatio) || 0.75));
+      const stepPx = Math.max(120, viewport * ratio);
+      const nextLogical = Math.min(Number(model.maxLogicalPosition), Number(model.logicalPosition) + stepPx);
+      setLogicalScrollPosition(container, nextLogical, model);
+      await nextFrame(this.window);
+      if (settleWaitMs > 0) await delay(this.window, settleWaitMs);
+      if (!isCurrent() || this.conversationAdapter.getScrollContainer?.() !== container) {
+        return { ok: false, started: true, reason: "superseded", steps, windowCount };
+      }
+      emitWindow("sweep-step");
+      windowCount += 1;
+      steps += 1;
+    }
+
+    model = readScrollModel(container, this.window);
+    return {
+      ok: false,
+      started: true,
+      reason: "step-limit",
+      steps,
+      windowCount,
+      logicalPosition: Number(model.logicalPosition) || 0,
+      maxLogicalPosition: Number(model.maxLogicalPosition) || 0
+    };
+  }
+
+  getCompatibilityStatus() {
+    return { ...this.compatibility };
+  }
+
+  readVisibleOrders(orderById = null) {
+    const values = [];
+    const host = this.conversationAdapter.getConversationIdentity?.()?.host ?? null;
+    for (const turn of this.turnAdapter.getVisibleTurns?.() ?? []) {
+      const id = String(turn?.id ?? "");
+      const canonicalOrder = orderById?.get?.(id);
+      let order = null;
+      if (Number.isFinite(canonicalOrder)) {
+        order = Number(canonicalOrder);
+      } else if (host === "chatgpt" && turn?.orderTrust === "window") {
+        order = fallbackOrder(id);
+      } else {
+        order = Number.isFinite(turn?.order) ? Number(turn.order) : fallbackOrder(id);
+      }
+      if (Number.isFinite(order)) values.push(order);
+    }
+    return [...new Set(values)].sort((a, b) => a - b);
+  }
+
+  readVisibleWindowSignature() {
+    return (this.turnAdapter.getVisibleTurns?.() ?? [])
+      .map((turn) => String(turn?.id ?? "").trim())
+      .filter(Boolean)
+      .join("|");
+  }
+
+  readHydrationSnapshot(container, targetOrder, orderById = null) {
+    return {
+      ...createHydrationSnapshot(targetOrder, this.readVisibleOrders(orderById), readScrollModel(container, this.window)),
+      windowSignature: this.readVisibleWindowSignature()
+    };
+  }
+
+  resolveCandidate(turnId, targetOrder = -1) {
+    const direct = this.turnAdapter.resolveTurn(turnId);
+    if (direct && this.turnAdapter.verifyTurnElement(turnId, direct)) return { element: direct, domId: turnId };
+    if (!Number.isFinite(targetOrder) || targetOrder < 0) return null;
+    const fallbackId = `fallback-turn-${targetOrder}`;
+    if (fallbackId === turnId) return null;
+    const fallback = this.turnAdapter.resolveTurn(fallbackId);
+    if (fallback && this.turnAdapter.verifyTurnElement(fallbackId, fallback)) return { element: fallback, domId: fallbackId };
+    return null;
+  }
+
+  async verifyAndAlign(turnId, candidateOrElement, isCurrent, probes, targetOrder = -1, maxKnownOrder = null, options = {}) {
+    if (!isCurrent()) return failure("superseded", turnId);
+    const readTargetOrder = typeof targetOrder === "function" ? targetOrder : () => targetOrder;
+    const readMaxKnownOrder = typeof maxKnownOrder === "function" ? maxKnownOrder : () => maxKnownOrder;
+    let candidate = candidateOrElement?.element
+      ? candidateOrElement
+      : { element: candidateOrElement, domId: turnId };
+    if (!this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)) return failure("stale-or-recycled-dom", turnId);
+    const container = this.conversationAdapter.getScrollContainer();
+    if (!container) return failure("missing-scroll-container", turnId);
+
+    const alignCandidate = async () => {
+      for (let frame = 0; frame < this.maxAlignFrames; frame += 1) {
+        if (!isCurrent()) return failure("superseded", turnId);
+        candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+        if (!candidate?.element || !this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)) {
+          return failure("stale-or-recycled-dom", turnId);
+        }
+        const rect = candidate.element.getBoundingClientRect?.();
+        const containerRect = container.getBoundingClientRect?.();
+        if (!rect || !containerRect) break;
+        const activationLine = containerRect.top + this.activationOffset;
+        const delta = rect.top - activationLine;
+        if (Math.abs(delta) <= 5) break;
+        const model = readScrollModel(container, this.window);
+        const logicalTarget = clamp(
+          model.logicalPosition + delta,
+          model.minLogicalPosition,
+          model.maxLogicalPosition
+        );
+        if (Math.abs(logicalTarget - model.logicalPosition) < 1) break;
+        setLogicalScrollPosition(container, logicalTarget, model);
+        await nextFrame(this.window);
+      }
+      return null;
+    };
+
+    const firstAlignmentFailure = await alignCandidate();
+    if (firstAlignmentFailure) return firstAlignmentFailure;
+
+    if (options?.mountedFastSettle && this.mountedFastSettleWaitMs > 0) {
+      candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+      const fastRectBefore = candidate?.element?.getBoundingClientRect?.();
+      const fastContainerBefore = container.getBoundingClientRect?.();
+      const fastSnapshotBefore = readMountedSettleSnapshot(this.turnAdapter, container, this.window, fastRectBefore);
+      if (candidate?.element
+        && this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)
+        && fastRectBefore
+        && fastContainerBefore
+        && (rectInActivationZone(fastRectBefore, fastContainerBefore, this.activationOffset)
+          || isVerifiedTailEndpoint({
+            targetOrder: readTargetOrder(),
+            maxKnownOrder: readMaxKnownOrder(),
+            rect: fastRectBefore,
+            containerRect: fastContainerBefore,
+            model: readScrollModel(container, this.window)
+          }))) {
+        await delay(this.window, this.mountedFastSettleWaitMs);
+        await nextFrame(this.window);
+        if (!isCurrent()) return failure("superseded", turnId);
+        candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+        const fastRectAfter = candidate?.element?.getBoundingClientRect?.();
+        const fastContainerAfter = container.getBoundingClientRect?.();
+        const fastModelAfter = readScrollModel(container, this.window);
+        const fastSnapshotAfter = readMountedSettleSnapshot(this.turnAdapter, container, this.window, fastRectAfter);
+        if (candidate?.element
+          && this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)
+          && fastRectAfter
+          && fastContainerAfter
+          && mountedSettleSnapshotStable(fastSnapshotBefore, fastSnapshotAfter)) {
+          if (isVerifiedTailEndpoint({
+            targetOrder: readTargetOrder(),
+            maxKnownOrder: readMaxKnownOrder(),
+            rect: fastRectAfter,
+            containerRect: fastContainerAfter,
+            model: fastModelAfter
+          })) {
+            return {
+              ok: true, target: turnId, targetOrder: readTargetOrder(), verified: true, probes,
+              domId: candidate.domId, settleChecks: 1, settleMode: "mounted-fast", endpoint: "tail"
+            };
+          }
+          if (rectInActivationZone(fastRectAfter, fastContainerAfter, this.activationOffset)) {
+            return {
+              ok: true, target: turnId, targetOrder: readTargetOrder(), verified: true, probes,
+              domId: candidate.domId, settleChecks: 1, settleMode: "mounted-fast"
+            };
+          }
+        }
+      }
+    }
+
+    for (let settleCheck = 0; settleCheck <= this.maxPostSettleCorrections; settleCheck += 1) {
+      await nextFrame(this.window);
+      if (!isCurrent()) return failure("superseded", turnId);
+      candidate = this.resolveCandidate(turnId, readTargetOrder()) ?? candidate;
+      if (!candidate?.element || !this.turnAdapter.verifyTurnElement(candidate.domId, candidate.element)) {
+        return { ...failure("post-settle-target-lost", turnId), probes, settleChecks: settleCheck };
+      }
+      const rect = candidate.element.getBoundingClientRect?.();
+      const containerRect = container.getBoundingClientRect?.();
+      if (!rect || !containerRect) return { ...failure("verification-failed", turnId), probes };
+      const model = readScrollModel(container, this.window);
+      if (isVerifiedTailEndpoint({
+        targetOrder: readTargetOrder(),
+        maxKnownOrder: readMaxKnownOrder(),
+        rect,
+        containerRect,
+        model
+      })) {
+        return {
+          ok: true,
+          target: turnId,
+          targetOrder: readTargetOrder(),
+          verified: true,
+          probes,
+          domId: candidate.domId,
+          settleChecks: settleCheck + 1,
+          endpoint: "tail"
+        };
+      }
+      if (!rectInActivationZone(rect, containerRect, this.activationOffset)) {
+        if (settleCheck >= this.maxPostSettleCorrections) {
+          return { ...failure("post-settle-drift", turnId), probes, settleChecks: settleCheck + 1 };
+        }
+        const correctionFailure = await alignCandidate();
+        if (correctionFailure) return correctionFailure;
+      }
+      if (settleCheck < this.maxPostSettleCorrections && this.postSettleWaitMs > 0) {
+        await delay(this.window, this.postSettleWaitMs);
+        continue;
+      }
+      return {
+        ok: true,
+        target: turnId,
+        targetOrder: readTargetOrder(),
+        verified: true,
+        probes,
+        domId: candidate.domId,
+        settleChecks: settleCheck + 1
+      };
+    }
+
+    return { ...failure("post-settle-drift", turnId), probes };
+  }
+
+  async verifyAndCenter(...args) {
+    return this.verifyAndAlign(...args);
+  }
+}
+
+function createNavigationIndex(turnId, turns = []) {
+  const list = Array.isArray(turns) ? turns : [];
+  const targetIndex = list.findIndex((turn) => turn?.id === turnId);
+  const targetRecord = targetIndex >= 0 ? list[targetIndex] : null;
+  const targetOrder = Number.isFinite(targetRecord?.order) ? Number(targetRecord.order) : targetIndex;
+  const orderById = createTurnOrderMap(list);
+  const knownOrders = [...orderById.values()].filter(Number.isFinite).sort((a, b) => a - b);
+  const maxKnownOrder = knownOrders.at(-1) ?? null;
+  const signature = list.map((turn, index) => {
+    const order = Number.isFinite(turn?.order) ? Number(turn.order) : index;
+    return `${String(turn?.id ?? "")}:${order}`;
+  }).join("|");
+  return { turns: list, targetIndex, targetOrder, orderById, maxKnownOrder, signature };
+}
+
+function createTurnOrderMap(turns = []) {
+  const values = new Map();
+  for (const [index, turn] of turns.entries()) {
+    if (!turn?.id) continue;
+    const order = Number.isFinite(turn.order) ? Number(turn.order) : index;
+    values.set(String(turn.id), order);
+  }
+  return values;
+}
+
+function computeActiveTurnId({ visibleTurns = [], resolveTurn, container = null, activationOffset = 120 } = {}) {
+  const containerRect = container?.getBoundingClientRect?.() ?? { top: 0, bottom: Number.POSITIVE_INFINITY, height: 800 };
+  const activationLine = containerRect.top + activationOffset;
+  let crossed = null;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const turn of visibleTurns) {
+    const rect = resolveTurn?.(turn.id)?.getBoundingClientRect?.();
+    if (!rect || rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
+    const distance = Math.abs(rect.top - activationLine);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = turn.id;
+    }
+    if (rect.top <= activationLine && rect.bottom > activationLine) crossed = turn.id;
+  }
+  return crossed ?? nearest ?? null;
+}
+
+function isVerifiedTailEndpoint({ targetOrder, maxKnownOrder, rect, containerRect, model, tolerance = 2 } = {}) {
+  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || targetOrder !== maxKnownOrder) return false;
+  if (!model?.isColumnReverse) return false;
+  if (Math.abs(Number(model.maxLogicalPosition || 0) - Number(model.logicalPosition || 0)) > tolerance) return false;
+  if (!rect || !containerRect) return false;
+  return Number(rect.bottom) > Number(containerRect.top) && Number(rect.top) < Number(containerRect.bottom);
+}
+
+function readMountedSettleSnapshot(turnAdapter, container, windowRef, rect) {
+  const model = readScrollModel(container, windowRef);
+  const visibleSignature = (turnAdapter?.getVisibleTurns?.() ?? [])
+    .map((turn) => String(turn?.id ?? ""))
+    .join("|");
+  return {
+    visibleSignature,
+    scrollHeight: Number(model.scrollHeight) || 0,
+    maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+    logicalPosition: Number(model.logicalPosition) || 0,
+    rectTop: Number(rect?.top),
+    rectBottom: Number(rect?.bottom)
+  };
+}
+
+function mountedSettleSnapshotStable(before, after, tolerance = 2) {
+  if (!before || !after) return false;
+  if (before.visibleSignature !== after.visibleSignature) return false;
+  if (Math.abs(after.scrollHeight - before.scrollHeight) > tolerance) return false;
+  if (Math.abs(after.maxLogicalPosition - before.maxLogicalPosition) > tolerance) return false;
+  if (Math.abs(after.logicalPosition - before.logicalPosition) > tolerance) return false;
+  if (!Number.isFinite(before.rectTop) || !Number.isFinite(after.rectTop)) return false;
+  if (!Number.isFinite(before.rectBottom) || !Number.isFinite(after.rectBottom)) return false;
+  if (Math.abs(after.rectTop - before.rectTop) > tolerance) return false;
+  if (Math.abs(after.rectBottom - before.rectBottom) > tolerance) return false;
+  return true;
+}
+
+function createNavigationTraceStep({ mode, direction, elapsedMs, jumpPx, waitMs, targetOrder, before, after, outcome } = {}) {
+  return {
+    mode: String(mode ?? "unknown"),
+    direction: Number(direction) || 0,
+    elapsedMs: Math.round(Number(elapsedMs) || 0),
+    jumpPx: Math.round(Number(jumpPx) || 0),
+    waitMs: Math.round(Number(waitMs) || 0),
+    targetOrder: Number.isFinite(targetOrder) ? Number(targetOrder) : null,
+    progressKind: classifyNavigationStepProgress({ targetOrder, before, after, outcome, direction }),
+    before: compactTraceSnapshot(before),
+    after: compactTraceSnapshot(after)
+  };
+}
+
+function compactTraceSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    visibleRange: snapshot.visibleRange ?? visibleOrderRange(snapshot.visibleOrders ?? []),
+    scrollHeight: Math.round(Number(snapshot.scrollHeight) || 0),
+    logicalPosition: Math.round(Number(snapshot.logicalPosition) || 0)
+  };
+}
+
+function classifyNavigationStepProgress({ targetOrder, before, after, outcome, direction } = {}) {
+  if (outcome?.candidate || outcome?.state === "target") return "target";
+  if (outcome?.indexChanged) return "index";
+  if (!after) return outcome?.progressed ? "progress" : "none";
+  if (turnWindowDistance(targetOrder, after.visibleOrders ?? []) < turnWindowDistance(targetOrder, before?.visibleOrders ?? [])) return "window";
+  if ((Number(after.scrollHeight) || 0) > (Number(before?.scrollHeight) || 0) + 1
+    || (Number(after.maxLogicalPosition) || 0) > (Number(before?.maxLogicalPosition) || 0) + 1) return "extent";
+  if (direction < 0 && (Number(after.logicalPosition) || 0) < (Number(before?.logicalPosition) || 0) - 1) return "motion";
+  if (direction > 0 && (Number(after.logicalPosition) || 0) > (Number(before?.logicalPosition) || 0) + 1) return "motion";
+  return outcome?.progressed ? "progress" : "none";
+}
+
+function rectInActivationZone(rect, containerRect = null, activationOffset = 120) {
+  if (!rect) return false;
+  const bounds = containerRect ?? { top: 0, bottom: 800, height: 800 };
+  const height = Number(bounds.height) || Math.max(1, Number(bounds.bottom) - Number(bounds.top)) || 800;
+  const line = Number(bounds.top || 0) + activationOffset;
+  const tolerance = Math.min(42, Math.max(18, height * 0.045));
+  return rect.top <= line + tolerance && rect.bottom >= line - tolerance;
+}
+
+function readScrollModel(container, windowRef = globalThis.window) {
+  const flexDirection = windowRef?.getComputedStyle?.(container)?.flexDirection
+    ?? container?.style?.flexDirection
+    ?? "column";
+  return createScrollModel({
+    scrollTop: container?.scrollTop,
+    scrollHeight: container?.scrollHeight,
+    clientHeight: container?.clientHeight,
+    flexDirection
+  });
+}
+
+function setLogicalScrollPosition(container, logicalPosition, model = readScrollModel(container)) {
+  if (!container) return null;
+  const top = scrollTopFromLogical(logicalPosition, model.maxLogicalPosition, model.isColumnReverse);
+  container.scrollTop = top;
+  return top;
+}
+
+function chooseHydrationDirection(targetOrder, visibleOrders = [], model = {}) {
+  if (visibleOrders.length) {
+    const min = visibleOrders[0];
+    const max = visibleOrders[visibleOrders.length - 1];
+    if (targetOrder < min) return -1;
+    if (targetOrder > max) return 1;
+  }
+  const midpoint = (Number(model.minLogicalPosition || 0) + Number(model.maxLogicalPosition || 0)) / 2;
+  return Number(model.logicalPosition || 0) > midpoint ? -1 : 1;
+}
+
+function hydrationStepSize(model = {}, visibleOrders = [], targetOrder = -1) {
+  const viewport = Math.max(1, Number(model.clientHeight) || 800);
+  const span = Math.max(viewport, Number(model.maxLogicalPosition) || viewport);
+  let multiplier = 1.45;
+  if (visibleOrders.length && Number.isFinite(targetOrder)) {
+    const min = visibleOrders[0];
+    const max = visibleOrders[visibleOrders.length - 1];
+    const distance = targetOrder < min ? min - targetOrder : targetOrder > max ? targetOrder - max : 0;
+    if (distance > 20) multiplier = 2.4;
+    else if (distance > 8) multiplier = 1.9;
+  }
+  const proportional = Math.min(3200, Math.max(900, span * 0.06));
+  return Math.min(span, Math.max(viewport * multiplier, proportional));
+}
+
+function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0 } = {}) {
+  const safeViewport = Math.max(240, Number(viewport) || 737);
+  const base = Math.min(Math.max(240, Number(configuredStep) || 720), safeViewport);
+  if (Number(turnCount) <= 12) return Math.round(Math.max(180, Math.min(base, safeViewport * 0.5)));
+  const distance = Math.max(0, Number(targetDistance) || 0);
+  const scale = distance > 40 ? 1.35 : distance > 20 ? 1.2 : 1;
+  const desired = Math.min(base * scale, safeViewport * 1.35);
+  const remaining = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  return Math.round(remaining > 0 ? Math.min(desired, remaining) : desired);
+}
+
+function hydrationJumpScale({ host = null, direction = 0, targetBeforeVisible = false, targetDistance = 0, chatEarlierJumpScale = 1.35 } = {}) {
+  if (host !== "chatgpt" || direction >= 0 || !targetBeforeVisible) return 1;
+  const base = Math.max(1, Number(chatEarlierJumpScale) || 1);
+  const distance = Math.max(0, Number(targetDistance) || 0);
+  if (distance > 40) return Math.max(base, 1.75);
+  if (distance > 20) return Math.max(base, 1.55);
+  return base;
+}
+
+function chatFarCoalescedJump({ baseJump = 0, host = null, direction = 0, targetBeforeVisible = false, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0, stalled = false } = {}) {
+  const base = Math.max(0, Number(baseJump) || 0);
+  const availableEarlier = Math.max(0, Number(logicalPosition) - Number(minLogicalPosition));
+  const eligible = host === "chatgpt"
+    && direction < 0
+    && targetBeforeVisible
+    && Number(targetDistance) > 40
+    && !stalled
+    && availableEarlier > base * 1.6;
+  if (!eligible) return { jumpPx: base, coalesced: false };
+  return { jumpPx: Math.round(Math.min(base * 1.35, 7600, availableEarlier)), coalesced: true };
+}
+
+function turnWindowDistance(targetOrder, orders = []) {
+  if (!Number.isFinite(targetOrder) || !orders.length) return Number.POSITIVE_INFINITY;
+  const sorted = [...orders].filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return Number.POSITIVE_INFINITY;
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  if (targetOrder < min) return min - targetOrder;
+  if (targetOrder > max) return targetOrder - max;
+  return 0;
+}
+
+function createHydrationSnapshot(targetOrder, orders = [], model = {}) {
+  const visibleOrders = [...orders].filter(Number.isFinite).sort((a, b) => a - b);
+  return {
+    visibleOrders,
+    visibleRange: visibleOrderRange(visibleOrders),
+    targetDistance: turnWindowDistance(targetOrder, visibleOrders),
+    scrollHeight: Number(model.scrollHeight) || 0,
+    clientHeight: Number(model.clientHeight) || 0,
+    maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+    logicalPosition: Number(model.logicalPosition) || 0
+  };
+}
+
+function hasHydrationProgress(targetOrder, before, after, direction = 0, { allowMotionProgress = true } = {}) {
+  if (!after) return false;
+  if (!before) return true;
+  if (turnWindowDistance(targetOrder, after.visibleOrders) < turnWindowDistance(targetOrder, before.visibleOrders)) return true;
+  if (after.scrollHeight > before.scrollHeight + 1) return true;
+  if (after.maxLogicalPosition > before.maxLogicalPosition + 1) return true;
+  if (!allowMotionProgress) return false;
+  if (direction < 0 && after.logicalPosition < before.logicalPosition - 1) return true;
+  if (direction > 0 && after.logicalPosition > before.logicalPosition + 1) return true;
+  return false;
+}
+
+function hasTurnWindowProgress(targetOrder, beforeOrders = [], afterOrders = []) {
+  return turnWindowDistance(targetOrder, afterOrders) < turnWindowDistance(targetOrder, beforeOrders);
+}
+
+function hasVisibleWindowChanged(before, after) {
+  const previous = String(before?.windowSignature ?? "");
+  const current = String(after?.windowSignature ?? "");
+  return Boolean(previous && current && previous !== current);
+}
+
+function visibleOrderRange(orders = []) {
+  if (!orders.length) return null;
+  return { min: orders[0], max: orders[orders.length - 1] };
+}
+
+function retryableAlignmentFailure(reason) {
+  return reason === "stale-or-recycled-dom"
+    || reason === "post-settle-target-lost"
+    || reason === "post-settle-drift";
+}
+
+function fallbackOrder(id) {
+  const match = String(id ?? "").match(FALLBACK_TURN);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function dispatchWheelEvent(container, windowRef = globalThis.window, deltaY = -720) {
+  if (!container?.dispatchEvent) return false;
+  try {
+    const WheelCtor = windowRef?.WheelEvent ?? globalThis.WheelEvent;
+    const event = typeof WheelCtor === "function"
+      ? new WheelCtor("wheel", { deltaY, deltaMode: 0, bubbles: true, cancelable: true })
+      : { type: "wheel", deltaY, deltaMode: 0, bubbles: true, cancelable: true };
+    container.dispatchEvent(event);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
+
+function readChatHistorySnapshot(turnAdapter, container, windowRef) {
+  const model = readScrollModel(container, windowRef);
+  return {
+    visibleSignature: (turnAdapter?.getVisibleTurns?.() ?? []).map((turn) => String(turn?.id ?? "")).join("|"),
+    scrollHeight: Number(model.scrollHeight) || 0,
+    maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+    minLogicalPosition: Number(model.minLogicalPosition) || 0,
+    logicalPosition: Number(model.logicalPosition) || 0
+  };
+}
+
+function chatHistorySnapshotChanged(before, after) {
+  if (!before || !after) return false;
+  return before.visibleSignature !== after.visibleSignature
+    || Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) >= 1
+    || Math.abs(Number(after.maxLogicalPosition) - Number(before.maxLogicalPosition)) >= 1;
+}
+
+function nextFrame(windowRef) {
+  return new Promise((resolve) => {
+    if (typeof windowRef?.requestAnimationFrame === "function") windowRef.requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 0);
+  });
+}
+
+function delay(windowRef, milliseconds) {
+  return new Promise((resolve) => setTimer(windowRef, resolve, milliseconds));
+}
+
+function setTimer(windowRef, callback, delayMs) {
+  return typeof windowRef?.setTimeout === "function" ? windowRef.setTimeout(callback, delayMs) : setTimeout(callback, delayMs);
+}
+
+function clearTimer(windowRef, timer) {
+  if (typeof windowRef?.clearTimeout === "function") windowRef.clearTimeout(timer);
+  else clearTimeout(timer);
+}
+
+function nowMs(windowRef) {
+  return Number(windowRef?.performance?.now?.()) || Date.now();
+}
+
+function createNavigationCompatibility() {
+  return {
+    feature: "codex-plus-thread-scroll-restore",
+    status: "not-needed",
+    notified: false,
+    error: ""
+  };
+}
+
+function failure(reason, target) {
+  return { ok: false, reason, target, verified: false };
+}
+
+Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
+
+},
+"src/v3/host/codex-desktop/work-navigation-adapter.js": (module, exports, __require) => {
+const { clamp, createScrollModel, scrollTopFromLogical } = __require("src/v3/core/scroll-model.js");
+
+const FALLBACK_TURN = /^fallback-turn-(\d+)$/;
+const NAVIGATION_TRACE_LIMIT = 16;
+const WORK_TAIL_BACKTRACK_MAX_STEPS = 32;
+const HYDRATION_ATTRIBUTES = [
+  "data-turn-key",
+  "data-content-search-turn-key",
+  "data-turn-id",
+  "data-turn-id-container"
+];
+
+class WorkNavigationAdapter {
+  constructor({
+    window,
+    turnAdapter,
+    conversationAdapter,
+    activationOffset = 120,
+    maxHydrationSteps = 256,
+    maxConsecutiveStalls = 4,
+    hydrationWaitMs = 900,
+    workWheelStepPx = 720,
+    workWheelWaitMs = 120,
+    inactivityNavigationMs = 5000,
+    absoluteMaxNavigationMs = 45000,
+    maxNavigationMs = null,
+    motionProgressWaitMs = 45,
+    chatMotionProgressWaitMs = 8,
+    chatEarlierJumpScale = 1.35,
+    chatBoundaryHydrationWaitMs = 1800,
+    maxAlignFrames = 8,
+    postSettleWaitMs = 160,
+    mountedFastSettleWaitMs = 120,
+    maxPostSettleCorrections = 2
+  } = {}) {
+    this.window = window ?? globalThis.window;
+    this.turnAdapter = turnAdapter;
+    this.conversationAdapter = conversationAdapter;
+    this.activationOffset = activationOffset;
+    this.maxHydrationSteps = maxHydrationSteps;
+    this.maxConsecutiveStalls = maxConsecutiveStalls;
+    this.hydrationWaitMs = hydrationWaitMs;
+    this.workWheelStepPx = workWheelStepPx;
+    this.workWheelWaitMs = workWheelWaitMs;
+    this.inactivityNavigationMs = inactivityNavigationMs;
+    this.absoluteMaxNavigationMs = Number.isFinite(maxNavigationMs)
+      ? Number(maxNavigationMs)
+      : Number(absoluteMaxNavigationMs);
+    this.motionProgressWaitMs = motionProgressWaitMs;
+    this.chatMotionProgressWaitMs = chatMotionProgressWaitMs;
+    this.chatEarlierJumpScale = Math.max(1, Number(chatEarlierJumpScale) || 1);
+    this.chatBoundaryHydrationWaitMs = Math.max(this.hydrationWaitMs, Number(chatBoundaryHydrationWaitMs) || 0);
+    this.maxAlignFrames = maxAlignFrames;
+    this.postSettleWaitMs = postSettleWaitMs;
+    this.mountedFastSettleWaitMs = mountedFastSettleWaitMs;
+    this.maxPostSettleCorrections = maxPostSettleCorrections;
+    this.compatibility = createNavigationCompatibility();
+  }
+
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
+    const steps = [];
+    const finish = (result) => ({ ...result, steps: steps.slice() });
     const recordStep = (entry) => {
       steps.push(entry);
       if (steps.length > NAVIGATION_TRACE_LIMIT) steps.splice(0, steps.length - NAVIGATION_TRACE_LIMIT);
@@ -1542,110 +3312,6 @@ class NavigationAdapter {
 
     const conversationIdentity = this.conversationAdapter.getConversationIdentity?.() ?? null;
     const allowFirstTurnProbeOverrun = conversationIdentity?.host === "chatgpt" && indexState.targetOrder === 0;
-
-    const initialFastPlan = planChatPredictiveFastPath({
-      allowed: allowChatPredictiveFastPath,
-      identity: conversationIdentity,
-      indexState,
-      snapshot
-    });
-    if (initialFastPlan.eligible) {
-      fastPath.attempted = true;
-      const fastStartedAt = nowMs(this.window);
-      const stability = await this.awaitChatFastPathStability({
-        container,
-        targetOrder: indexState.targetOrder,
-        orderById: indexState.orderById,
-        getIndexState,
-        isCurrent: isNavigationCurrent
-      });
-      snapshot = stability.after ?? snapshot;
-      if (stability.state === "superseded") {
-        fastPath.fallbackReason = "superseded";
-        recordStep(createNavigationTraceStep({
-          mode: "chat-fast", direction: -1,
-          elapsedMs: nowMs(this.window) - fastStartedAt,
-          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
-          before: stability.before, after: stability.after,
-          outcome: { state: "superseded", progressed: false }
-        }));
-        return finish(failure("superseded", turnId));
-      }
-      if (!stability.stable) {
-        fastPath.fallbackReason = "unstable-extent";
-        recordStep(createNavigationTraceStep({
-          mode: "chat-fast", direction: -1,
-          elapsedMs: nowMs(this.window) - fastStartedAt,
-          jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
-          before: stability.before, after: stability.after,
-          outcome: { progressed: false }
-        }));
-      } else {
-        indexState = getIndexState();
-        const stablePlan = planChatPredictiveFastPath({
-          allowed: true,
-          identity: conversationIdentity,
-          indexState,
-          snapshot: stability.after
-        });
-        if (!stablePlan.eligible) {
-          fastPath.fallbackReason = stablePlan.reason;
-          recordStep(createNavigationTraceStep({
-            mode: "chat-fast", direction: -1,
-            elapsedMs: nowMs(this.window) - fastStartedAt,
-            jumpPx: 0, waitMs: 0, targetOrder: indexState.targetOrder,
-            before: stability.before, after: stability.after,
-            outcome: { progressed: false }
-          }));
-        } else {
-          const fastBefore = stability.after;
-          const predictedLogical = stablePlan.predictedLogical;
-          const fastJumpPx = Math.abs(Number(fastBefore.logicalPosition) - Number(predictedLogical));
-          const outcome = await this.awaitHydrationProgress({
-            turnId,
-            targetOrder: indexState.targetOrder,
-            previousSnapshot: fastBefore,
-            direction: -1,
-            container,
-            isCurrent: isNavigationCurrent,
-            orderById: indexState.orderById,
-            getIndexState,
-            waitMs: this.chatFastPathWaitMs,
-            allowMotionProgress: false,
-            scrollAction: () => setLogicalScrollPosition(container, predictedLogical, readScrollModel(container, this.window))
-          });
-          recordStep(createNavigationTraceStep({
-            mode: "chat-fast", direction: -1,
-            elapsedMs: nowMs(this.window) - fastStartedAt,
-            jumpPx: fastJumpPx, waitMs: this.chatFastPathWaitMs,
-            targetOrder: indexState.targetOrder,
-            before: fastBefore, after: outcome.snapshot, outcome
-          }));
-          if (outcome.state === "superseded") {
-            fastPath.fallbackReason = "superseded";
-            return finish(failure("superseded", turnId));
-          }
-          probes += fastJumpPx >= 1 ? 1 : 0;
-          indexState = getIndexState();
-          snapshot = outcome.snapshot ?? this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
-          if (outcome.progressed) lastProgressAt = nowMs(this.window);
-          if (outcome.candidate) {
-            const aligned = await this.verifyAndAlign(turnId, outcome.candidate, isNavigationCurrent, probes, readTargetOrder, readMaxKnownOrder);
-            if (aligned.ok) {
-              fastPath.succeeded = true;
-              fastPath.fallbackReason = null;
-              return finish(aligned);
-            }
-            fastPath.fallbackReason = aligned.reason ?? "fast-verify-failed";
-            if (!retryableAlignmentFailure(aligned.reason)) return finish(aligned);
-            indexState = getIndexState();
-            snapshot = this.readHydrationSnapshot(container, indexState.targetOrder, indexState.orderById);
-          } else {
-            fastPath.fallbackReason = outcome.progressed ? "target-not-mounted" : "no-structural-progress";
-          }
-        }
-      }
-    }
 
     while ((probes < this.maxHydrationSteps || allowFirstTurnProbeOverrun)
       && nowMs(this.window) - startedAt < this.absoluteMaxNavigationMs) {
@@ -2026,25 +3692,6 @@ class NavigationAdapter {
     return promise;
   }
 
-  async awaitChatFastPathStability({ container, targetOrder, orderById = null, getIndexState = null, isCurrent = () => true } = {}) {
-    const readIndex = () => typeof getIndexState === "function" ? getIndexState() : null;
-    const firstIndex = readIndex();
-    const firstTargetOrder = Number.isFinite(firstIndex?.targetOrder) ? Number(firstIndex.targetOrder) : targetOrder;
-    const firstOrderById = firstIndex?.orderById ?? orderById;
-    const before = this.readHydrationSnapshot(container, firstTargetOrder, firstOrderById);
-    await nextFrame(this.window);
-    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
-    await nextFrame(this.window);
-    if (!isCurrent()) return { state: "superseded", stable: false, before, after: before };
-    const lastIndex = readIndex();
-    const lastTargetOrder = Number.isFinite(lastIndex?.targetOrder) ? Number(lastIndex.targetOrder) : targetOrder;
-    const lastOrderById = lastIndex?.orderById ?? orderById;
-    const after = this.readHydrationSnapshot(container, lastTargetOrder, lastOrderById);
-    const sameIndex = firstIndex?.signature == null || lastIndex?.signature == null || firstIndex.signature === lastIndex.signature;
-    const stable = Boolean(sameIndex && chatFastSnapshotStable(before, after));
-    return { state: stable ? "stable" : "unstable", stable, before, after };
-  }
-
   async performWorkWheelHydrationStep({ turnId, targetOrder, previousSnapshot, container, isCurrent, orderById, turnCount = 0, direction = -1, getIndexState = null }) {
     if (!container || !isCurrent()) return { state: "superseded", progressed: false, moved: false };
     const indexState = typeof getIndexState === "function" ? getIndexState() : null;
@@ -2103,6 +3750,98 @@ class NavigationAdapter {
       this.compatibility = { ...createNavigationCompatibility(), status: "error", error: String(error?.message ?? error ?? "unknown") };
       return false;
     }
+  }
+
+  isEarlierBoundary({ tolerance = 24 } = {}) {
+    const identity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return false;
+    const container = this.conversationAdapter.getScrollContainer?.();
+    if (!container || container.isConnected === false) return false;
+    const model = readScrollModel(container, this.window);
+    if (!model.isColumnReverse) return false;
+    return Math.abs(Number(model.logicalPosition) - Number(model.minLogicalPosition)) <= Math.max(0, Number(tolerance) || 0);
+  }
+
+  async hydrateEarlierHistory({
+    isCurrent = () => true,
+    maxSteps = 96,
+    maxBoundaryStalls = 3,
+    stopAfterBatch = false,
+    onProgress = null
+  } = {}) {
+    const identity = this.conversationAdapter.getConversationIdentity?.() ?? null;
+    const container = this.conversationAdapter.getScrollContainer?.();
+    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
+      return { ok: false, started: false, reason: "not-local-work", steps: 0, stalls: 0 };
+    }
+    if (!container || container.isConnected === false) {
+      return { ok: false, started: false, reason: "missing-scroll-container", steps: 0, stalls: 0 };
+    }
+    const initialModel = readScrollModel(container, this.window);
+    if (!initialModel.isColumnReverse) {
+      return { ok: false, started: false, reason: "not-earlier-boundary", steps: 0, stalls: 0 };
+    }
+
+    this.notifyCodexPlusScrollIntent(container, isCurrent);
+    let steps = 0;
+    let stalls = 0;
+    let snapshot = readWorkHistorySnapshot(this.turnAdapter, container, this.window);
+    while (steps < Math.max(1, Number(maxSteps) || 1)
+      && stalls < Math.max(1, Number(maxBoundaryStalls) || 1)) {
+      if (!isCurrent() || this.conversationAdapter.getScrollContainer?.() !== container) {
+        return { ok: false, started: true, reason: "superseded", steps, stalls };
+      }
+      const model = readScrollModel(container, this.window);
+      const viewport = Math.max(240, Number(model.clientHeight) || 737);
+      const step = Math.round(Math.min(Math.max(240, Number(this.workWheelStepPx) || 720), viewport * 0.9));
+      const nextLogical = clamp(model.logicalPosition - step, model.minLogicalPosition, model.maxLogicalPosition);
+      const moved = Math.abs(nextLogical - model.logicalPosition) >= 1;
+      dispatchWheelEvent(container, this.window, -step);
+      if (moved) setLogicalScrollPosition(container, nextLogical, model);
+      const waitMs = moved ? this.workWheelWaitMs : this.hydrationWaitMs;
+      await delay(this.window, waitMs);
+      await nextFrame(this.window);
+      if (!isCurrent()) return { ok: false, started: true, reason: "superseded", steps, stalls };
+
+      const after = readWorkHistorySnapshot(this.turnAdapter, container, this.window);
+      const structuralProgress = workHistorySnapshotChanged(snapshot, after);
+      const motionProgress = Math.abs(Number(after.logicalPosition) - Number(snapshot.logicalPosition)) >= 1;
+      const extentGrowth = Number(after.scrollHeight) > Number(snapshot.scrollHeight)
+        || Number(after.maxLogicalPosition) > Number(snapshot.maxLogicalPosition);
+      const boundaryExpansion = !moved && structuralProgress;
+      const batchLoaded = extentGrowth || boundaryExpansion;
+      const progressed = structuralProgress || motionProgress;
+      steps += 1;
+      if (progressed) {
+        stalls = 0;
+        try { onProgress?.({ steps, snapshot: after, structuralProgress, motionProgress }); } catch {}
+      } else if (Math.abs(Number(after.logicalPosition) - Number(after.minLogicalPosition)) <= 24) {
+        stalls += 1;
+      } else {
+        stalls = 0;
+      }
+      snapshot = after;
+      if (stopAfterBatch && batchLoaded) {
+        return {
+          ok: true,
+          started: true,
+          reason: "earlier-batch-loaded",
+          steps,
+          stalls,
+          scrollHeight: snapshot.scrollHeight,
+          logicalPosition: snapshot.logicalPosition
+        };
+      }
+    }
+    return {
+      ok: true,
+      started: true,
+      reason: stalls >= Math.max(1, Number(maxBoundaryStalls) || 1) ? "earlier-boundary-exhausted" : "step-limit",
+      steps,
+      stalls,
+      scrollHeight: snapshot.scrollHeight,
+      logicalPosition: snapshot.logicalPosition
+    };
   }
 
   getCompatibilityStatus() {
@@ -2456,44 +4195,6 @@ function hydrationStepSize(model = {}, visibleOrders = [], targetOrder = -1) {
   return Math.min(span, Math.max(viewport * multiplier, proportional));
 }
 
-function predictChatFastLogicalPosition({ targetOrder = null, maxKnownOrder = null, minLogicalPosition = 0, maxLogicalPosition = 0 } = {}) {
-  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || Number(maxKnownOrder) <= 0) return null;
-  const min = Number(minLogicalPosition) || 0;
-  const max = Math.max(min, Number(maxLogicalPosition) || 0);
-  const ratio = clamp(Number(targetOrder) / Number(maxKnownOrder), 0, 1);
-  return Math.round(min + (max - min) * ratio);
-}
-
-function chatFastSnapshotStable(before, after, tolerance = 2) {
-  if (!before || !after) return false;
-  const beforeOrders = (before.visibleOrders ?? []).join("|");
-  const afterOrders = (after.visibleOrders ?? []).join("|");
-  if (!beforeOrders || beforeOrders !== afterOrders) return false;
-  if (Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) > tolerance) return false;
-  if (Math.abs(Number(after.maxLogicalPosition) - Number(before.maxLogicalPosition)) > tolerance) return false;
-  if (Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition)) > tolerance) return false;
-  if (Math.abs(Number(after.clientHeight) - Number(before.clientHeight)) > tolerance) return false;
-  return Number(after.maxLogicalPosition) > Math.max(1, Number(after.clientHeight) || 0);
-}
-
-function planChatPredictiveFastPath({ allowed = false, identity = null, indexState = null, snapshot = null } = {}) {
-  if (!allowed) return { eligible: false, reason: "not-authorized", predictedLogical: null };
-  if (identity?.host !== "chatgpt" || identity?.stable !== true) return { eligible: false, reason: "unstable-identity", predictedLogical: null };
-  const targetOrder = Number(indexState?.targetOrder);
-  const maxKnownOrder = Number(indexState?.maxKnownOrder);
-  const visibleOrders = (snapshot?.visibleOrders ?? []).filter(Number.isFinite).sort((a, b) => a - b);
-  if (!Number.isFinite(targetOrder) || !Number.isFinite(maxKnownOrder) || maxKnownOrder < 20) return { eligible: false, reason: "insufficient-index", predictedLogical: null };
-  const knownOrders = [...new Set([...(indexState?.orderById?.values?.() ?? [])].filter(Number.isFinite))].sort((a, b) => a - b);
-  if (knownOrders.length !== maxKnownOrder + 1 || knownOrders[0] !== 0 || knownOrders.at(-1) !== maxKnownOrder) return { eligible: false, reason: "non-contiguous-index", predictedLogical: null };
-  if (visibleOrders.length < 2 || targetOrder >= visibleOrders[0]) return { eligible: false, reason: "not-far-earlier", predictedLogical: null };
-  const distance = turnWindowDistance(targetOrder, visibleOrders);
-  if (!(distance > 20)) return { eligible: false, reason: "near-target", predictedLogical: null };
-  if (!(Number(snapshot?.maxLogicalPosition) > Math.max(1, Number(snapshot?.clientHeight) || 0))) return { eligible: false, reason: "insufficient-scroll-extent", predictedLogical: null };
-  const predictedLogical = predictChatFastLogicalPosition({ targetOrder, maxKnownOrder, minLogicalPosition: 0, maxLogicalPosition: snapshot.maxLogicalPosition });
-  if (!Number.isFinite(predictedLogical) || predictedLogical >= Number(snapshot.logicalPosition) - Math.max(180, Number(snapshot.clientHeight) || 180)) return { eligible: false, reason: "prediction-too-small", predictedLogical: null };
-  return { eligible: true, reason: null, predictedLogical };
-}
-
 function workWheelStepSize({ configuredStep = 720, viewport = 737, turnCount = 0, targetDistance = 0, logicalPosition = 0, minLogicalPosition = 0, maxLogicalPosition = Number.POSITIVE_INFINITY, direction = -1 } = {}) {
   const safeViewport = Math.max(240, Number(viewport) || 737);
   const base = Math.min(Math.max(240, Number(configuredStep) || 720), safeViewport);
@@ -2585,6 +4286,24 @@ function fallbackOrder(id) {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
+function readWorkHistorySnapshot(turnAdapter, container, windowRef) {
+  const model = readScrollModel(container, windowRef);
+  return {
+    visibleSignature: (turnAdapter?.getVisibleTurns?.() ?? []).map((turn) => String(turn?.id ?? "")).join("|"),
+    scrollHeight: Number(model.scrollHeight) || 0,
+    maxLogicalPosition: Number(model.maxLogicalPosition) || 0,
+    minLogicalPosition: Number(model.minLogicalPosition) || 0,
+    logicalPosition: Number(model.logicalPosition) || 0
+  };
+}
+
+function workHistorySnapshotChanged(before, after) {
+  if (!before || !after) return false;
+  return before.visibleSignature !== after.visibleSignature
+    || Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) >= 1
+    || Math.abs(Number(after.maxLogicalPosition) - Number(before.maxLogicalPosition)) >= 1;
+}
+
 function dispatchWheelEvent(container, windowRef = globalThis.window, deltaY = -720) {
   if (!container?.dispatchEvent) return false;
   try {
@@ -2637,7 +4356,7 @@ function failure(reason, target) {
   return { ok: false, reason, target, verified: false };
 }
 
-Object.assign(exports, { NavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, predictChatFastLogicalPosition, chatFastSnapshotStable, planChatPredictiveFastPath, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
+Object.assign(exports, { WorkNavigationAdapter, computeActiveTurnId, rectInActivationZone, readScrollModel, setLogicalScrollPosition, chooseHydrationDirection, hydrationStepSize, workWheelStepSize, hydrationJumpScale, chatFarCoalescedJump, turnWindowDistance, createHydrationSnapshot, hasHydrationProgress, hasTurnWindowProgress, visibleOrderRange });
 
 },
 "src/v3/host/codex-desktop/host-contract.js": (module, exports, __require) => {
@@ -2837,12 +4556,14 @@ Object.assign(exports, { HOST_CONTRACT_REVISION, HOST_CONTRACT_STATUS, HostContr
 "src/v3/host/codex-desktop/codex-host.js": (module, exports, __require) => {
 const { HostInterface } = __require("src/v3/host/host-interface.js");
 const { ConversationAdapter, isStableLocalThreadIdentity } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
-const { TurnAdapter, cssEscape } = __require("src/v3/host/codex-desktop/turn-adapter.js");
+const { TurnAdapter } = __require("src/v3/host/codex-desktop/turn-adapter.js");
+const { WorkTurnAdapter } = __require("src/v3/host/codex-desktop/work-turn-adapter.js");
 const { ComposerAdapter } = __require("src/v3/host/codex-desktop/composer-adapter.js");
 const { OverlayDetector } = __require("src/v3/host/codex-desktop/overlay-detector.js");
 const { SurfaceDetector } = __require("src/v3/host/codex-desktop/surface-detector.js");
 const { ConversationCapture } = __require("src/v3/host/codex-desktop/conversation-capture.js");
 const { NavigationAdapter, computeActiveTurnId } = __require("src/v3/host/codex-desktop/navigation-adapter.js");
+const { WorkNavigationAdapter } = __require("src/v3/host/codex-desktop/work-navigation-adapter.js");
 const { HostContractDiagnostics } = __require("src/v3/host/codex-desktop/host-contract.js");
 
 function computeTailActiveTurnId({ visibleTurns = [], resolveTurn, container = null, windowRef = globalThis.window, tolerance = 2 } = {}) {
@@ -2883,7 +4604,10 @@ class CodexDesktopHost extends HostInterface {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
     this.conversation = new ConversationAdapter({ document: this.document, window: this.window });
-    this.turns = new TurnAdapter({ document: this.document });
+    this.chatTurns = new TurnAdapter({ document: this.document });
+    this.workTurns = new WorkTurnAdapter({ document: this.document });
+    this.lastHostMode = null;
+    this.turns = createRoutedTurnAdapter(this);
     this.composer = new ComposerAdapter({ document: this.document, window: this.window });
     this.overlay = new OverlayDetector({ document: this.document });
     this.surface = new SurfaceDetector({
@@ -2892,9 +4616,8 @@ class CodexDesktopHost extends HostInterface {
       conversationAdapter: this.conversation,
       overlayDetector: this.overlay
     });
-    this.navigation = new NavigationAdapter({
+    this.chatNavigation = new NavigationAdapter({
       window: this.window,
-      turnAdapter: this.turns,
       conversationAdapter: this.conversation,
       activationOffset: 120,
       maxHydrationSteps: 256,
@@ -2903,8 +4626,23 @@ class CodexDesktopHost extends HostInterface {
       inactivityNavigationMs: 5000,
       absoluteMaxNavigationMs: 45000,
       postSettleWaitMs: 160,
-      maxPostSettleCorrections: 2
+      maxPostSettleCorrections: 2,
+      turnAdapter: this.chatTurns
     });
+    this.workNavigation = new WorkNavigationAdapter({
+      window: this.window,
+      conversationAdapter: this.conversation,
+      activationOffset: 120,
+      maxHydrationSteps: 256,
+      maxConsecutiveStalls: 4,
+      hydrationWaitMs: 900,
+      inactivityNavigationMs: 5000,
+      absoluteMaxNavigationMs: 45000,
+      postSettleWaitMs: 160,
+      maxPostSettleCorrections: 2,
+      turnAdapter: this.workTurns
+    });
+    this.navigation = createRoutedNavigationAdapter(this);
     this.capture = new ConversationCapture({
       window: this.window,
       onCapture,
@@ -2920,10 +4658,13 @@ class CodexDesktopHost extends HostInterface {
       capture: this.capture
     });
     this.navigationRequestId = 0;
+    this.hostTailIntentGeneration = 0;
+    this.boundHostPointerDown = (event) => this.handleHostPointerDown(event);
   }
 
   start() {
     this.capture.install();
+    this.window?.addEventListener?.("pointerdown", this.boundHostPointerDown, true);
     return this;
   }
 
@@ -2944,41 +4685,52 @@ class CodexDesktopHost extends HostInterface {
     return this.conversation.getConversationIdentity();
   }
 
+  getDirectConversationIdentity() {
+    return this.conversation.getDirectConversationIdentity?.() ?? null;
+  }
+
+  setInferredChatConversationId(conversationId) {
+    return this.conversation.setInferredChatConversationId?.(conversationId) ?? false;
+  }
+
+  clearInferredChatConversationId() {
+    return this.conversation.clearInferredChatConversationId?.() ?? false;
+  }
+
+  getChatVisibleTurns() {
+    return this.chatTurns.getVisibleTurns?.() ?? [];
+  }
+
   getRoute() {
     return this.conversation.getRoute();
+  }
+
+  getHostMode() {
+    const identity = this.conversation.getConversationIdentity?.() ?? null;
+    const conversationId = this.conversation.getConversationId?.() ?? null;
+    if (identity?.host === "local" || String(conversationId ?? "").startsWith("local:")) {
+      this.lastHostMode = "work";
+      return "work";
+    }
+    if (identity?.host === "chatgpt") {
+      this.lastHostMode = "chat";
+      return "chat";
+    }
+    return this.lastHostMode ?? "chat";
+  }
+
+  getTurnAdapter() {
+    return this.getHostMode() === "work" ? this.workTurns : this.chatTurns;
+  }
+
+  getNavigationAdapter() {
+    return this.getHostMode() === "work" ? this.workNavigation : this.chatNavigation;
   }
 
   getVisibleTurns() {
     return this.turns.getVisibleTurns();
   }
 
-  resolveOfficialNavigationMarkerKey(markerKey) {
-    const key = String(markerKey ?? "").trim();
-    if (!key) return null;
-    const escaped = cssEscape(key);
-    const selectors = [
-      `[data-message-id="${escaped}"]`,
-      `[data-message-id-container="${escaped}"]`,
-      `[data-user-message-id="${escaped}"]`,
-      `[data-message-key="${escaped}"]`,
-      `[data-turn-id-container="${escaped}"]`,
-      `[data-turn-id="${escaped}"]`,
-      `[data-content-search-turn-key="${escaped}"]`,
-      `[data-turn-key="${escaped}"]`
-    ];
-    const resolved = new Set();
-    const collect = (node) => {
-      if (!node) return;
-      const container = this.turns.getTurnContainer?.(node) ?? node;
-      const turnId = this.turns.getTurnId?.(container) ?? this.turns.getTurnId?.(node);
-      if (turnId) resolved.add(String(turnId));
-    };
-    collect(this.document?.getElementById?.(key));
-    for (const selector of selectors) {
-      for (const node of this.document?.querySelectorAll?.(selector) ?? []) collect(node);
-    }
-    return resolved.size === 1 ? [...resolved][0] : null;
-  }
   resolveTurn(turnId) {
     return this.turns.resolveTurn(turnId);
   }
@@ -3004,7 +4756,7 @@ class CodexDesktopHost extends HostInterface {
     });
   }
 
-  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, allowChatPredictiveFastPath = false, onTraceStep = null } = {}) {
+  async navigateToTurn(turnId, { turns = [], getTurns = null, isCurrent = () => true, allowMountedFastSettle = false, onTraceStep = null } = {}) {
     const requestId = ++this.navigationRequestId;
     const stillCurrent = () => requestId === this.navigationRequestId && isCurrent();
     const result = await this.navigation.navigateToTurn(turnId, {
@@ -3012,7 +4764,6 @@ class CodexDesktopHost extends HostInterface {
       getTurns,
       isCurrent: stillCurrent,
       allowMountedFastSettle,
-      allowChatPredictiveFastPath,
       onTraceStep
     });
     if (result?.ok && result?.verified && stillCurrent()) this.persistLocalScrollPosition();
@@ -3022,7 +4773,75 @@ class CodexDesktopHost extends HostInterface {
   notifyNavigationIntent() {
     const container = this.getScrollContainer();
     if (!container || container.isConnected === false) return false;
-    return this.navigation.notifyCodexPlusScrollIntent?.(container, () => true) ?? false;
+    return this.getNavigationAdapter()?.notifyCodexPlusScrollIntent?.(container, () => true) ?? false;
+  }
+
+  isWorkEarlierBoundary() {
+    if (this.getHostMode() !== "work") return false;
+    return this.workNavigation?.isEarlierBoundary?.() ?? false;
+  }
+
+  hydrateWorkEarlierHistory(options = {}) {
+    if (this.getHostMode() !== "work") {
+      return Promise.resolve({ ok: false, started: false, reason: "not-work" });
+    }
+    return this.workNavigation?.hydrateEarlierHistory?.(options)
+      ?? Promise.resolve({ ok: false, started: false, reason: "unsupported" });
+  }
+
+  hydrateChatEarlierHistory(options = {}) {
+    if (this.getHostMode() !== "chat") {
+      return Promise.resolve({ ok: false, started: false, reason: "not-chat" });
+    }
+    return this.chatNavigation?.hydrateEarlierHistory?.(options)
+      ?? Promise.resolve({ ok: false, started: false, reason: "unsupported" });
+  }
+
+  sweepLoadedChatHistory(options = {}) {
+    if (this.getHostMode() !== "chat") {
+      return Promise.resolve({ ok: false, started: false, reason: "not-chat" });
+    }
+    return this.chatNavigation?.sweepLoadedChatHistory?.(options)
+      ?? Promise.resolve({ ok: false, started: false, reason: "unsupported" });
+  }
+
+  handleHostPointerDown(event) {
+    const identity = this.getConversationIdentity();
+    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return false;
+    const container = this.getScrollContainer();
+    if (!container || container.isConnected === false) return false;
+    const button = findHostTailButtonCandidate(event?.target, container);
+    if (!button) return false;
+
+    const notified = this.workNavigation?.notifyCodexPlusScrollIntent?.(container, () => true) ?? false;
+    if (!notified) return false;
+    const generation = ++this.hostTailIntentGeneration;
+    const delays = [0, 60, 180, 360];
+    const set = this.window?.setTimeout ?? setTimeout;
+    const check = (index) => {
+      if (generation !== this.hostTailIntentGeneration) return;
+      set(() => {
+        if (generation !== this.hostTailIntentGeneration) return;
+        const currentIdentity = this.getConversationIdentity();
+        if (!currentIdentity?.stable || currentIdentity.id !== identity.id || currentIdentity.host !== "local" || currentIdentity.source !== "sidebar-local") return;
+        if (this.getScrollContainer() !== container || container.isConnected === false) return;
+        if (isPhysicalScrollTail(container, this.window)) {
+          this.persistLocalScrollPosition();
+          this.hostTailIntentGeneration += 1;
+          return;
+        }
+        const nearTailTolerance = Math.min(96, Math.max(36, Number(container.clientHeight || 0) * 0.08));
+        if (index >= 2 && distanceToPhysicalScrollTail(container, this.window) <= nearTailTolerance) {
+          snapToPhysicalScrollTail(container, this.window);
+          this.persistLocalScrollPosition();
+          this.hostTailIntentGeneration += 1;
+          return;
+        }
+        if (index + 1 < delays.length) check(index + 1);
+      }, delays[index] ?? 0);
+    };
+    check(0);
+    return true;
   }
 
   persistLocalScrollPosition() {
@@ -3097,81 +4916,87 @@ class CodexDesktopHost extends HostInterface {
 
   destroy() {
     this.cancelNavigation();
+    this.hostTailIntentGeneration += 1;
+    this.window?.removeEventListener?.("pointerdown", this.boundHostPointerDown, true);
     this.capture.dispose();
   }
 }
 
-Object.assign(exports, { computeTailActiveTurnId, CodexDesktopHost });
-
-},
-"src/v3/core/question-display.js": (module, exports, __require) => {
-const REQUEST_LABEL = /^(?:my request|request|\u6211\u7684\u8bf7\u6c42|\u6211\u7684\u95ee\u9898)$/i;
-const WRAPPER_LABEL = /^(?:selected text|selection\s+\d+)$/i;
-
-function normalizeQuestionDisplayText(value) {
-  const raw = String(value ?? "").replace(/\r\n?/g, "\n").trim();
-  if (!raw) return "";
-
-  const request = extractRequestSection(raw);
-  const candidate = request || stripWrapperLabels(raw);
-  const cleaned = cleanMarkdownNoise(candidate);
-  if (cleaned) return cleaned;
-
-  return collapseWhitespace(stripWrapperLabels(raw)) || collapseWhitespace(raw);
-}
-
-function extractRequestSection(value) {
-  const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
-  let matchIndex = -1;
-  let inline = "";
-  for (let index = 0; index < lines.length; index += 1) {
-    const parsed = parseLabelLine(lines[index]);
-    if (!parsed || !REQUEST_LABEL.test(parsed.label)) continue;
-    matchIndex = index;
-    inline = parsed.rest;
+function findHostTailButtonCandidate(target, container) {
+  let button = target ?? null;
+  while (button && String(button.tagName ?? "").toUpperCase() !== "BUTTON") button = button.parentElement ?? null;
+  if (!button) return null;
+  for (let node = button; node; node = node.parentElement ?? null) {
+    if (node.getAttribute?.("data-gte-component")) return null;
   }
-  if (matchIndex < 0) return "";
-  return [inline, ...lines.slice(matchIndex + 1)].filter(Boolean).join("\n").trim();
+  const buttonRect = button.getBoundingClientRect?.();
+  const containerRect = container?.getBoundingClientRect?.();
+  if (!buttonRect || !containerRect) return null;
+  const width = Number(buttonRect.width) || Math.max(0, Number(buttonRect.right) - Number(buttonRect.left));
+  const height = Number(buttonRect.height) || Math.max(0, Number(buttonRect.bottom) - Number(buttonRect.top));
+  if (width < 20 || height < 20 || width > 72 || height > 72) return null;
+  const containerWidth = Number(containerRect.width) || Math.max(0, Number(containerRect.right) - Number(containerRect.left));
+  const containerHeight = Number(containerRect.height) || Math.max(0, Number(containerRect.bottom) - Number(containerRect.top));
+  if (!(containerWidth > 0) || !(containerHeight > 0)) return null;
+  const centerX = (Number(buttonRect.left) + Number(buttonRect.right)) / 2;
+  const centerY = (Number(buttonRect.top) + Number(buttonRect.bottom)) / 2;
+  const minX = Number(containerRect.left) + containerWidth * 0.28;
+  const maxX = Number(containerRect.right) - containerWidth * 0.28;
+  const minY = Number(containerRect.top) + containerHeight * 0.55;
+  const maxY = Number(containerRect.bottom) + 48;
+  return centerX >= minX && centerX <= maxX && centerY >= minY && centerY <= maxY ? button : null;
 }
 
-function stripWrapperLabels(value) {
-  return String(value ?? "")
-    .split("\n")
-    .filter((line) => {
-      const parsed = parseLabelLine(line);
-      if (parsed && WRAPPER_LABEL.test(parsed.label)) return false;
-      const heading = String(line ?? "").match(/^\s*#{1,6}\s+(.+?)\s*$/);
-      return !(heading && WRAPPER_LABEL.test(heading[1].trim()));
-    })
-    .join("\n");
+function distanceToPhysicalScrollTail(container, windowRef = globalThis.window) {
+  if (!container) return Number.POSITIVE_INFINITY;
+  const flexDirection = windowRef?.getComputedStyle?.(container)?.flexDirection
+    ?? container?.style?.flexDirection
+    ?? "column";
+  const scrollTop = Number(container.scrollTop);
+  if (!Number.isFinite(scrollTop)) return Number.POSITIVE_INFINITY;
+  if (flexDirection === "column-reverse") return Math.abs(scrollTop);
+  const max = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
+  return Math.abs(max - scrollTop);
 }
 
-function parseLabelLine(line) {
-  const match = String(line ?? "").match(/^\s*(?:#{1,6}\s*)?([^:\uFF1A]+)[:\uFF1A]\s*(.*)$/);
-  if (!match) return null;
-  return { label: match[1].trim(), rest: match[2].trim() };
+function snapToPhysicalScrollTail(container, windowRef = globalThis.window) {
+  if (!container) return false;
+  const flexDirection = windowRef?.getComputedStyle?.(container)?.flexDirection
+    ?? container?.style?.flexDirection
+    ?? "column";
+  if (flexDirection === "column-reverse") container.scrollTop = 0;
+  else container.scrollTop = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
+  return true;
 }
 
-function cleanMarkdownNoise(value) {
-  return collapseWhitespace(
-    String(value ?? "")
-      .replace(/```[\s\S]*?```/g, " [code] ")
-      .replace(/~~~[\s\S]*?~~~/g, " [code] ")
-      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-      .replace(/\[([^\]]+)\]\((?:https?:\/\/|www\.)[^)]+\)/gi, "$1")
-      .replace(/https?:\/\/\S+/gi, " ")
-      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
-      .replace(/^\s*>\s?/gm, "")
-      .replace(/^\s*[-*+]\s+/gm, "")
-      .replace(/^\s*\d+[.)]\s+/gm, "")
-      .replace(/`([^`]+)`/g, "$1")
-  );
+function isPhysicalScrollTail(container, windowRef = globalThis.window, tolerance = 3) {
+  if (!container) return false;
+  const flexDirection = windowRef?.getComputedStyle?.(container)?.flexDirection
+    ?? container?.style?.flexDirection
+    ?? "column";
+  const scrollTop = Number(container.scrollTop);
+  if (!Number.isFinite(scrollTop)) return false;
+  if (flexDirection === "column-reverse") return Math.abs(scrollTop) <= tolerance;
+  const max = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
+  return Math.abs(max - scrollTop) <= tolerance;
 }
 
-function collapseWhitespace(value) {
-  return String(value ?? "").replace(/\s+/g, " ").trim();
+function createRoutedTurnAdapter(host) {
+  return {
+    getVisibleTurns: (...args) => host.getTurnAdapter()?.getVisibleTurns?.(...args) ?? [],
+    resolveTurn: (...args) => host.getTurnAdapter()?.resolveTurn?.(...args) ?? null,
+    verifyTurnElement: (...args) => Boolean(host.getTurnAdapter()?.verifyTurnElement?.(...args))
+  };
 }
-Object.assign(exports, { normalizeQuestionDisplayText, extractRequestSection });
+
+function createRoutedNavigationAdapter(host) {
+  return {
+    navigateToTurn: (...args) => host.getNavigationAdapter()?.navigateToTurn?.(...args),
+    getCompatibilityStatus: () => host.getNavigationAdapter()?.getCompatibilityStatus?.() ?? null
+  };
+}
+
+Object.assign(exports, { computeTailActiveTurnId, CodexDesktopHost });
 
 },
 "src/v3/ui/timeline/timeline-rail.js": (module, exports, __require) => {
@@ -3301,16 +5126,19 @@ Object.assign(exports, { TimelineRail });
 const { normalizeQuestionDisplayText } = __require("src/v3/core/question-display.js");
 
 class QuestionListPanel {
-  constructor({ document, window, onSelect, onOpenChange, getAnchorRect } = {}) {
+  constructor({ document, window, onSelect, onOpenChange, onLoadEarlier, getAnchorRect } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
     this.onSelect = onSelect ?? (() => {});
     this.onOpenChange = onOpenChange ?? (() => {});
+    this.onLoadEarlier = onLoadEarlier ?? (() => {});
     this.getAnchorRect = getAnchorRect ?? (() => null);
     this.element = null;
     this.list = null;
     this.count = null;
     this.followButton = null;
+    this.loadEarlierButton = null;
+    this.earlierAction = { visible: false, loading: false, exhausted: false };
     this.turns = [];
     this.signature = "";
     this.activeTurnId = null;
@@ -3352,7 +5180,18 @@ class QuestionListPanel {
     close.textContent = "\u00d7";
     close.title = "关闭";
     close.addEventListener("click", () => this.setOpen(false));
-    header.append(title, count, follow, close);
+    const loadEarlier = this.document.createElement("button");
+    loadEarlier.type = "button";
+    loadEarlier.className = "gte-load-earlier";
+    loadEarlier.hidden = true;
+    loadEarlier.textContent = "⇈";
+    loadEarlier.title = "加载全部历史到顶部";
+    loadEarlier.setAttribute("aria-label", "加载全部历史到顶部");
+    loadEarlier.addEventListener("click", () => {
+      if (loadEarlier.disabled || loadEarlier.hidden) return;
+      this.onLoadEarlier();
+    });
+    header.append(title, loadEarlier, count, follow, close);
 
     const list = this.document.createElement("div");
     list.className = "gte-question-list";
@@ -3375,6 +5214,7 @@ class QuestionListPanel {
     this.list = list;
     this.count = count;
     this.followButton = follow;
+    this.loadEarlierButton = loadEarlier;
     this.window?.addEventListener?.("resize", this.boundResize, { passive: true });
     this.window?.visualViewport?.addEventListener?.("resize", this.boundResize, { passive: true });
     return panel;
@@ -3421,9 +5261,17 @@ class QuestionListPanel {
     this.element.style.right = "auto";
   }
 
+  setEarlierAction({ visible = false, loading = false, exhausted = false } = {}) {
+    this.earlierAction = { visible: Boolean(visible), loading: Boolean(loading), exhausted: Boolean(exhausted) };
+    if (!this.loadEarlierButton || !this.element) return;
+    this.loadEarlierButton.hidden = !this.earlierAction.visible || this.earlierAction.exhausted;
+    this.loadEarlierButton.disabled = this.earlierAction.loading;
+    this.loadEarlierButton.textContent = this.earlierAction.loading ? "…" : "⇈";
+  }
+
   setTurns(turns) {
     const next = Array.isArray(turns) ? turns : [];
-    const signature = next.map((turn) => `${turn.id}\u0000${turn.text}`).join("\u0001");
+    const signature = next.map((turn) => `${turn.id}\u0000${Number.isFinite(turn?.order) ? Number(turn.order) : ""}\u0000${turn.text}`).join("\u0001");
     if (signature === this.signature) {
       this.turns = next;
       return false;
@@ -3562,6 +5410,7 @@ class QuestionListPanel {
     this.element = null;
     this.list = null;
     this.pendingTurnId = null;
+    this.loadEarlierButton = null;
   }
 }
 
@@ -3983,7 +5832,7 @@ Object.assign(exports, { Toast });
 
 },
 "src/v3/ui/style-bundle.js": (module, exports, __require) => {
-const BUNDLED_STYLE_TEXT = "/*\n * GPT TalkEnhancer 0.3 Timeline UI.\n * Interaction/visual baseline adapted from houyanchao/chatgpt-gemini-timeline (GPL-3.0-or-later).\n * See reference/NOTICE-GPL.md and reference/THIRD_PARTY_GPL-3.0.txt.\n */\n:host, .gte-shell {\n  --gte-bg: #ffffff;\n  --gte-panel: rgba(255,255,255,.965);\n  --gte-text: #202123;\n  --gte-muted: #8a8d93;\n  --gte-border: rgba(0,0,0,.10);\n  --gte-hover: rgba(0,0,0,.045);\n  --gte-active: #6d5dfc;\n  --gte-active-soft: rgba(109,93,252,.11);\n  --gte-timeline-active: #202123;\n  --gte-timeline-dot: #b9bdc4;\n  --gte-shadow: 0 12px 36px rgba(0,0,0,.14);\n}\n:host([data-theme=\"dark\"]), .gte-shell[data-theme=\"dark\"] {\n  --gte-bg: #1f2023;\n  --gte-panel: rgba(31,32,35,.965);\n  --gte-text: #f3f3f4;\n  --gte-muted: #96999f;\n  --gte-border: rgba(255,255,255,.11);\n  --gte-hover: rgba(255,255,255,.065);\n  --gte-active-soft: rgba(133,119,255,.18);\n  --gte-timeline-active: #f1f3f5;\n  --gte-timeline-dot: #747981;\n  --gte-shadow: 0 12px 36px rgba(0,0,0,.32);\n}\n\n.gte-timeline-rail {\n  position: fixed;\n  top: 94px;\n  right: 10px;\n  bottom: 112px;\n  z-index: 2147483100;\n  width: 28px;\n  min-height: 220px;\n  box-sizing: border-box;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  padding: 8px 3px 34px;\n  border: 1px solid rgba(0,0,0,.035);\n  border-radius: 14px;\n  background: rgba(248,249,250,.72);\n  box-shadow: 0 2px 12px rgba(0,0,0,.055);\n  backdrop-filter: blur(9px);\n  -webkit-backdrop-filter: blur(9px);\n}\n:host([data-theme=\"dark\"]) .gte-timeline-rail,\n.gte-shell[data-theme=\"dark\"] .gte-timeline-rail {\n  background: rgba(38,40,44,.70);\n  border-color: rgba(255,255,255,.045);\n  box-shadow: 0 2px 14px rgba(0,0,0,.20);\n}\n.gte-timeline-rail[hidden], .gte-question-panel[hidden] { display: none !important; }\n\n.gte-rail-markers {\n  position: relative;\n  width: 100%;\n  flex: 1 1 auto;\n  min-height: 0;\n  margin-top: 6px;\n}\n.gte-rail-marker,\n.gte-rail-toggle,\n.gte-question-close,\n.gte-follow-active {\n  appearance: none;\n  border: 0;\n  font: inherit;\n  color: inherit;\n  cursor: pointer;\n}\n.gte-rail-marker {\n  position: absolute;\n  left: 50%;\n  width: 18px;\n  height: 18px;\n  padding: 0;\n  transform: translate(-50%, -50%);\n  border-radius: 999px;\n  background: transparent;\n  outline: none;\n}\n.gte-rail-marker::after {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 5px;\n  height: 5px;\n  transform: translate(-50%, -50%);\n  border-radius: 999px;\n  background: var(--gte-timeline-dot);\n  transition: transform .13s ease, background .13s ease, opacity .13s ease;\n  opacity: .86;\n}\n.gte-rail-marker:hover::after {\n  transform: translate(-50%, -50%) scale(1.35);\n  background: var(--gte-muted);\n}\n.gte-rail-marker.is-active::before {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 13px;\n  height: 13px;\n  transform: translate(-50%, -50%);\n  border: 2px solid var(--gte-timeline-active);\n  border-radius: 999px;\n  box-sizing: border-box;\n}\n.gte-rail-marker.is-active::after {\n  width: 4px;\n  height: 4px;\n  background: var(--gte-timeline-active);\n  opacity: .92;\n}\n.gte-rail-marker.is-pending::before {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 14px;\n  height: 14px;\n  transform: translate(-50%, -50%);\n  border: 2px dashed var(--gte-active);\n  border-radius: 999px;\n  box-sizing: border-box;\n}\n.gte-rail-marker.is-pending::after {\n  background: var(--gte-active);\n  opacity: 1;\n}\n.gte-rail-toggle {\n  position: absolute;\n  left: 50%;\n  bottom: 5px;\n  width: 22px;\n  height: 22px;\n  transform: translateX(-50%);\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  border-radius: 7px;\n  background: transparent;\n  color: var(--gte-muted);\n  font-size: 15px;\n  line-height: 1;\n  opacity: .88;\n}\n.gte-rail-toggle:hover {\n  background: var(--gte-hover);\n  color: var(--gte-text);\n  opacity: 1;\n}\n\n.gte-question-panel {\n  position: fixed;\n  z-index: 2147483099;\n  width: 250px;\n  max-height: min(68vh, 620px);\n  overflow: hidden;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: 0 12px 40px rgba(0,0,0,.12), 0 4px 12px rgba(0,0,0,.055);\n  color: var(--gte-text);\n  backdrop-filter: blur(12px);\n  -webkit-backdrop-filter: blur(12px);\n  animation: gte-ql-in .16s cubic-bezier(.16,1,.3,1);\n}\n@keyframes gte-ql-in {\n  from { opacity: 0; transform: scale(.975) translateX(4px); }\n  to { opacity: 1; transform: scale(1) translateX(0); }\n}\n.gte-question-header {\n  height: 42px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 8px 0 12px;\n  border-bottom: 1px solid rgba(0,0,0,.055);\n}\n:host([data-theme=\"dark\"]) .gte-question-header,\n.gte-shell[data-theme=\"dark\"] .gte-question-header { border-bottom-color: rgba(255,255,255,.06); }\n.gte-question-header strong { flex: 1; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }\n.gte-question-count { color: var(--gte-muted); font-size: 11px; font-variant-numeric: tabular-nums; }\n.gte-question-close, .gte-follow-active {\n  width: 24px;\n  height: 24px;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--gte-muted);\n}\n.gte-question-close:hover, .gte-follow-active:hover { background: var(--gte-hover); color: var(--gte-text); }\n.gte-question-list {\n  max-height: calc(min(68vh, 620px) - 42px);\n  overflow-y: auto;\n  overflow-x: hidden;\n  padding: 4px 3px;\n  overscroll-behavior: contain;\n  scrollbar-width: thin;\n}\n.gte-question-row {\n  width: 100%;\n  min-width: 0;\n  height: 32px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 7px;\n  border: 0;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--gte-text);\n  cursor: pointer;\n  text-align: left;\n  font: 12.5px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n}\n.gte-question-row:hover { background: var(--gte-hover); }\n.gte-question-row.is-active { background: rgba(0,0,0,.055); color: var(--gte-text); }\n:host([data-theme=\"dark\"]) .gte-question-row.is-active,\n.gte-shell[data-theme=\"dark\"] .gte-question-row.is-active { background: rgba(255,255,255,.08); }\n.gte-question-row.is-pending {\n  background: var(--gte-active-soft);\n  box-shadow: inset 2px 0 0 var(--gte-active);\n}\n.gte-question-number {\n  flex: 0 0 31px;\n  color: var(--gte-muted);\n  font-size: 10.5px;\n  font-weight: 650;\n  text-align: right;\n  font-variant-numeric: tabular-nums;\n  letter-spacing: .01em;\n}\n.gte-question-row.is-active .gte-question-number { color: var(--gte-text); font-weight: 750; }\n.gte-question-row.is-pending .gte-question-number { color: var(--gte-active); font-weight: 750; }\n.gte-question-text {\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n:host, .gte-shell {\n  --gte-prompt-bg: var(--gte-panel, rgba(31,32,35,.96));\n}\n.gte-prompt-trigger {\n  position: fixed;\n  z-index: 2147483101;\n  width: 32px;\n  height: 32px;\n  padding: 0;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: 0 4px 14px rgba(0,0,0,.11);\n  color: var(--gte-active);\n  font: 700 16px/1 system-ui, sans-serif;\n  cursor: pointer;\n  backdrop-filter: blur(10px);\n  -webkit-backdrop-filter: blur(10px);\n  transition: background .14s ease, transform .14s ease, box-shadow .14s ease;\n}\n.gte-prompt-trigger:hover {\n  background: var(--gte-active-soft);\n  transform: translateY(-1px);\n  box-shadow: 0 5px 16px rgba(0,0,0,.13);\n}\n.gte-prompt-trigger[hidden], .gte-prompt-panel[hidden] { display: none !important; }\n.gte-prompt-panel {\n  position: fixed;\n  z-index: 2147483102;\n  width: 332px;\n  max-height: min(410px, calc(100vh - 24px));\n  overflow: hidden;\n  border: 1px solid var(--gte-border);\n  border-radius: 14px;\n  background: var(--gte-panel);\n  box-shadow: var(--gte-shadow);\n  color: var(--gte-text);\n  backdrop-filter: blur(14px);\n  -webkit-backdrop-filter: blur(14px);\n  animation: gte-prompt-in .16s cubic-bezier(.16,1,.3,1);\n}\n.gte-prompt-panel[data-placement=\"above\"] { transform-origin: bottom left; }\n.gte-prompt-panel[data-placement=\"below\"] { transform-origin: top left; }\n@keyframes gte-prompt-in {\n  from { opacity: 0; transform: scale(.975) translateY(4px); }\n  to { opacity: 1; transform: scale(1) translateY(0); }\n}\n.gte-prompt-header {\n  height: 44px;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 9px 0 13px;\n  border-bottom: 1px solid var(--gte-border);\n}\n.gte-prompt-header strong { flex: 1; font-size: 13px; }\n.gte-prompt-icon-button, .gte-prompt-action, .gte-primary-button, .gte-secondary-button, .gte-prompt-item-main {\n  border: 0;\n  font: inherit;\n  cursor: pointer;\n}\n.gte-prompt-icon-button {\n  width: 27px;\n  height: 27px;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--gte-muted);\n}\n.gte-prompt-icon-button:hover { background: var(--gte-hover); color: var(--gte-text); }\n.gte-prompt-body { max-height: 366px; overflow-y: auto; padding: 9px; box-sizing: border-box; }\n.gte-prompt-search, .gte-prompt-input, .gte-prompt-textarea {\n  width: 100%;\n  box-sizing: border-box;\n  border: 1px solid var(--gte-border);\n  border-radius: 9px;\n  background: var(--gte-bg);\n  color: var(--gte-text);\n  outline: none;\n  font: 12px/1.4 system-ui, sans-serif;\n}\n.gte-prompt-search, .gte-prompt-input { height: 34px; padding: 0 10px; }\n.gte-prompt-search { margin-bottom: 8px; }\n.gte-prompt-search:focus, .gte-prompt-input:focus, .gte-prompt-textarea:focus { border-color: var(--gte-active); }\n.gte-prompt-list { display: flex; flex-direction: column; gap: 6px; }\n.gte-prompt-item {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  padding: 4px;\n  border-radius: 10px;\n}\n.gte-prompt-item:hover { background: var(--gte-hover); }\n.gte-prompt-item-main {\n  flex: 1;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 3px;\n  padding: 6px;\n  background: transparent;\n  color: var(--gte-text);\n  text-align: left;\n}\n.gte-prompt-item-main strong { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }\n.gte-prompt-item-main span {\n  width: 100%;\n  overflow: hidden;\n  display: -webkit-box;\n  -webkit-line-clamp: 2;\n  -webkit-box-orient: vertical;\n  color: var(--gte-muted);\n  font-size: 11px;\n  line-height: 1.35;\n}\n.gte-prompt-actions { display: flex; gap: 2px; }\n.gte-prompt-action {\n  min-width: 25px;\n  height: 25px;\n  padding: 0 5px;\n  border-radius: 7px;\n  background: transparent;\n  color: var(--gte-muted);\n  font-size: 10px;\n}\n.gte-prompt-action:hover { background: var(--gte-active-soft); color: var(--gte-active); }\n.gte-prompt-action.is-danger { color: #ef5350; background: rgba(239,83,80,.12); }\n.gte-prompt-empty, .gte-prompt-empty-small {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 12px;\n  padding: 30px 12px;\n  color: var(--gte-muted);\n  font-size: 12px;\n}\n.gte-prompt-empty-small { padding: 18px 8px; }\n.gte-primary-button, .gte-secondary-button {\n  height: 32px;\n  padding: 0 12px;\n  border-radius: 8px;\n  font-size: 12px;\n}\n.gte-primary-button { background: var(--gte-active); color: white; }\n.gte-secondary-button { background: var(--gte-hover); color: var(--gte-text); }\n.gte-prompt-editor { display: flex; flex-direction: column; gap: 8px; }\n.gte-prompt-textarea { min-height: 150px; resize: vertical; padding: 9px 10px; }\n.gte-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }\n.gte-toast {\n  position: fixed;\n  z-index: 2147483103;\n  left: 50%;\n  bottom: 34px;\n  transform: translateX(-50%);\n  max-width: min(420px, 80vw);\n  padding: 9px 13px;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: var(--gte-shadow);\n  color: var(--gte-text);\n  font: 12px/1.4 system-ui, sans-serif;\n}\n";
+const BUNDLED_STYLE_TEXT = "/*\n * GPT TalkEnhancer 0.3 Timeline UI.\n * Interaction/visual baseline adapted from houyanchao/chatgpt-gemini-timeline (GPL-3.0-or-later).\n * See reference/NOTICE-GPL.md and reference/THIRD_PARTY_GPL-3.0.txt.\n */\n:host, .gte-shell {\n  --gte-bg: #ffffff;\n  --gte-panel: rgba(255,255,255,.965);\n  --gte-text: #202123;\n  --gte-muted: #8a8d93;\n  --gte-border: rgba(0,0,0,.10);\n  --gte-hover: rgba(0,0,0,.045);\n  --gte-active: #6d5dfc;\n  --gte-active-soft: rgba(109,93,252,.11);\n  --gte-timeline-active: #202123;\n  --gte-timeline-dot: #b9bdc4;\n  --gte-shadow: 0 12px 36px rgba(0,0,0,.14);\n}\n:host([data-theme=\"dark\"]), .gte-shell[data-theme=\"dark\"] {\n  --gte-bg: #1f2023;\n  --gte-panel: rgba(31,32,35,.965);\n  --gte-text: #f3f3f4;\n  --gte-muted: #96999f;\n  --gte-border: rgba(255,255,255,.11);\n  --gte-hover: rgba(255,255,255,.065);\n  --gte-active-soft: rgba(133,119,255,.18);\n  --gte-timeline-active: #f1f3f5;\n  --gte-timeline-dot: #747981;\n  --gte-shadow: 0 12px 36px rgba(0,0,0,.32);\n}\n\n.gte-timeline-rail {\n  position: fixed;\n  top: 94px;\n  right: 10px;\n  bottom: 112px;\n  z-index: 2147483100;\n  width: 28px;\n  min-height: 220px;\n  box-sizing: border-box;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  padding: 8px 3px 34px;\n  border: 1px solid rgba(0,0,0,.035);\n  border-radius: 14px;\n  background: rgba(248,249,250,.72);\n  box-shadow: 0 2px 12px rgba(0,0,0,.055);\n  backdrop-filter: blur(9px);\n  -webkit-backdrop-filter: blur(9px);\n}\n:host([data-theme=\"dark\"]) .gte-timeline-rail,\n.gte-shell[data-theme=\"dark\"] .gte-timeline-rail {\n  background: rgba(38,40,44,.70);\n  border-color: rgba(255,255,255,.045);\n  box-shadow: 0 2px 14px rgba(0,0,0,.20);\n}\n.gte-timeline-rail[hidden], .gte-question-panel[hidden] { display: none !important; }\n\n.gte-rail-markers {\n  position: relative;\n  width: 100%;\n  flex: 1 1 auto;\n  min-height: 0;\n  margin-top: 6px;\n}\n.gte-rail-marker,\n.gte-rail-toggle,\n.gte-question-close,\n.gte-follow-active {\n  appearance: none;\n  border: 0;\n  font: inherit;\n  color: inherit;\n  cursor: pointer;\n}\n.gte-rail-marker {\n  position: absolute;\n  left: 50%;\n  width: 18px;\n  height: 18px;\n  padding: 0;\n  transform: translate(-50%, -50%);\n  border-radius: 999px;\n  background: transparent;\n  outline: none;\n}\n.gte-rail-marker::after {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 5px;\n  height: 5px;\n  transform: translate(-50%, -50%);\n  border-radius: 999px;\n  background: var(--gte-timeline-dot);\n  transition: transform .13s ease, background .13s ease, opacity .13s ease;\n  opacity: .86;\n}\n.gte-rail-marker:hover::after {\n  transform: translate(-50%, -50%) scale(1.35);\n  background: var(--gte-muted);\n}\n.gte-rail-marker.is-active::before {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 13px;\n  height: 13px;\n  transform: translate(-50%, -50%);\n  border: 2px solid var(--gte-timeline-active);\n  border-radius: 999px;\n  box-sizing: border-box;\n}\n.gte-rail-marker.is-active::after {\n  width: 4px;\n  height: 4px;\n  background: var(--gte-timeline-active);\n  opacity: .92;\n}\n.gte-rail-marker.is-pending::before {\n  content: \"\";\n  position: absolute;\n  left: 50%;\n  top: 50%;\n  width: 14px;\n  height: 14px;\n  transform: translate(-50%, -50%);\n  border: 2px dashed var(--gte-active);\n  border-radius: 999px;\n  box-sizing: border-box;\n}\n.gte-rail-marker.is-pending::after {\n  background: var(--gte-active);\n  opacity: 1;\n}\n.gte-rail-toggle {\n  position: absolute;\n  left: 50%;\n  bottom: 5px;\n  width: 22px;\n  height: 22px;\n  transform: translateX(-50%);\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  border-radius: 7px;\n  background: transparent;\n  color: var(--gte-muted);\n  font-size: 15px;\n  line-height: 1;\n  opacity: .88;\n}\n.gte-rail-toggle:hover {\n  background: var(--gte-hover);\n  color: var(--gte-text);\n  opacity: 1;\n}\n\n.gte-question-panel {\n  position: fixed;\n  z-index: 2147483099;\n  width: 250px;\n  max-height: min(68vh, 620px);\n  overflow: hidden;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: 0 12px 40px rgba(0,0,0,.12), 0 4px 12px rgba(0,0,0,.055);\n  color: var(--gte-text);\n  backdrop-filter: blur(12px);\n  -webkit-backdrop-filter: blur(12px);\n  animation: gte-ql-in .16s cubic-bezier(.16,1,.3,1);\n}\n@keyframes gte-ql-in {\n  from { opacity: 0; transform: scale(.975) translateX(4px); }\n  to { opacity: 1; transform: scale(1) translateX(0); }\n}\n.gte-question-header {\n  height: 42px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 8px 0 12px;\n  border-bottom: 1px solid rgba(0,0,0,.055);\n}\n:host([data-theme=\"dark\"]) .gte-question-header,\n.gte-shell[data-theme=\"dark\"] .gte-question-header { border-bottom-color: rgba(255,255,255,.06); }\n.gte-question-header strong { flex: 1; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }\n.gte-question-count { color: var(--gte-muted); font-size: 11px; font-variant-numeric: tabular-nums; }\n.gte-question-close, .gte-follow-active {\n  width: 24px;\n  height: 24px;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--gte-muted);\n}\n.gte-question-close:hover, .gte-follow-active:hover { background: var(--gte-hover); color: var(--gte-text); }\n.gte-load-earlier {\n  appearance: none;\n  width: 24px;\n  height: 24px;\n  flex: 0 0 24px;\n  border: 0;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--gte-muted);\n  cursor: pointer;\n  font: 14px/1 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n}\n.gte-load-earlier:hover:not(:disabled) { background: var(--gte-hover); color: var(--gte-text); }\n.gte-load-earlier:disabled { cursor: default; opacity: .58; }\n.gte-question-list {\n  max-height: calc(min(68vh, 620px) - 42px);\n  overflow-y: auto;\n  overflow-x: hidden;\n  padding: 4px 3px;\n  overscroll-behavior: contain;\n  scrollbar-width: thin;\n}\n.gte-question-row {\n  width: 100%;\n  min-width: 0;\n  height: 32px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 7px;\n  border: 0;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--gte-text);\n  cursor: pointer;\n  text-align: left;\n  font: 12.5px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n}\n.gte-question-row:hover { background: var(--gte-hover); }\n.gte-question-row.is-active { background: rgba(0,0,0,.055); color: var(--gte-text); }\n:host([data-theme=\"dark\"]) .gte-question-row.is-active,\n.gte-shell[data-theme=\"dark\"] .gte-question-row.is-active { background: rgba(255,255,255,.08); }\n.gte-question-row.is-pending {\n  background: var(--gte-active-soft);\n  box-shadow: inset 2px 0 0 var(--gte-active);\n}\n.gte-question-number {\n  flex: 0 0 31px;\n  color: var(--gte-muted);\n  font-size: 10.5px;\n  font-weight: 650;\n  text-align: right;\n  font-variant-numeric: tabular-nums;\n  letter-spacing: .01em;\n}\n.gte-question-row.is-active .gte-question-number { color: var(--gte-text); font-weight: 750; }\n.gte-question-row.is-pending .gte-question-number { color: var(--gte-active); font-weight: 750; }\n.gte-question-text {\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n:host, .gte-shell {\n  --gte-prompt-bg: var(--gte-panel, rgba(31,32,35,.96));\n}\n.gte-prompt-trigger {\n  position: fixed;\n  z-index: 2147483101;\n  width: 32px;\n  height: 32px;\n  padding: 0;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: 0 4px 14px rgba(0,0,0,.11);\n  color: var(--gte-active);\n  font: 700 16px/1 system-ui, sans-serif;\n  cursor: pointer;\n  backdrop-filter: blur(10px);\n  -webkit-backdrop-filter: blur(10px);\n  transition: background .14s ease, transform .14s ease, box-shadow .14s ease;\n}\n.gte-prompt-trigger:hover {\n  background: var(--gte-active-soft);\n  transform: translateY(-1px);\n  box-shadow: 0 5px 16px rgba(0,0,0,.13);\n}\n.gte-prompt-trigger[hidden], .gte-prompt-panel[hidden] { display: none !important; }\n.gte-prompt-panel {\n  position: fixed;\n  z-index: 2147483102;\n  width: 332px;\n  max-height: min(410px, calc(100vh - 24px));\n  overflow: hidden;\n  border: 1px solid var(--gte-border);\n  border-radius: 14px;\n  background: var(--gte-panel);\n  box-shadow: var(--gte-shadow);\n  color: var(--gte-text);\n  backdrop-filter: blur(14px);\n  -webkit-backdrop-filter: blur(14px);\n  animation: gte-prompt-in .16s cubic-bezier(.16,1,.3,1);\n}\n.gte-prompt-panel[data-placement=\"above\"] { transform-origin: bottom left; }\n.gte-prompt-panel[data-placement=\"below\"] { transform-origin: top left; }\n@keyframes gte-prompt-in {\n  from { opacity: 0; transform: scale(.975) translateY(4px); }\n  to { opacity: 1; transform: scale(1) translateY(0); }\n}\n.gte-prompt-header {\n  height: 44px;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 9px 0 13px;\n  border-bottom: 1px solid var(--gte-border);\n}\n.gte-prompt-header strong { flex: 1; font-size: 13px; }\n.gte-prompt-icon-button, .gte-prompt-action, .gte-primary-button, .gte-secondary-button, .gte-prompt-item-main {\n  border: 0;\n  font: inherit;\n  cursor: pointer;\n}\n.gte-prompt-icon-button {\n  width: 27px;\n  height: 27px;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--gte-muted);\n}\n.gte-prompt-icon-button:hover { background: var(--gte-hover); color: var(--gte-text); }\n.gte-prompt-body { max-height: 366px; overflow-y: auto; padding: 9px; box-sizing: border-box; }\n.gte-prompt-search, .gte-prompt-input, .gte-prompt-textarea {\n  width: 100%;\n  box-sizing: border-box;\n  border: 1px solid var(--gte-border);\n  border-radius: 9px;\n  background: var(--gte-bg);\n  color: var(--gte-text);\n  outline: none;\n  font: 12px/1.4 system-ui, sans-serif;\n}\n.gte-prompt-search, .gte-prompt-input { height: 34px; padding: 0 10px; }\n.gte-prompt-search { margin-bottom: 8px; }\n.gte-prompt-search:focus, .gte-prompt-input:focus, .gte-prompt-textarea:focus { border-color: var(--gte-active); }\n.gte-prompt-list { display: flex; flex-direction: column; gap: 6px; }\n.gte-prompt-item {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  padding: 4px;\n  border-radius: 10px;\n}\n.gte-prompt-item:hover { background: var(--gte-hover); }\n.gte-prompt-item-main {\n  flex: 1;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  align-items: flex-start;\n  gap: 3px;\n  padding: 6px;\n  background: transparent;\n  color: var(--gte-text);\n  text-align: left;\n}\n.gte-prompt-item-main strong { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }\n.gte-prompt-item-main span {\n  width: 100%;\n  overflow: hidden;\n  display: -webkit-box;\n  -webkit-line-clamp: 2;\n  -webkit-box-orient: vertical;\n  color: var(--gte-muted);\n  font-size: 11px;\n  line-height: 1.35;\n}\n.gte-prompt-actions { display: flex; gap: 2px; }\n.gte-prompt-action {\n  min-width: 25px;\n  height: 25px;\n  padding: 0 5px;\n  border-radius: 7px;\n  background: transparent;\n  color: var(--gte-muted);\n  font-size: 10px;\n}\n.gte-prompt-action:hover { background: var(--gte-active-soft); color: var(--gte-active); }\n.gte-prompt-action.is-danger { color: #ef5350; background: rgba(239,83,80,.12); }\n.gte-prompt-empty, .gte-prompt-empty-small {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 12px;\n  padding: 30px 12px;\n  color: var(--gte-muted);\n  font-size: 12px;\n}\n.gte-prompt-empty-small { padding: 18px 8px; }\n.gte-primary-button, .gte-secondary-button {\n  height: 32px;\n  padding: 0 12px;\n  border-radius: 8px;\n  font-size: 12px;\n}\n.gte-primary-button { background: var(--gte-active); color: white; }\n.gte-secondary-button { background: var(--gte-hover); color: var(--gte-text); }\n.gte-prompt-editor { display: flex; flex-direction: column; gap: 8px; }\n.gte-prompt-textarea { min-height: 150px; resize: vertical; padding: 9px 10px; }\n.gte-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }\n.gte-toast {\n  position: fixed;\n  z-index: 2147483103;\n  left: 50%;\n  bottom: 34px;\n  transform: translateX(-50%);\n  max-width: min(420px, 80vw);\n  padding: 9px 13px;\n  border: 1px solid var(--gte-border);\n  border-radius: 10px;\n  background: var(--gte-panel);\n  box-shadow: var(--gte-shadow);\n  color: var(--gte-text);\n  font: 12px/1.4 system-ui, sans-serif;\n}\n";
 
 Object.assign(exports, { BUNDLED_STYLE_TEXT });
 
@@ -3998,12 +5847,13 @@ const { Toast } = __require("src/v3/ui/toast.js");
 const { BUNDLED_STYLE_TEXT } = __require("src/v3/ui/style-bundle.js");
 
 class AppShell {
-  constructor({ document, window, host, promptStore, onNavigate, initialPanelOpen = false } = {}) {
+  constructor({ document, window, host, promptStore, onNavigate, onLoadEarlier, initialPanelOpen = false } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
     this.host = host;
     this.promptStore = promptStore;
     this.onNavigate = onNavigate ?? (() => {});
+    this.onLoadEarlier = onLoadEarlier ?? (() => {});
     this.initialPanelOpen = initialPanelOpen;
     this.hostElement = null;
     this.root = null;
@@ -4041,6 +5891,7 @@ class AppShell {
       document: this.document,
       window: this.window,
       onSelect: (turnId) => this.onNavigate(turnId),
+      onLoadEarlier: () => this.onLoadEarlier(),
       onOpenChange: (open) => { this.panelOpen = open; },
       getAnchorRect: () => this.rail?.getAnchorRect?.() ?? null
     });
@@ -4091,6 +5942,10 @@ class AppShell {
     this.questionList?.setActive(activeTurnId);
     this.rail?.setState(turns, activeTurnId);
     this.questionList?.updatePosition?.();
+  }
+
+  setQuestionHistoryState(state = {}) {
+    this.questionList?.setEarlierAction?.(state);
   }
 
   setNavigationState({ state = "idle", target = null, targetOrder = null, pendingVisible = false } = {}) {
@@ -4153,8 +6008,11 @@ class AppShell {
   getStatus() {
     return {
       timelineMounted: Boolean(this.rail?.element),
+      timelineHidden: Boolean(this.rail?.element?.hidden),
+      timelineMarkerCount: Number(this.rail?.markers?.children?.length ?? 0),
       questionPanelOpen: Boolean(this.questionList?.opened),
       questionRenderCount: this.questionList?.renderCount ?? 0,
+      questionTurnCount: Number(this.questionList?.turns?.length ?? 0),
       promptMounted: Boolean(this.promptTrigger?.element),
       promptPanelOpen: Boolean(this.promptPanel?.opened)
     };
@@ -4182,1869 +6040,6 @@ class AppShell {
 Object.assign(exports, { AppShell });
 
 },
-"src/v3/diagnostics/official-navigation-probe.js": (module, exports, __require) => {
-const { createScrollModel } = __require("src/v3/core/scroll-model.js");
-
-const DEFAULT_SAMPLE_DELAYS_MS = [24, 80, 180, 420, 900, 1200];
-const MAX_SAMPLES = 32;
-const MAX_PATH_NODES = 6;
-const MAX_CLASS_TOKENS = 8;
-
-class OfficialNavigationProbe {
-  constructor({ document, window, getContext = () => null, getScrollContainer = () => null, getVisibleRange = () => null, isOwnedEvent = defaultOwnedEvent, onPrivateMarker = null, onRecord = null, sampleDelaysMs = DEFAULT_SAMPLE_DELAYS_MS } = {}) {
-    this.document = document ?? globalThis.document;
-    this.window = window ?? globalThis.window;
-    this.getContext = getContext;
-    this.getScrollContainer = getScrollContainer;
-    this.getVisibleRange = getVisibleRange;
-    this.isOwnedEvent = isOwnedEvent;
-    this.onPrivateMarker = onPrivateMarker;
-    this.onRecord = onRecord;
-    this.sampleDelaysMs = [...sampleDelaysMs].filter((value) => Number(value) >= 0);
-    this.active = null;
-    this.sequence = 0;
-    this.started = false;
-    this.boundClick = (event) => this.handleClick(event);
-  }
-
-  start() {
-    if (this.started) return this;
-    this.started = true;
-    this.document?.addEventListener?.("click", this.boundClick, true);
-    return this;
-  }
-
-  destroy() {
-    if (!this.started) return;
-    this.started = false;
-    this.document?.removeEventListener?.("click", this.boundClick, true);
-    this.finishActive("destroyed", { emit: false });
-  }
-
-  handleClick(event) {
-    if (!this.started || this.isOwnedEvent?.(event)) return;
-    const context = safeCall(this.getContext);
-    if (!context?.enabled || !context?.sessionKey) return;
-    if (isConversationSwitchEvent(event) || isEditorEvent(event)) return;
-    const container = safeCall(this.getScrollContainer);
-    if (!container || container.isConnected === false) return;
-
-    this.finishActive("superseded-click");
-    const startedAtMs = probeNow(this.window);
-    const active = {
-      probeId: ++this.sequence,
-      context,
-      initialContainer: container,
-      startedAtMs,
-      startedAt: new Date().toISOString(),
-      trigger: fingerprintClickTarget(event, this.window),
-      marker: identifyOfficialNavigationMarker(event, this.document),
-      before: this.readSnapshot(container),
-      after: null,
-      samples: [],
-      timers: [],
-      observer: null,
-      scrollContainer: null,
-      scrollEventCount: 0,
-      mutationCount: 0,
-      firstScrollMs: null,
-      firstWindowMs: null,
-      firstExtentMs: null
-    };
-    this.active = active;
-    const privateMarkerKey = readOfficialNavigationMarkerKey(event);
-    if (active.marker && privateMarkerKey) {
-      try { this.onPrivateMarker?.({ probeId: active.probeId, sessionKey: context.sessionKey, markerKey: privateMarkerKey, markerIndex: active.marker.markerIndex, markerCount: active.marker.markerCount }); } catch {}
-    }
-    this.appendSample(active, "click", active.before, 0);
-    this.bindActiveContainer(active, container);
-
-    for (const delayMs of this.sampleDelaysMs) {
-      const timer = setTimer(this.window, () => {
-        if (this.active !== active) return;
-        const snapshot = this.readSnapshot();
-        this.observeMilestones(active, snapshot);
-        this.appendSample(active, "timer", snapshot);
-        if (delayMs === this.sampleDelaysMs.at(-1)) this.finishActive("settled");
-      }, delayMs);
-      active.timers.push(timer);
-    }
-  }
-
-  bindActiveContainer(active, container) {
-    if (!active || !container || active.scrollContainer === container) return;
-    if (active.scrollContainer) active.scrollContainer.removeEventListener?.("scroll", active.onScroll);
-    active.scrollContainer = container;
-    active.onScroll = () => {
-      if (this.active !== active) return;
-      active.scrollEventCount += 1;
-      if (active.firstScrollMs == null) active.firstScrollMs = elapsedMs(this.window, active.startedAtMs);
-      const currentContainer = safeCall(this.getScrollContainer) ?? container;
-      if (currentContainer !== active.scrollContainer) this.bindActiveContainer(active, currentContainer);
-      const snapshot = this.readSnapshot(currentContainer);
-      this.observeMilestones(active, snapshot);
-      this.appendSample(active, "scroll", snapshot);
-    };
-    container.addEventListener?.("scroll", active.onScroll, { passive: true });
-
-    try { active.observer?.disconnect?.(); } catch {}
-    const MutationObserverCtor = this.window?.MutationObserver;
-    if (typeof MutationObserverCtor === "function") {
-      try {
-        active.observer = new MutationObserverCtor(() => {
-          if (this.active !== active) return;
-          active.mutationCount += 1;
-          const currentContainer = safeCall(this.getScrollContainer) ?? container;
-          if (currentContainer !== active.scrollContainer) this.bindActiveContainer(active, currentContainer);
-          const snapshot = this.readSnapshot(currentContainer);
-          this.observeMilestones(active, snapshot);
-          this.appendSample(active, "mutation", snapshot);
-        });
-        active.observer.observe(container, { subtree: true, childList: true, attributes: true });
-      } catch {
-        active.observer = null;
-      }
-    }
-  }
-
-  readSnapshot(explicitContainer = null) {
-    const container = explicitContainer ?? safeCall(this.getScrollContainer);
-    if (!container) return null;
-    const flexDirection = safeFlexDirection(this.window, container);
-    const model = createScrollModel({
-      scrollTop: container.scrollTop,
-      scrollHeight: container.scrollHeight,
-      clientHeight: container.clientHeight,
-      flexDirection
-    });
-    const range = sanitizeVisibleRange(safeCall(this.getVisibleRange));
-    return {
-      physicalScrollTop: roundNumber(container.scrollTop),
-      scrollHeight: roundNumber(model.scrollHeight),
-      clientHeight: roundNumber(model.clientHeight),
-      logicalPosition: roundNumber(model.logicalPosition),
-      maxLogicalPosition: roundNumber(model.maxLogicalPosition),
-      isColumnReverse: Boolean(model.isColumnReverse),
-      visibleRange: range,
-      containerChanged: Boolean(this.active && container !== this.active.initialContainer)
-    };
-  }
-
-  observeMilestones(active, snapshot) {
-    if (!active || !snapshot || !active.before) return;
-    const t = elapsedMs(this.window, active.startedAtMs);
-    if (active.firstWindowMs == null && visibleRangeChanged(active.before.visibleRange, snapshot.visibleRange)) active.firstWindowMs = t;
-    if (active.firstExtentMs == null && Math.abs(snapshot.scrollHeight - active.before.scrollHeight) > 2) active.firstExtentMs = t;
-  }
-
-  appendSample(active, kind, snapshot, explicitElapsed = null) {
-    if (!active || !snapshot) return;
-    const sample = { t: explicitElapsed == null ? elapsedMs(this.window, active.startedAtMs) : explicitElapsed, kind, ...snapshot };
-    const previous = active.samples.at(-1);
-    if (previous && sampleEquivalent(previous, sample)) return;
-    active.samples.push(sample);
-    if (active.samples.length > MAX_SAMPLES) active.samples.splice(0, active.samples.length - MAX_SAMPLES);
-  }
-
-  finishActive(reason = "settled", { emit = true } = {}) {
-    const active = this.active;
-    if (!active) return null;
-    this.active = null;
-    for (const timer of active.timers ?? []) clearTimer(this.window, timer);
-    try { active.observer?.disconnect?.(); } catch {}
-    active.scrollContainer?.removeEventListener?.("scroll", active.onScroll);
-
-    const currentContext = safeCall(this.getContext);
-    if (!emit || !currentContext?.enabled || currentContext.sessionKey !== active.context.sessionKey) return null;
-    const finalContainer = safeCall(this.getScrollContainer) ?? active.initialContainer;
-    const after = this.readSnapshot(finalContainer);
-    active.after = after;
-    this.observeMilestones(active, after);
-    this.appendSample(active, "final", after);
-    if (!meaningfulNavigationChange(active.before, after, active.samples, active.scrollEventCount)) return null;
-
-    const metrics = computeProbeMetrics(active);
-    const record = sanitizeOfficialNavigationRecord({
-      probeId: active.probeId,
-      host: active.context.host ?? null,
-      source: active.context.source ?? null,
-      stable: Boolean(active.context.stable),
-      startedAt: active.startedAt,
-      finishedReason: reason,
-      trigger: active.trigger,
-      marker: active.marker,
-      totalElapsedMs: elapsedMs(this.window, active.startedAtMs),
-      clickToFirstScrollMs: active.firstScrollMs,
-      clickToFirstWindowMs: active.firstWindowMs,
-      clickToFirstExtentMs: active.firstExtentMs,
-      scrollEventCount: active.scrollEventCount,
-      mutationCount: active.mutationCount,
-      classification: classifyNavigation(active, metrics),
-      metrics,
-      before: active.before,
-      after,
-      samples: active.samples
-    });
-    if (record) {
-      try { this.onRecord?.(record); } catch {}
-    }
-    return record;
-  }
-}
-
-
-function readOfficialNavigationMarkerKey(event) {
-  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
-  for (const node of path ?? []) {
-    const value = node?.getAttribute?.("data-thread-user-message-navigation-item-id");
-    if (value != null) {
-      const key = String(value).trim();
-      return key || null;
-    }
-  }
-  return null;
-}
-
-function identifyOfficialNavigationMarker(event, documentRef = globalThis.document) {
-  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
-  let marker = null;
-  for (const node of path ?? []) {
-    if (node?.getAttribute?.("data-thread-user-message-navigation-item-id") != null) { marker = node; break; }
-  }
-  if (!marker) return null;
-  const buttons = Array.from(documentRef?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-  const index = buttons.indexOf(marker);
-  if (index < 0) return null;
-  return { markerIndex: index, markerCount: buttons.length };
-}
-
-function sanitizeOfficialNavigationLearningSample(value = {}) {
-  if (!value || typeof value !== "object") return null;
-  const markerIndex = Number(value.markerIndex);
-  const markerCount = Number(value.markerCount);
-  const targetOrder = Number(value.targetOrder);
-  const knownTurnCount = Number(value.knownTurnCount);
-  if (!Number.isInteger(markerIndex) || markerIndex < 0 || !Number.isInteger(markerCount) || markerCount <= markerIndex || !Number.isInteger(targetOrder) || targetOrder < 0) return null;
-  return {
-    markerIndex,
-    markerCount,
-    targetOrder,
-    knownTurnCount: Number.isInteger(knownTurnCount) && knownTurnCount >= 0 ? knownTurnCount : null,
-    host: safeString(value.host),
-    classification: safeString(value.classification),
-    observedAt: safeString(value.observedAt)
-  };
-}
-
-function selectTrustedOfficialBridgePair({ learning, targetOrder, markerCount, knownTurnCount, minHits = 2 } = {}) {
-  if (!learning || typeof learning !== "object") return null;
-  if (!learning.oneToOneObserved || !learning.monotonic || Number(learning.markerConflicts) > 0 || Number(learning.targetConflicts) > 0) return null;
-  if (!Number.isInteger(targetOrder) || targetOrder < 0) return null;
-  if (!Number.isInteger(markerCount) || markerCount <= 0 || Number(learning.markerCount) !== markerCount) return null;
-  if (!Number.isInteger(knownTurnCount) || knownTurnCount <= 0 || Number(learning.knownTurnCount) !== knownTurnCount) return null;
-  const pair = (Array.isArray(learning.observedPairs) ? learning.observedPairs : []).find((item) => Number(item?.targetOrder) === targetOrder);
-  if (!pair || !Number.isInteger(pair.markerIndex) || pair.markerIndex < 0 || pair.markerIndex >= markerCount) return null;
-  if ((Number(pair.hits) || 0) < Math.max(2, Number(minHits) || 2)) return null;
-  return { markerIndex: Number(pair.markerIndex), targetOrder, hits: Number(pair.hits) || 0 };
-}
-
-function sanitizeOfficialNavigationLearningHistory(value, limit = 32) {
-  if (!Array.isArray(value)) return [];
-  return value.map(sanitizeOfficialNavigationLearningSample).filter(Boolean).slice(-Math.max(1, Number(limit) || 32));
-}
-
-function analyzeOfficialNavigationLearning(samples = []) {
-  const clean = sanitizeOfficialNavigationLearningHistory(samples, 256);
-  const markerTargets = new Map();
-  const targetMarkers = new Map();
-  for (const sample of clean) {
-    const targets = markerTargets.get(sample.markerIndex) ?? new Set(); targets.add(sample.targetOrder); markerTargets.set(sample.markerIndex, targets);
-    const markers = targetMarkers.get(sample.targetOrder) ?? new Set(); markers.add(sample.markerIndex); targetMarkers.set(sample.targetOrder, markers);
-  }
-  const markerConflicts = [...markerTargets.values()].filter((targets) => targets.size > 1).length;
-  const targetConflicts = [...targetMarkers.values()].filter((markers) => markers.size > 1).length;
-  const pairs = [...markerTargets.entries()]
-    .filter(([, targets]) => targets.size === 1)
-    .map(([markerIndex, targets]) => {
-      const targetOrder = [...targets][0];
-      const hits = clean.filter((sample) => sample.markerIndex === markerIndex && sample.targetOrder === targetOrder).length;
-      return { markerIndex, targetOrder, offset: markerIndex - targetOrder, hits };
-    })
-    .sort((a, b) => a.markerIndex - b.markerIndex);
-  const monotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
-  const oneToOneObserved = markerConflicts === 0 && targetConflicts === 0;
-  const uniqueOffsets = [...new Set(pairs.map((pair) => pair.offset))].sort((a,b)=>a-b);
-  const latest = clean.at(-1) ?? null;
-  const knownTurnCount = latest?.knownTurnCount ?? null;
-  const markerCount = latest?.markerCount ?? null;
-  const targetCoverage = Number.isInteger(knownTurnCount) && knownTurnCount > 0 ? ratio(targetMarkers.size, knownTurnCount) : 0;
-  let recommendedBridgeMode = 'insufficient';
-  if (!oneToOneObserved || !monotonic) recommendedBridgeMode = 'unsafe-conflict';
-  else if (targetCoverage >= 0.95 && pairs.length >= 5) recommendedBridgeMode = 'learned-index-near-complete';
-  else if (pairs.length >= 5) recommendedBridgeMode = 'learned-pairs-only';
-  else if (pairs.length > 0) recommendedBridgeMode = 'collect-more';
-  return {
-    sampleCount: clean.length,
-    uniqueMarkerCount: markerTargets.size,
-    uniqueTargetCount: targetMarkers.size,
-    markerCount,
-    knownTurnCount,
-    markerConflicts,
-    targetConflicts,
-    oneToOneObserved,
-    monotonic,
-    uniqueOffsets,
-    targetCoverage: clampRatio(targetCoverage),
-    observedPairs: pairs.slice(-64),
-    recommendedBridgeMode
-  };
-}
-
-function sanitizeOfficialMarker(value) {
-  if (!value || typeof value !== "object") return null;
-  const markerIndex = Number(value.markerIndex), markerCount = Number(value.markerCount);
-  if (!Number.isInteger(markerIndex) || markerIndex < 0 || !Number.isInteger(markerCount) || markerCount <= markerIndex) return null;
-  return { markerIndex, markerCount };
-}
-
-function fingerprintClickTarget(event, windowRef = globalThis.window) {
-  const path = typeof event?.composedPath === "function" ? event.composedPath() : buildElementPath(event?.target);
-  const nodes = [];
-  for (const node of path ?? []) {
-    if (!node || typeof node !== "object" || !node.tagName) continue;
-    const tag = String(node.tagName).toLowerCase();
-    if (tag === "html" || tag === "body") continue;
-    nodes.push(fingerprintElement(node, windowRef));
-    if (nodes.length >= MAX_PATH_NODES) break;
-  }
-  return { trusted: Boolean(event?.isTrusted), path: nodes };
-}
-
-function analyzeOfficialNavigationMapping({ document, turns = [] } = {}) {
-  const buttons = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-  const officialIds = buttons
-    .map((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim())
-    .filter(Boolean);
-  const orderedTurns = (Array.isArray(turns) ? turns : [])
-    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
-    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }))
-    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
-  const turnOrderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
-  const officialUniqueIdCount = new Set(officialIds).size;
-  const knownUniqueIdCount = new Set(orderedTurns.map((turn) => turn.id)).size;
-  const matchedOrders = officialIds.map((id) => turnOrderById.get(id)).filter(Number.isFinite);
-  const exactIdMatches = matchedOrders.length;
-  let orderedExactMatches = 0;
-  for (let index = 0; index < Math.min(officialIds.length, orderedTurns.length); index += 1) {
-    if (officialIds[index] === orderedTurns[index].id) orderedExactMatches += 1;
-  }
-  const matchedOrderMonotonic = matchedOrders.every((order, index) => index === 0 || order > matchedOrders[index - 1]);
-  const officialButtonCount = officialIds.length;
-  const knownTurnCount = orderedTurns.length;
-  const exactButtonCoverage = ratio(exactIdMatches, officialButtonCount);
-  const exactTurnCoverage = ratio(exactIdMatches, knownTurnCount);
-  const orderedCoverage = ratio(orderedExactMatches, Math.min(officialButtonCount, knownTurnCount));
-  const countAligned = officialButtonCount > 0 && officialButtonCount === knownTurnCount;
-  const oneToOneExact = officialButtonCount > 0
-    && officialUniqueIdCount === officialButtonCount
-    && knownUniqueIdCount === knownTurnCount
-    && countAligned
-    && exactIdMatches === officialButtonCount
-    && orderedExactMatches === officialButtonCount
-    && matchedOrderMonotonic;
-  let recommendedBridgeMode = 'insufficient';
-  if (oneToOneExact) recommendedBridgeMode = 'direct-exact-id';
-  else if (officialButtonCount > 0 && exactButtonCoverage >= 0.95 && matchedOrderMonotonic) recommendedBridgeMode = 'direct-exact-id-partial';
-  else if (countAligned && orderedCoverage >= 0.95) recommendedBridgeMode = 'ordered-index-candidate';
-  else if (officialButtonCount > 0 && exactIdMatches > 0) recommendedBridgeMode = 'mixed-unsafe';
-  return sanitizeOfficialNavigationMapping({
-    officialButtonCount,
-    officialUniqueIdCount,
-    knownTurnCount,
-    knownUniqueIdCount,
-    exactIdMatches,
-    orderedExactMatches,
-    exactButtonCoverage,
-    exactTurnCoverage,
-    orderedCoverage,
-    matchedOrderMonotonic,
-    countAligned,
-    oneToOneExact,
-    matchedOrderRange: matchedOrders.length ? { min: Math.min(...matchedOrders), max: Math.max(...matchedOrders), count: matchedOrders.length } : null,
-    recommendedBridgeMode
-  });
-}
-
-function sanitizeOfficialNavigationMapping(value = {}) {
-  if (!value || typeof value !== 'object') return null;
-  return {
-    officialButtonCount: nonNegativeInt(value.officialButtonCount),
-    officialUniqueIdCount: nonNegativeInt(value.officialUniqueIdCount),
-    knownTurnCount: nonNegativeInt(value.knownTurnCount),
-    knownUniqueIdCount: nonNegativeInt(value.knownUniqueIdCount),
-    exactIdMatches: nonNegativeInt(value.exactIdMatches),
-    orderedExactMatches: nonNegativeInt(value.orderedExactMatches),
-    exactButtonCoverage: clampRatio(value.exactButtonCoverage),
-    exactTurnCoverage: clampRatio(value.exactTurnCoverage),
-    orderedCoverage: clampRatio(value.orderedCoverage),
-    matchedOrderMonotonic: Boolean(value.matchedOrderMonotonic),
-    countAligned: Boolean(value.countAligned),
-    oneToOneExact: Boolean(value.oneToOneExact),
-    matchedOrderRange: sanitizeVisibleRange(value.matchedOrderRange),
-    recommendedBridgeMode: safeString(value.recommendedBridgeMode) ?? 'insufficient'
-  };
-}
-
-function ratio(numerator, denominator) {
-  if (!(Number(denominator) > 0)) return 0;
-  return Math.round((Number(numerator) / Number(denominator)) * 1000) / 1000;
-}
-
-function clampRatio(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
-}
-
-function nonNegativeInt(value) {
-  return Math.max(0, Math.round(Number(value) || 0));
-}
-
-function sanitizeOfficialNavigationHistory(value, limit = 10) {
-  if (!Array.isArray(value)) return [];
-  return value.map(sanitizeOfficialNavigationRecord).filter(Boolean).slice(-Math.max(1, Number(limit) || 10));
-}
-
-function sanitizeOfficialNavigationRecord(value = {}) {
-  if (!value || typeof value !== "object") return null;
-  return {
-    probeId: Number(value.probeId) || 0,
-    host: safeString(value.host),
-    source: safeString(value.source),
-    stable: Boolean(value.stable),
-    startedAt: safeString(value.startedAt),
-    finishedReason: safeString(value.finishedReason),
-    trigger: sanitizeTrigger(value.trigger),
-    marker: sanitizeOfficialMarker(value.marker),
-    learningSample: sanitizeOfficialNavigationLearningSample(value.learningSample),
-    totalElapsedMs: nullableRound(value.totalElapsedMs),
-    clickToFirstScrollMs: nullableRound(value.clickToFirstScrollMs),
-    clickToFirstWindowMs: nullableRound(value.clickToFirstWindowMs),
-    clickToFirstExtentMs: nullableRound(value.clickToFirstExtentMs),
-    scrollEventCount: Math.max(0, Math.round(Number(value.scrollEventCount) || 0)),
-    mutationCount: Math.max(0, Math.round(Number(value.mutationCount) || 0)),
-    classification: safeString(value.classification) ?? "navigation-change",
-    mapping: sanitizeOfficialNavigationMapping(value.mapping),
-    metrics: sanitizeMetrics(value.metrics),
-    before: sanitizeSnapshot(value.before),
-    after: sanitizeSnapshot(value.after),
-    samples: (Array.isArray(value.samples) ? value.samples : []).map(sanitizeSample).filter(Boolean).slice(-MAX_SAMPLES)
-  };
-}
-
-function fingerprintElement(element, windowRef) {
-  const role = safeAttribute(element, "role");
-  const classes = String(element.className ?? "").split(/\s+/).map((token) => token.trim()).filter(Boolean).slice(0, MAX_CLASS_TOKENS);
-  const dataAttributes = [];
-  for (const attribute of Array.from(element.attributes ?? [])) {
-    const name = String(attribute?.name ?? "");
-    if (!name.startsWith("data-")) continue;
-    dataAttributes.push({ name, kind: classifyAttributeValue(attribute?.value) });
-    if (dataAttributes.length >= 10) break;
-  }
-  const rect = element.getBoundingClientRect?.();
-  const innerWidth = Number(windowRef?.innerWidth) || null;
-  return {
-    tag: String(element.tagName ?? "").toLowerCase() || null,
-    role: role || null,
-    classes,
-    hasId: Boolean(element.id),
-    ariaLabel: attributeShape(element, "aria-label"),
-    ariaCurrent: attributeShape(element, "aria-current"),
-    title: attributeShape(element, "title"),
-    dataAttributes,
-    rect: rect ? {
-      top: roundNumber(rect.top),
-      left: roundNumber(rect.left),
-      width: roundNumber(rect.width),
-      height: roundNumber(rect.height),
-      rightInset: innerWidth == null ? null : roundNumber(innerWidth - Number(rect.right || 0))
-    } : null
-  };
-}
-
-function attributeShape(element, name) {
-  const value = safeAttribute(element, name);
-  if (!value) return null;
-  return { present: true, length: String(value).length, kind: classifyAttributeValue(value) };
-}
-
-function classifyAttributeValue(value) {
-  const text = String(value ?? "");
-  if (!text) return "empty";
-  if (/^-?\d+(?:\.\d+)?$/.test(text)) return "numeric";
-  if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(text)) return "uuid-like";
-  if (/^(true|false|page|step|location|date|time)$/i.test(text)) return "enum";
-  if (text.length <= 24 && /^[A-Za-z0-9_.:-]+$/.test(text)) return "short-token";
-  return text.length > 80 ? "long-text" : "text";
-}
-
-function sanitizeTrigger(value) {
-  if (!value || typeof value !== "object") return { trusted: false, path: [] };
-  return {
-    trusted: Boolean(value.trusted),
-    path: (Array.isArray(value.path) ? value.path : []).slice(0, MAX_PATH_NODES).map((node) => ({
-      tag: safeString(node?.tag),
-      role: safeString(node?.role),
-      classes: (Array.isArray(node?.classes) ? node.classes : []).map(safeString).filter(Boolean).slice(0, MAX_CLASS_TOKENS),
-      hasId: Boolean(node?.hasId),
-      ariaLabel: sanitizeAttributeShape(node?.ariaLabel),
-      ariaCurrent: sanitizeAttributeShape(node?.ariaCurrent),
-      title: sanitizeAttributeShape(node?.title),
-      dataAttributes: (Array.isArray(node?.dataAttributes) ? node.dataAttributes : []).slice(0, 10).map((item) => ({ name: safeString(item?.name), kind: safeString(item?.kind) })).filter((item) => item.name),
-      rect: sanitizeRect(node?.rect)
-    }))
-  };
-}
-
-function sanitizeAttributeShape(value) {
-  if (!value || typeof value !== "object") return null;
-  return { present: Boolean(value.present), length: Math.max(0, Math.round(Number(value.length) || 0)), kind: safeString(value.kind) };
-}
-
-function sanitizeRect(value) {
-  if (!value || typeof value !== "object") return null;
-  return { top: nullableRound(value.top), left: nullableRound(value.left), width: nullableRound(value.width), height: nullableRound(value.height), rightInset: nullableRound(value.rightInset) };
-}
-
-function sanitizeVisibleRange(value) {
-  if (!value || typeof value !== "object") return null;
-  const min = Number(value.min), max = Number(value.max), count = Number(value.count);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
-  return { min, max, count: Number.isFinite(count) ? count : Math.max(0, max - min + 1) };
-}
-
-function sanitizeSnapshot(value) {
-  if (!value || typeof value !== "object") return null;
-  return {
-    physicalScrollTop: nullableRound(value.physicalScrollTop),
-    scrollHeight: nullableRound(value.scrollHeight),
-    clientHeight: nullableRound(value.clientHeight),
-    logicalPosition: nullableRound(value.logicalPosition),
-    maxLogicalPosition: nullableRound(value.maxLogicalPosition),
-    isColumnReverse: Boolean(value.isColumnReverse),
-    visibleRange: sanitizeVisibleRange(value.visibleRange),
-    containerChanged: Boolean(value.containerChanged)
-  };
-}
-
-function sanitizeSample(value) {
-  const snapshot = sanitizeSnapshot(value);
-  if (!snapshot) return null;
-  return { t: nullableRound(value?.t), kind: safeString(value?.kind), ...snapshot };
-}
-
-function sanitizeMetrics(value) {
-  if (!value || typeof value !== "object") return { logicalDelta: 0, absoluteLogicalDelta: 0, maxSingleLogicalDelta: 0, distinctMotionSteps: 0, extentDelta: 0, windowChanged: false, containerChanged: false };
-  return {
-    logicalDelta: roundNumber(value.logicalDelta),
-    absoluteLogicalDelta: Math.abs(roundNumber(value.absoluteLogicalDelta)),
-    maxSingleLogicalDelta: Math.abs(roundNumber(value.maxSingleLogicalDelta)),
-    distinctMotionSteps: Math.max(0, Math.round(Number(value.distinctMotionSteps) || 0)),
-    extentDelta: roundNumber(value.extentDelta),
-    windowChanged: Boolean(value.windowChanged),
-    containerChanged: Boolean(value.containerChanged)
-  };
-}
-
-function computeProbeMetrics(active) {
-  const before = active.before ?? {};
-  const after = active.after ?? {};
-  let maxSingleLogicalDelta = 0, distinctMotionSteps = 0, previous = null;
-  for (const sample of active.samples ?? []) {
-    if (previous) {
-      const delta = Math.abs(Number(sample.logicalPosition) - Number(previous.logicalPosition));
-      if (delta > 2) distinctMotionSteps += 1;
-      maxSingleLogicalDelta = Math.max(maxSingleLogicalDelta, delta);
-    }
-    previous = sample;
-  }
-  return {
-    logicalDelta: roundNumber(Number(after.logicalPosition) - Number(before.logicalPosition)),
-    absoluteLogicalDelta: roundNumber(Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition))),
-    maxSingleLogicalDelta: roundNumber(maxSingleLogicalDelta),
-    distinctMotionSteps,
-    extentDelta: roundNumber(Number(after.scrollHeight) - Number(before.scrollHeight)),
-    windowChanged: visibleRangeChanged(before.visibleRange, after.visibleRange),
-    containerChanged: Boolean(after.containerChanged || (active.samples ?? []).some((sample) => sample.containerChanged))
-  };
-}
-
-function classifyNavigation(active, metrics) {
-  const viewport = Math.max(1, Number(active.before?.clientHeight) || 1);
-  if (metrics.windowChanged && metrics.absoluteLogicalDelta <= 2 && active.scrollEventCount <= 1) return "virtual-window-swap";
-  if (metrics.absoluteLogicalDelta >= viewport * 1.5 && metrics.distinctMotionSteps <= 2 && active.scrollEventCount <= 2) return metrics.windowChanged ? "single-jump-window-swap" : "single-jump";
-  if (metrics.distinctMotionSteps >= 3 || active.scrollEventCount >= 3) return "multi-step-scroll";
-  if (metrics.windowChanged || Math.abs(metrics.extentDelta) > 2) return "window-or-extent-navigation";
-  return "navigation-change";
-}
-
-function meaningfulNavigationChange(before, after, samples, scrollEventCount) {
-  if (!before || !after) return false;
-  if (Math.abs(Number(after.logicalPosition) - Number(before.logicalPosition)) > 2) return true;
-  if (Math.abs(Number(after.scrollHeight) - Number(before.scrollHeight)) > 2) return true;
-  if (visibleRangeChanged(before.visibleRange, after.visibleRange)) return true;
-  if (scrollEventCount > 0 && (samples ?? []).some((sample) => Math.abs(Number(sample.logicalPosition) - Number(before.logicalPosition)) > 2)) return true;
-  return false;
-}
-
-function visibleRangeChanged(a, b) {
-  if (!a && !b) return false;
-  if (!a || !b) return true;
-  return Number(a.min) !== Number(b.min) || Number(a.max) !== Number(b.max) || Number(a.count) !== Number(b.count);
-}
-
-function sampleEquivalent(a, b) {
-  return Number(a.logicalPosition) === Number(b.logicalPosition)
-    && Number(a.scrollHeight) === Number(b.scrollHeight)
-    && Number(a.physicalScrollTop) === Number(b.physicalScrollTop)
-    && !visibleRangeChanged(a.visibleRange, b.visibleRange)
-    && Boolean(a.containerChanged) === Boolean(b.containerChanged);
-}
-
-function defaultOwnedEvent(event) {
-  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) if (node?.id === "gte-root") return true;
-  return false;
-}
-
-function isConversationSwitchEvent(event) {
-  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) {
-    if (!node?.getAttribute) continue;
-    if (node.getAttribute("data-sidebar-chatgpt-conversation-key") != null) return true;
-    if (node.getAttribute("data-app-action-sidebar-thread-id") != null) return true;
-  }
-  return false;
-}
-
-function isEditorEvent(event) {
-  for (const node of event?.composedPath?.() ?? buildElementPath(event?.target)) {
-    if (!node || !node.tagName) continue;
-    const tag = String(node.tagName).toLowerCase();
-    if (tag === "textarea" || tag === "input") return true;
-    if (node.getAttribute?.("contenteditable") === "true") return true;
-  }
-  return false;
-}
-
-function buildElementPath(target) {
-  const path = [];
-  let node = target;
-  while (node && path.length < MAX_PATH_NODES + 4) {
-    path.push(node);
-    node = node.parentElement ?? node.parentNode ?? null;
-  }
-  return path;
-}
-
-function safeAttribute(element, name) { try { return element?.getAttribute?.(name) ?? ""; } catch { return ""; } }
-function safeFlexDirection(windowRef, container) { try { return windowRef?.getComputedStyle?.(container)?.flexDirection ?? container?.style?.flexDirection ?? "column"; } catch { return container?.style?.flexDirection ?? "column"; } }
-function safeCall(fn) { try { return typeof fn === "function" ? fn() : null; } catch { return null; } }
-function elapsedMs(windowRef, startedAtMs) { return Math.max(0, Math.round(probeNow(windowRef) - Number(startedAtMs || 0))); }
-function probeNow(windowRef) { const value = Number(windowRef?.performance?.now?.()); return Number.isFinite(value) ? value : Date.now(); }
-function setTimer(windowRef, callback, delayMs) { return typeof windowRef?.setTimeout === "function" ? windowRef.setTimeout(callback, Math.max(0, Number(delayMs) || 0)) : setTimeout(callback, Math.max(0, Number(delayMs) || 0)); }
-function clearTimer(windowRef, timer) { if (typeof windowRef?.clearTimeout === "function") windowRef.clearTimeout(timer); else clearTimeout(timer); }
-function roundNumber(value) { const number = Number(value); return Number.isFinite(number) ? Math.round(number) : 0; }
-function nullableRound(value) { const number = Number(value); return Number.isFinite(number) ? Math.round(number) : null; }
-function safeString(value) { return typeof value === "string" && value ? value : null; }
-
-Object.assign(exports, { OfficialNavigationProbe, identifyOfficialNavigationMarker, sanitizeOfficialNavigationLearningSample, selectTrustedOfficialBridgePair, sanitizeOfficialNavigationLearningHistory, analyzeOfficialNavigationLearning, fingerprintClickTarget, analyzeOfficialNavigationMapping, sanitizeOfficialNavigationMapping, sanitizeOfficialNavigationHistory, sanitizeOfficialNavigationRecord });
-
-},
-"src/v3/diagnostics/official-navigation-auto-map.js": (module, exports, __require) => {
-const MARKER_SELECTOR = "[data-thread-user-message-navigation-item-id]";
-
-function analyzeOfficialNavigationAutoMap({ document, turns = [], resolveMarkerKey = null, minCoverage = 0.8 } = {}) {
-  const buttons = Array.from(document?.querySelectorAll?.(MARKER_SELECTOR) ?? []);
-  const orderedTurns = (Array.isArray(turns) ? turns : [])
-    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
-    .map((turn) => ({
-      id: String(turn.id),
-      order: Number(turn.order),
-      text: normalizeText(turn.text),
-      shortText: normalizeText(turn.shortText ?? turn.text)
-    }))
-    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
-  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
-  const uniqueTextOrders = buildUniqueTextOrders(orderedTurns);
-  const markerCandidates = [];
-  const strategyCounts = { domReference: 0, explicitLabel: 0, textMatch: 0, sequenceGap: 0 };
-  let markerConflicts = 0;
-
-  buttons.forEach((button, markerIndex) => {
-    const markerKey = String(button?.getAttribute?.("data-thread-user-message-navigation-item-id") ?? "").trim();
-    if (!markerKey) return;
-    const candidates = new Map();
-    const add = (order, strategy) => {
-      if (!Number.isInteger(order) || order < 0 || order >= orderedTurns.length) return;
-      const strategies = candidates.get(order) ?? new Set();
-      strategies.add(strategy);
-      candidates.set(order, strategies);
-    };
-
-    if (typeof resolveMarkerKey === "function") {
-      const resolvedId = resolveMarkerKey(markerKey);
-      const resolvedOrder = orderById.get(String(resolvedId ?? ""));
-      if (Number.isInteger(resolvedOrder)) add(resolvedOrder, "domReference");
-    }
-
-    const texts = readMarkerTexts(button);
-    for (const text of texts) {
-      const explicitOrder = parseExplicitQuestionOrder(text, orderedTurns.length);
-      if (Number.isInteger(explicitOrder)) add(explicitOrder, "explicitLabel");
-      const normalized = normalizeText(text);
-      const textOrder = uniqueTextOrders.get(normalized);
-      if (Number.isInteger(textOrder)) add(textOrder, "textMatch");
-      if (normalized.length >= 6) {
-        for (const turn of orderedTurns) {
-          const candidateText = turn.shortText || turn.text;
-          if (candidateText.length >= 6 && normalized.endsWith(candidateText)) add(turn.order, "textMatch");
-        }
-      }
-    }
-
-    if (candidates.size !== 1) {
-      if (candidates.size > 1) markerConflicts += 1;
-      return;
-    }
-    const [[targetOrder, strategies]] = candidates.entries();
-    for (const strategy of strategies) strategyCounts[strategy] += 1;
-    markerCandidates.push({ markerIndex, markerKey, targetOrder, strategies: [...strategies].sort() });
-  });
-
-  const byTarget = new Map();
-  for (const pair of markerCandidates) {
-    const list = byTarget.get(pair.targetOrder) ?? [];
-    list.push(pair);
-    byTarget.set(pair.targetOrder, list);
-  }
-  const targetConflicts = [...byTarget.values()].filter((list) => list.length > 1).length;
-  let pairs = markerCandidates
-    .filter((pair) => (byTarget.get(pair.targetOrder)?.length ?? 0) === 1)
-    .sort((a, b) => a.markerIndex - b.markerIndex);
-  const directMonotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
-  if (directMonotonic && markerConflicts === 0 && targetConflicts === 0) {
-    const anchors = [{ markerIndex: -1, targetOrder: -1 }, ...pairs, { markerIndex: buttons.length, targetOrder: orderedTurns.length }];
-    const occupiedMarkers = new Set(pairs.map((pair) => pair.markerIndex));
-    const occupiedTargets = new Set(pairs.map((pair) => pair.targetOrder));
-    const inferred = [];
-    for (let i = 0; i < anchors.length - 1; i += 1) {
-      const left = anchors[i];
-      const right = anchors[i + 1];
-      const markerGap = right.markerIndex - left.markerIndex - 1;
-      const targetGap = right.targetOrder - left.targetOrder - 1;
-      if (markerGap <= 0 || markerGap !== targetGap) continue;
-      for (let offset = 1; offset <= markerGap; offset += 1) {
-        const markerIndex = left.markerIndex + offset;
-        const targetOrder = left.targetOrder + offset;
-        if (occupiedMarkers.has(markerIndex) || occupiedTargets.has(targetOrder)) continue;
-        const button = buttons[markerIndex];
-        const markerKey = String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim();
-        if (!markerKey) continue;
-        inferred.push({ markerIndex, markerKey, targetOrder, strategies: ['sequenceGap'] });
-        occupiedMarkers.add(markerIndex);
-        occupiedTargets.add(targetOrder);
-      }
-    }
-    if (inferred.length) {
-      strategyCounts.sequenceGap += inferred.length;
-      pairs = [...pairs, ...inferred].sort((a, b) => a.markerIndex - b.markerIndex);
-    }
-  }
-  const monotonic = pairs.every((pair, index) => index === 0 || pair.targetOrder > pairs[index - 1].targetOrder);
-  const mappedTargetCount = new Set(pairs.map((pair) => pair.targetOrder)).size;
-  const knownTurnCount = orderedTurns.length;
-  const coverage = knownTurnCount > 0 ? mappedTargetCount / knownTurnCount : 0;
-  const readyCandidate = buttons.length > 0
-    && knownTurnCount >= 5
-    && markerConflicts === 0
-    && targetConflicts === 0
-    && monotonic
-    && mappedTargetCount >= 5
-    && coverage >= Math.max(0.5, Math.min(1, Number(minCoverage) || 0.8));
-
-  return {
-    privatePairs: pairs,
-    summary: {
-      markerCount: buttons.length,
-      knownTurnCount,
-      mappedTargetCount,
-      coverage: roundRatio(coverage),
-      markerConflicts,
-      targetConflicts,
-      monotonic,
-      strategyCounts,
-      readyCandidate,
-      recommendedMode: readyCandidate ? "auto-official-candidate" : "fallback-self"
-    }
-  };
-}
-
-function sanitizeOfficialNavigationAutoSummary(value = {}) {
-  const strategies = value?.strategyCounts ?? {};
-  return {
-    status: typeof value?.status === "string" ? value.status : "idle",
-    markerCount: nonNegativeInt(value?.markerCount),
-    knownTurnCount: nonNegativeInt(value?.knownTurnCount),
-    mappedTargetCount: nonNegativeInt(value?.mappedTargetCount),
-    coverage: roundRatio(value?.coverage),
-    markerConflicts: nonNegativeInt(value?.markerConflicts),
-    targetConflicts: nonNegativeInt(value?.targetConflicts),
-    monotonic: Boolean(value?.monotonic),
-    stableScans: nonNegativeInt(value?.stableScans),
-    strategyCounts: {
-      domReference: nonNegativeInt(strategies.domReference),
-      explicitLabel: nonNegativeInt(strategies.explicitLabel),
-      textMatch: nonNegativeInt(strategies.textMatch),
-      sequenceGap: nonNegativeInt(strategies.sequenceGap)
-    },
-    recommendedMode: typeof value?.recommendedMode === "string" ? value.recommendedMode : "fallback-self"
-  };
-}
-
-function officialAutoMapSignature(pairs = []) {
-  return (Array.isArray(pairs) ? pairs : [])
-    .map((pair) => `${Number(pair?.targetOrder)}\u0000${String(pair?.markerKey ?? "")}`)
-    .sort()
-    .join("\u0001");
-}
-
-function readMarkerTexts(button) {
-  const values = [
-    button?.getAttribute?.("aria-label"),
-    button?.getAttribute?.("aria-description"),
-    button?.getAttribute?.("title"),
-    button?.innerText,
-    button?.textContent
-  ];
-  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
-}
-
-function parseExplicitQuestionOrder(text, knownTurnCount) {
-  const value = String(text ?? "").trim();
-  const patterns = [
-    /\bQ\s*([1-9]\d*)\b/i,
-    /\bQuestion\s*([1-9]\d*)\b/i,
-    /问题\s*([1-9]\d*)/i,
-    /第\s*([1-9]\d*)\s*(?:个)?(?:问题|提问)/i
-  ];
-  for (const pattern of patterns) {
-    const match = value.match(pattern);
-    if (!match) continue;
-    const number = Number.parseInt(match[1], 10);
-    if (Number.isInteger(number) && number >= 1 && number <= knownTurnCount) return number - 1;
-  }
-  return null;
-}
-
-function buildUniqueTextOrders(turns) {
-  const map = new Map();
-  const ambiguous = new Set();
-  for (const turn of turns) {
-    for (const text of [turn.text, turn.shortText]) {
-      if (!text || text.length < 3) continue;
-      if (map.has(text) && map.get(text) !== turn.order) {
-        ambiguous.add(text);
-        map.delete(text);
-      } else if (!ambiguous.has(text)) {
-        map.set(text, turn.order);
-      }
-    }
-  }
-  return map;
-}
-
-function normalizeText(value) {
-  return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function nonNegativeInt(value) {
-  return Math.max(0, Math.round(Number(value) || 0));
-}
-
-function roundRatio(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
-}
-
-Object.assign(exports, { analyzeOfficialNavigationAutoMap, sanitizeOfficialNavigationAutoSummary, officialAutoMapSignature });
-
-},
-"src/v3/diagnostics/host-internal-depth-probe.js": (module, exports, __require) => {
-const CANDIDATE_KEY_RE = /(id|turn|message|thread|nav|index|order|item|scroll|virtual|range|offset)/i;
-const REACT_PROPS_PREFIX = '__reactProps$';
-const REACT_FIBER_PREFIX = '__reactFiber$';
-const REACT_CONTAINER_PREFIX = '__reactContainer$';
-
-function collectHostInternalDepthProbe({ window: windowRef, document, host, turns = [] } = {}) {
-  const orderedTurns = (Array.isArray(turns) ? turns : [])
-    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
-    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }));
-  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
-  const markers = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-  const marker = markers[0] ?? null;
-  const markerSample = sampleMarkers(markers, 8);
-  const scrollContainer = host?.getScrollContainer?.() ?? null;
-  const conversationRoot = host?.conversation?.getConversationRoot?.() ?? scrollContainer?.parentElement ?? null;
-
-  const level1 = collectLevel1(windowRef);
-  const level2 = collectReactPropsLayer({ marker, markerSample, scrollContainer, conversationRoot, orderById });
-  const level3 = collectFiberLayer({ marker, markerSample, scrollContainer, conversationRoot, orderById });
-  const l3AutoBridgeProbe = collectL3AutoBridgeProbe({ markers, orderById });
-  return {
-    capturedAt: new Date().toISOString(),
-    host: host?.getConversationIdentity?.()?.host ?? null,
-    level0: {
-      officialMarkerCount: markers.length,
-      hasScrollContainer: Boolean(scrollContainer),
-      markerReactOwnKeys: marker ? reactOwnKeys(marker) : []
-    },
-    level1,
-    level2,
-    level3,
-    l3AutoBridgeProbe,
-    conclusion: summarizeRequiredDepth({ markerCount: markers.length, level1, level2, level3 })
-  };
-}
-
-function collectL3ExactKeyJoinDryRunMap({ document, turns = [], preferredPattern = null } = {}) {
-  const orderedTurns = (Array.isArray(turns) ? turns : [])
-    .filter((turn) => turn?.id && Number.isFinite(turn?.order))
-    .map((turn) => ({ id: String(turn.id), order: Number(turn.order) }));
-  const orderById = new Map(orderedTurns.map((turn) => [turn.id, turn.order]));
-  const markers = Array.from(document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-  return collectExactKeyJoinMap({ markers, orderById, preferredPattern });
-}
-function collectLevel1(windowRef) {
-  const handlers = safeDataValue(windowRef, '__codexThreadScrollHandlers');
-  const globals = [];
-  for (const name of safeOwnNames(windowRef)) {
-    if (!/(codex|thread|scroll|nav|virtual|message)/i.test(name)) continue;
-    const value = safeDataValue(windowRef, name);
-    if (value == null) continue;
-    globals.push({
-      name,
-      type: valueType(value),
-      keys: isPlainInspectable(value) ? describeOwnKeys(value, 30) : []
-    });
-    if (globals.length >= 20) break;
-  }
-  return {
-    codexThreadScrollHandlers: handlers == null ? { present: false, keys: [] } : {
-      present: true,
-      keys: describeOwnKeys(handlers, 50)
-    },
-    matchingGlobals: globals
-  };
-}
-
-function collectReactPropsLayer({ marker, markerSample = [], scrollContainer, conversationRoot, orderById }) {
-  const targets = [
-    ['official-marker', marker],
-    ['scroll-container', scrollContainer],
-    ['conversation-root', conversationRoot]
-  ];
-  const inspected = [];
-  for (const [label, node] of targets) {
-    if (!node) continue;
-    const propKey = reactOwnKeys(node).find((key) => key.startsWith(REACT_PROPS_PREFIX));
-    if (!propKey) {
-      inspected.push({ target: label, present: false, candidatePaths: [], knownTurnMatches: [] });
-      continue;
-    }
-    const props = safeDataValue(node, propKey);
-    inspected.push({
-      target: label,
-      present: Boolean(props),
-      candidatePaths: collectCandidatePaths(props, { maxDepth: 4, maxNodes: 350 }),
-      knownTurnMatches: findKnownTurnMatches(props, orderById, { maxDepth: 4, maxNodes: 500 })
-    });
-  }
-  const markerSamples = markerSample.map((node, sampleIndex) => {
-    const propKey = reactOwnKeys(node).find((key) => key.startsWith(REACT_PROPS_PREFIX));
-    const props = propKey ? safeDataValue(node, propKey) : null;
-    return {
-      sampleIndex,
-      present: Boolean(props),
-      candidatePaths: props ? collectCandidatePaths(props, { maxDepth: 5, maxNodes: 700 }) : [],
-      knownTurnMatches: props ? findKnownTurnMatches(props, orderById, { maxDepth: 5, maxNodes: 900 }) : [],
-      handlerTraits: props ? collectHandlerTraits(props, { maxDepth: 3, maxNodes: 220 }) : []
-    };
-  });
-  return {
-    reactPropsPresent: inspected.some((entry) => entry.present) || markerSamples.some((entry) => entry.present),
-    directKnownTurnMatch: inspected.some((entry) => entry.knownTurnMatches.length > 0) || markerSamples.some((entry) => entry.knownTurnMatches.length > 0),
-    inspected,
-    markerSamples,
-    markerSampleCount: markerSamples.length,
-    markerSamplesWithKnownTurnMatch: markerSamples.filter((entry) => entry.knownTurnMatches.length > 0).length
-  };
-}
-
-function collectFiberLayer({ marker, markerSample = [], scrollContainer, conversationRoot, orderById }) {
-  const targets = [
-    ['official-marker', marker],
-    ['scroll-container', scrollContainer],
-    ['conversation-root', conversationRoot]
-  ];
-  const inspected = [];
-  for (const [label, node] of targets) {
-    if (!node) continue;
-    const ownKeys = reactOwnKeys(node);
-    const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
-    if (!fiberKey) {
-      inspected.push({ target: label, present: false, componentChain: [], knownTurnMatches: [], candidatePaths: [] });
-      continue;
-    }
-    let fiber = safeDataValue(node, fiberKey);
-    const componentChain = [];
-    const knownTurnMatches = [];
-    const candidatePaths = [];
-    const seen = new Set();
-    for (let depth = 0; fiber && depth < 12 && !seen.has(fiber); depth += 1) {
-      seen.add(fiber);
-      componentChain.push(describeFiber(fiber));
-      for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
-        const value = safeDataValue(fiber, propName);
-        if (value == null) continue;
-        const prefix = `fiber[${depth}].${propName}`;
-        for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 3, maxNodes: 220 })) {
-          knownTurnMatches.push({ ...hit, path: `${prefix}.${hit.path}` });
-        }
-        for (const hit of collectCandidatePaths(value, { maxDepth: 3, maxNodes: 180 })) {
-          candidatePaths.push({ ...hit, path: `${prefix}.${hit.path}` });
-        }
-      }
-      fiber = safeDataValue(fiber, 'return');
-    }
-    inspected.push({
-      target: label,
-      present: true,
-      componentChain,
-      knownTurnMatches: dedupeMatches(knownTurnMatches).slice(0, 40),
-      candidatePaths: dedupePaths(candidatePaths).slice(0, 60)
-    });
-  }
-  const markerSamples = markerSample.map((node, sampleIndex) => collectMarkerFiberSample(node, sampleIndex, orderById));
-  return {
-    reactFiberPresent: inspected.some((entry) => entry.present) || markerSamples.some((entry) => entry.present),
-    directKnownTurnMatch: inspected.some((entry) => entry.knownTurnMatches.length > 0) || markerSamples.some((entry) => entry.knownTurnMatches.length > 0),
-    inspected,
-    markerSamples,
-    markerSampleCount: markerSamples.length,
-    markerSamplesWithKnownTurnMatch: markerSamples.filter((entry) => entry.knownTurnMatches.length > 0).length,
-    shallowestKnownTurnDepth: minKnownTurnDepth(markerSamples)
-  };
-}
-
-function collectL3AutoBridgeProbe({ markers = [], orderById = new Map() } = {}) {
-  const markerList = Array.isArray(markers) ? markers : [];
-  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
-  const patterns = new Map();
-
-  markerList.forEach((marker, markerIndex) => {
-    const byPattern = new Map();
-    for (const candidate of collectMarkerCandidateMatches(marker, orderById)) {
-      const targets = byPattern.get(candidate.pattern) ?? new Set();
-      targets.add(candidate.targetOrder);
-      byPattern.set(candidate.pattern, targets);
-    }
-    for (const [pattern, targets] of byPattern.entries()) {
-      let record = patterns.get(pattern);
-      if (!record) {
-        record = { markerTargets: new Map() };
-        patterns.set(pattern, record);
-      }
-      record.markerTargets.set(markerIndex, targets);
-    }
-  });
-
-  const summaries = [...patterns.values()].map((record) => summarizeCandidatePattern({
-    markerCount: markerList.length,
-    knownTurnCount,
-    markerTargets: record.markerTargets
-  }));
-  summaries.sort(compareCandidatePatternSummaries);
-  const best = summaries[0] ?? emptyCandidatePatternSummary(markerList.length, knownTurnCount);
-  const candidatePatternCount = summaries.length;
-  const resolvableCandidatePatternCount = summaries.filter((summary) => summary.resolvedMarkerCount > 0).length;
-  const exactOneToOneCandidateCount = summaries.filter((summary) => summary.oneToOne).length;
-  const sharedStateCandidateCount = summaries.filter((summary) => summary.sharedState).length;
-  const partialCandidateCount = summaries.filter((summary) => summary.partial).length;
-  const relational = collectL3RelationalProbe({ markers: markerList, orderById });
-
-  let recommendedMode = 'probe-insufficient';
-  if (markerList.length === 0) recommendedMode = 'probe-pending-marker';
-  else if (knownTurnCount === 0) recommendedMode = 'probe-insufficient-known-turns';
-  else if (relational.objectRef.oneToOne) recommendedMode = 'probe-relation-object-ref-exact-one-to-one';
-  else if (relational.keyJoin.oneToOne) recommendedMode = 'probe-relation-key-join-exact-one-to-one';
-  else if (relational.best.coverage >= 0.95 && relational.best.conflicts === 0) recommendedMode = 'probe-relation-near-complete';
-  else if (relational.best.mappedTurnCount > 0) recommendedMode = 'probe-relation-partial';
-  else if (best.oneToOne) recommendedMode = 'probe-candidate-exact-one-to-one';
-  else if (best.coverage >= 0.95 && best.duplicateTargetCount === 0 && best.ambiguousMarkerCount === 0) recommendedMode = 'probe-candidate-near-complete';
-  else if (best.mappedTurnCount > 0) recommendedMode = 'probe-candidate-partial';
-  else if (candidatePatternCount > 0) recommendedMode = 'probe-candidate-conflict';
-
-  return {
-    markerCount: markerList.length,
-    knownTurnCount,
-    candidatePatternCount,
-    resolvableCandidatePatternCount,
-    exactOneToOneCandidateCount,
-    sharedStateCandidateCount,
-    partialCandidateCount,
-    resolvedMarkerCount: best.resolvedMarkerCount,
-    mappedMarkerCount: best.mappedMarkerCount,
-    mappedTurnCount: best.mappedTurnCount,
-    unmatchedOfficialCount: best.unmatchedOfficialCount,
-    ambiguousMarkerCount: best.ambiguousMarkerCount,
-    duplicateTargetCount: best.duplicateTargetCount,
-    noScopedMatchCount: best.noPatternMatchCount,
-    conflicts: best.ambiguousMarkerCount + best.duplicateTargetCount,
-    coverage: best.coverage,
-    oneToOne: best.oneToOne,
-    bestCandidateResolvedMarkers: best.resolvedMarkerCount,
-    bestCandidateUniqueTurns: best.uniqueTurnCount,
-    bestCandidateDuplicateTargets: best.duplicateTargetCount,
-    bestCandidateAmbiguousMarkers: best.ambiguousMarkerCount,
-    bestCandidateCoverage: best.coverage,
-    bestCandidateOneToOne: best.oneToOne,
-    objectRefMappedMarkers: relational.objectRef.mappedMarkerCount,
-    objectRefUniqueTurns: relational.objectRef.uniqueTurnCount,
-    objectRefConflicts: relational.objectRef.conflicts,
-    objectRefCoverage: relational.objectRef.coverage,
-    objectRefOneToOne: relational.objectRef.oneToOne,
-    keyJoinMappedMarkers: relational.keyJoin.mappedMarkerCount,
-    keyJoinUniqueTurns: relational.keyJoin.uniqueTurnCount,
-    keyJoinConflicts: relational.keyJoin.conflicts,
-    keyJoinCoverage: relational.keyJoin.coverage,
-    keyJoinOneToOne: relational.keyJoin.oneToOne,
-    positionalAlignmentCandidates: relational.positionalAlignmentCandidates,
-    bestPositionalCoverage: relational.bestPositionalCoverage,
-    bestRelationKind: relational.best.kind,
-    bestRelationMappedMarkers: relational.best.mappedMarkerCount,
-    bestRelationUniqueTurns: relational.best.uniqueTurnCount,
-    bestRelationConflicts: relational.best.conflicts,
-    bestRelationCoverage: relational.best.coverage,
-    bestRelationOneToOne: relational.best.oneToOne,
-    recommendedMode
-  };
-}
-
-function collectMarkerCandidateMatches(node, orderById) {
-  if (!node || !(orderById instanceof Map) || orderById.size === 0) return [];
-  const ownKeys = reactOwnKeys(node);
-  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
-  if (!fiberKey) return [];
-  let fiber = safeDataValue(node, fiberKey);
-  const seen = new Set();
-  const candidates = [];
-  const dedupe = new Set();
-  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
-    seen.add(fiber);
-    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
-      const value = safeDataValue(fiber, propName);
-      if (value == null) continue;
-      for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 6, maxNodes: 1200 })) {
-        const pattern = normalizeCandidatePattern(`fiber[${depth}].${propName}.${hit.path}`);
-        const key = `${pattern}\u0000${hit.targetOrder}`;
-        if (dedupe.has(key)) continue;
-        dedupe.add(key);
-        candidates.push({ pattern, targetOrder: hit.targetOrder });
-      }
-    }
-    fiber = safeDataValue(fiber, 'return');
-  }
-  return candidates;
-}
-
-function normalizeCandidatePattern(path) {
-  return String(path ?? '')
-    .replace(/\[\d+\]/g, '[*]')
-    .replace(/(^|\.)\d+(?=\.|$)/g, '$1[*]');
-}
-
-function summarizeCandidatePattern({ markerCount = 0, knownTurnCount = 0, markerTargets = new Map() } = {}) {
-  let resolvedMarkerCount = 0;
-  let ambiguousMarkerCount = 0;
-  const targetCounts = new Map();
-  for (const targets of markerTargets.values()) {
-    if (!(targets instanceof Set) || targets.size === 0) continue;
-    if (targets.size > 1) {
-      ambiguousMarkerCount += 1;
-      continue;
-    }
-    const targetOrder = [...targets][0];
-    resolvedMarkerCount += 1;
-    targetCounts.set(targetOrder, Number(targetCounts.get(targetOrder) ?? 0) + 1);
-  }
-  const duplicateTargets = new Set([...targetCounts.entries()].filter(([, count]) => count > 1).map(([targetOrder]) => targetOrder));
-  const duplicateTargetCount = duplicateTargets.size;
-  const conflictFreeCounts = [...targetCounts.entries()].filter(([targetOrder]) => !duplicateTargets.has(targetOrder));
-  const mappedTurnCount = conflictFreeCounts.length;
-  const mappedMarkerCount = conflictFreeCounts.reduce((sum, [, count]) => sum + count, 0);
-  const uniqueTurnCount = targetCounts.size;
-  const noPatternMatchCount = Math.max(0, markerCount - markerTargets.size);
-  const unmatchedOfficialCount = Math.max(0, markerCount - mappedMarkerCount);
-  const coverage = knownTurnCount > 0 ? roundRatio(mappedTurnCount / knownTurnCount) : 0;
-  const oneToOne = knownTurnCount > 0
-    && ambiguousMarkerCount === 0
-    && duplicateTargetCount === 0
-    && resolvedMarkerCount === knownTurnCount
-    && uniqueTurnCount === knownTurnCount;
-  const sharedState = resolvedMarkerCount >= 2 && duplicateTargetCount > 0 && uniqueTurnCount < resolvedMarkerCount;
-  const partial = !oneToOne && mappedTurnCount > 0 && duplicateTargetCount === 0 && ambiguousMarkerCount === 0;
-  return {
-    resolvedMarkerCount,
-    mappedMarkerCount,
-    mappedTurnCount,
-    uniqueTurnCount,
-    unmatchedOfficialCount,
-    ambiguousMarkerCount,
-    duplicateTargetCount,
-    noPatternMatchCount,
-    coverage,
-    oneToOne,
-    sharedState,
-    partial
-  };
-}
-
-function emptyCandidatePatternSummary(markerCount, knownTurnCount) {
-  return summarizeCandidatePattern({ markerCount, knownTurnCount, markerTargets: new Map() });
-}
-
-function compareCandidatePatternSummaries(a, b) {
-  if (Boolean(a.oneToOne) !== Boolean(b.oneToOne)) return a.oneToOne ? -1 : 1;
-  const aConflicts = Number(a.duplicateTargetCount || 0) + Number(a.ambiguousMarkerCount || 0);
-  const bConflicts = Number(b.duplicateTargetCount || 0) + Number(b.ambiguousMarkerCount || 0);
-  const aConflictFree = aConflicts === 0;
-  const bConflictFree = bConflicts === 0;
-  if (aConflictFree !== bConflictFree) return aConflictFree ? -1 : 1;
-  if (a.mappedTurnCount !== b.mappedTurnCount) return b.mappedTurnCount - a.mappedTurnCount;
-  if (a.uniqueTurnCount !== b.uniqueTurnCount) return b.uniqueTurnCount - a.uniqueTurnCount;
-  if (aConflicts !== bConflicts) return aConflicts - bConflicts;
-  if (a.coverage !== b.coverage) return b.coverage - a.coverage;
-  return b.resolvedMarkerCount - a.resolvedMarkerCount;
-}
-
-const RELATION_JOIN_KEY_RE = /(?:id|key|marker|nav)/i;
-
-function collectL3RelationalProbe({ markers = [], orderById = new Map() } = {}) {
-  const markerList = Array.isArray(markers) ? markers : [];
-  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
-  const objectPatterns = new Map();
-  const keyPatterns = new Map();
-  const positionalCollections = new Map();
-
-  markerList.forEach((marker, markerIndex) => {
-    const relations = collectMarkerRelationMatches(marker, orderById);
-    addRelationCandidates(objectPatterns, markerIndex, relations.objectRefs);
-    addRelationCandidates(keyPatterns, markerIndex, relations.keyJoins);
-    for (const collection of relations.collections) {
-      if (!positionalCollections.has(collection.pattern)) positionalCollections.set(collection.pattern, collection.targetOrders);
-    }
-  });
-
-  const objectRef = summarizeBestRelationPatterns(objectPatterns, markerList.length, knownTurnCount, 'object-ref');
-  const keyJoin = summarizeBestRelationPatterns(keyPatterns, markerList.length, knownTurnCount, 'key-join');
-  const positional = summarizePositionalAlignments({
-    markerCount: markerList.length,
-    knownTurnCount,
-    collections: [...positionalCollections.values()]
-  });
-  const best = compareRelationSummaries(objectRef, keyJoin) <= 0 ? objectRef : keyJoin;
-  return {
-    objectRef,
-    keyJoin,
-    positionalAlignmentCandidates: positional.candidateCount,
-    bestPositionalCoverage: positional.bestCoverage,
-    best
-  };
-}
-
-function collectMarkerRelationMatches(node, orderById) {
-  if (!node || !(orderById instanceof Map) || orderById.size === 0) return { objectRefs: [], keyJoins: [], collections: [] };
-  const ownKeys = reactOwnKeys(node);
-  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
-  if (!fiberKey) return { objectRefs: [], keyJoins: [], collections: [] };
-  let fiber = safeDataValue(node, fiberKey);
-  const seen = new Set();
-  const localObjects = [];
-  const localTokens = [];
-  const collections = [];
-
-  const markerKey = safeAttributeValue(node, 'data-thread-user-message-navigation-item-id');
-  if (isRelationScalar(markerKey)) localTokens.push({ path: 'dom.markerKey', value: markerKey });
-
-  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
-    seen.add(fiber);
-    const fiberKeyValue = safeDataValue(fiber, 'key');
-    if (isRelationScalar(fiberKeyValue)) localTokens.push({ path: `fiber[${depth}].key`, value: fiberKeyValue });
-    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
-      const value = safeDataValue(fiber, propName);
-      if (value == null) continue;
-      const prefix = `fiber[${depth}].${propName}`;
-      localObjects.push(...collectNonArrayObjectRefs(value, prefix, { maxDepth: 5, maxNodes: 500 }));
-      localTokens.push(...collectRelationJoinTokens(value, prefix, orderById, { maxDepth: 5, maxNodes: 500 }));
-      collections.push(...collectTurnItemCollections(value, prefix, orderById, { maxDepth: 5, maxNodes: 700 }));
-    }
-    fiber = safeDataValue(fiber, 'return');
-  }
-
-  const objectRefs = [];
-  const keyJoins = [];
-  const objectSeen = new Set();
-  const keySeen = new Set();
-  for (const collection of collections) {
-    const itemByObject = new Map(collection.items.map((item) => [item.object, item]));
-    for (const local of localObjects) {
-      const item = itemByObject.get(local.object);
-      if (!item) continue;
-      const pattern = `ref:${normalizeCandidatePattern(local.path)}=>${collection.pattern}`;
-      const dedupeKey = `${pattern}\u0000${item.targetOrder}`;
-      if (objectSeen.has(dedupeKey)) continue;
-      objectSeen.add(dedupeKey);
-      objectRefs.push({ pattern, targetOrder: item.targetOrder });
-    }
-    for (const local of localTokens) {
-      for (const item of collection.items) {
-        for (const token of item.tokens) {
-          if (!relationScalarEqual(local.value, token.value)) continue;
-          const pattern = `key:${normalizeCandidatePattern(local.path)}=>${collection.pattern}.${normalizeCandidatePattern(token.path)}`;
-          const dedupeKey = `${pattern}\u0000${item.targetOrder}`;
-          if (keySeen.has(dedupeKey)) continue;
-          keySeen.add(dedupeKey);
-          keyJoins.push({ pattern, targetOrder: item.targetOrder, identity: local.value });
-        }
-      }
-    }
-  }
-  const collectionSummaries = collections.map((collection) => ({
-    pattern: collection.pattern,
-    targetOrders: collection.items.map((item) => item.targetOrder)
-  }));
-  return { objectRefs, keyJoins, collections: collectionSummaries };
-}
-
-function collectTurnItemCollections(root, prefix, orderById, { maxDepth = 5, maxNodes = 600 } = {}) {
-  const queue = [{ value: root, path: prefix, depth: 0 }];
-  const seen = new Set();
-  const out = [];
-  let visited = 0;
-  while (queue.length && visited < maxNodes) {
-    const current = queue.shift();
-    const value = current.value;
-    if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) continue;
-    seen.add(value);
-    visited += 1;
-    if (Array.isArray(value)) {
-      const items = [];
-      const limit = Math.min(value.length, Math.max(128, orderById.size + 8));
-      for (let index = 0; index < limit; index += 1) {
-        const item = value[index];
-        if (!item || typeof item !== 'object') continue;
-        const orders = new Set(findKnownTurnMatches(item, orderById, { maxDepth: 4, maxNodes: 180 }).map((hit) => hit.targetOrder));
-        if (orders.size !== 1) continue;
-        items.push({
-          object: item,
-          targetOrder: [...orders][0],
-          tokens: collectRelationJoinTokens(item, '', orderById, { maxDepth: 4, maxNodes: 180, includeTurnKeys: true })
-        });
-      }
-      if (items.length >= 2) out.push({ pattern: normalizeCandidatePattern(current.path), items });
-      continue;
-    }
-    if (current.depth >= maxDepth) continue;
-    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
-      if (!('value' in descriptor)) continue;
-      const child = descriptor.value;
-      if (!child || (typeof child !== 'object' && typeof child !== 'function')) continue;
-      const path = current.path ? `${current.path}.${key}` : key;
-      queue.push({ value: child, path, depth: current.depth + 1 });
-    }
-  }
-  return dedupeCollections(out);
-}
-
-function collectNonArrayObjectRefs(root, prefix, { maxDepth = 5, maxNodes = 400 } = {}) {
-  const queue = [{ value: root, path: prefix, depth: 0 }];
-  const seen = new Set();
-  const out = [];
-  let visited = 0;
-  while (queue.length && visited < maxNodes) {
-    const current = queue.shift();
-    const value = current.value;
-    if (!value || (typeof value !== 'object' && typeof value !== 'function') || Array.isArray(value) || seen.has(value)) continue;
-    seen.add(value);
-    visited += 1;
-    if (current.depth >= maxDepth) continue;
-    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
-      if (!('value' in descriptor)) continue;
-      const child = descriptor.value;
-      const path = current.path ? `${current.path}.${key}` : key;
-      if (child && typeof child === 'object' && !Array.isArray(child)) {
-        out.push({ path, object: child });
-        queue.push({ value: child, path, depth: current.depth + 1 });
-      }
-    }
-  }
-  return out;
-}
-
-function collectRelationJoinTokens(root, prefix, orderById, { maxDepth = 5, maxNodes = 400, includeTurnKeys = false } = {}) {
-  const queue = [{ value: root, path: prefix, depth: 0 }];
-  const seen = new Set();
-  const out = [];
-  let visited = 0;
-  while (queue.length && visited < maxNodes) {
-    const current = queue.shift();
-    const value = current.value;
-    if (!value || (typeof value !== 'object' && typeof value !== 'function') || Array.isArray(value) || seen.has(value)) continue;
-    seen.add(value);
-    visited += 1;
-    if (current.depth >= maxDepth) continue;
-    for (const [key, descriptor] of Object.entries(safeDescriptors(value))) {
-      if (!('value' in descriptor)) continue;
-      const child = descriptor.value;
-      const path = current.path ? `${current.path}.${key}` : key;
-      if (isRelationScalar(child)) {
-        const terminal = String(key);
-        const isTurnKey = /^(?:turnKey|turnId)$/i.test(terminal);
-        if (isTurnKey ? includeTurnKeys : RELATION_JOIN_KEY_RE.test(terminal)) out.push({ path, value: child });
-      } else if (child && typeof child === 'object' && !Array.isArray(child)) {
-        queue.push({ value: child, path, depth: current.depth + 1 });
-      }
-    }
-  }
-  return out;
-}
-
-function addRelationCandidates(patterns, markerIndex, candidates) {
-  const byPattern = new Map();
-  for (const candidate of candidates ?? []) {
-    const targets = byPattern.get(candidate.pattern) ?? new Set();
-    targets.add(candidate.targetOrder);
-    byPattern.set(candidate.pattern, targets);
-  }
-  for (const [pattern, targets] of byPattern.entries()) {
-    let markerTargets = patterns.get(pattern);
-    if (!markerTargets) {
-      markerTargets = new Map();
-      patterns.set(pattern, markerTargets);
-    }
-    markerTargets.set(markerIndex, targets);
-  }
-}
-
-function summarizeBestRelationPatterns(patterns, markerCount, knownTurnCount, kind) {
-  const summaries = [...patterns.values()].map((markerTargets) => ({
-    ...summarizeCandidatePattern({ markerCount, knownTurnCount, markerTargets }),
-    kind
-  }));
-  summaries.sort(compareCandidatePatternSummaries);
-  const best = summaries[0] ?? { ...emptyCandidatePatternSummary(markerCount, knownTurnCount), kind };
-  return { ...best, conflicts: best.ambiguousMarkerCount + best.duplicateTargetCount };
-}
-
-function collectExactKeyJoinMap({ markers = [], orderById = new Map(), preferredPattern = null } = {}) {
-  const markerList = Array.isArray(markers) ? markers : [];
-  const knownTurnCount = orderById instanceof Map ? orderById.size : 0;
-  const patterns = new Map();
-  markerList.forEach((marker, markerIndex) => {
-    const byPattern = new Map();
-    for (const candidate of collectMarkerRelationMatches(marker, orderById).keyJoins) {
-      let entry = byPattern.get(candidate.pattern);
-      if (!entry) {
-        entry = { targets: new Set(), identitiesByTarget: new Map() };
-        byPattern.set(candidate.pattern, entry);
-      }
-      entry.targets.add(candidate.targetOrder);
-      let identities = entry.identitiesByTarget.get(candidate.targetOrder);
-      if (!identities) {
-        identities = new Set();
-        entry.identitiesByTarget.set(candidate.targetOrder, identities);
-      }
-      identities.add(candidate.identity);
-    }
-    for (const [pattern, entry] of byPattern.entries()) {
-      let markerEntries = patterns.get(pattern);
-      if (!markerEntries) {
-        markerEntries = new Map();
-        patterns.set(pattern, markerEntries);
-      }
-      markerEntries.set(markerIndex, { marker, ...entry });
-    }
-  });
-
-  const markersWithKeyJoinCandidates = new Set();
-  const keyJoinPatternSummaries = [];
-  for (const markerEntries of patterns.values()) {
-    for (const markerIndex of markerEntries.keys()) markersWithKeyJoinCandidates.add(markerIndex);
-    const markerTargets = new Map([...markerEntries.entries()].map(([markerIndex, entry]) => [markerIndex, entry.targets]));
-    keyJoinPatternSummaries.push(summarizeCandidatePattern({ markerCount: markerList.length, knownTurnCount, markerTargets }));
-  }
-  keyJoinPatternSummaries.sort(compareCandidatePatternSummaries);
-  const bestKeyJoin = keyJoinPatternSummaries[0] ?? emptyCandidatePatternSummary(markerList.length, knownTurnCount);
-  const bestKeyJoinConflicts = Number(bestKeyJoin.ambiguousMarkerCount || 0) + Number(bestKeyJoin.duplicateTargetCount || 0);
-  const exact = [];
-  for (const [pattern, markerEntries] of patterns.entries()) {
-    const markerTargets = new Map([...markerEntries.entries()].map(([markerIndex, entry]) => [markerIndex, entry.targets]));
-    const summary = summarizeCandidatePattern({ markerCount: markerList.length, knownTurnCount, markerTargets });
-    if (!summary.oneToOne) continue;
-    const pairsByTarget = new Map();
-    const identityByTarget = new Map();
-    let identityAmbiguous = false;
-    for (const [markerIndex, entry] of markerEntries.entries()) {
-      if (!(entry.targets instanceof Set) || entry.targets.size !== 1) continue;
-      const targetOrder = [...entry.targets][0];
-      const identities = entry.identitiesByTarget?.get(targetOrder);
-      if (!(identities instanceof Set) || identities.size !== 1) {
-        identityAmbiguous = true;
-        break;
-      }
-      const identity = [...identities][0];
-      pairsByTarget.set(targetOrder, { marker: entry.marker, markerIndex });
-      identityByTarget.set(targetOrder, identity);
-    }
-    if (identityAmbiguous || identityByTarget.size !== knownTurnCount) continue;
-    exact.push({ pattern, summary, pairsByTarget, identityByTarget });
-  }
-
-  exact.sort((a, b) => String(a.pattern).localeCompare(String(b.pattern)));
-  const preferred = preferredPattern ? exact.find((entry) => entry.pattern === preferredPattern) ?? null : null;
-  const preferredPatternPresent = preferredPattern ? Boolean(preferred) : null;
-  const alternateExactPatternAvailable = preferredPattern ? exact.some((entry) => entry.pattern !== preferredPattern) : null;
-  const selected = preferred ?? exact[0] ?? null;
-  const mappingAgreement = Boolean(selected);
-  return {
-    summary: {
-      markerCount: markerList.length,
-      knownTurnCount,
-      exactPatternCount: exact.length,
-      relationPatternCount: patterns.size,
-      markersWithKeyJoinCandidates: markersWithKeyJoinCandidates.size,
-      keyJoinMappedMarkers: bestKeyJoin.mappedMarkerCount,
-      keyJoinUniqueTurns: bestKeyJoin.uniqueTurnCount,
-      bestKeyJoinCoverage: bestKeyJoin.coverage,
-      bestKeyJoinConflicts,
-      bestKeyJoinOneToOne: Boolean(bestKeyJoin.oneToOne),
-      mappingAgreement,
-      preferredPatternPresent,
-      alternateExactPatternAvailable,
-      mappedTurnCount: selected?.summary?.mappedTurnCount ?? 0,
-      coverage: selected?.summary?.coverage ?? 0,
-      conflicts: selected ? 0 : (exact.length > 0 ? 1 : 0),
-      oneToOne: Boolean(selected?.summary?.oneToOne)
-    },
-    pairsByTarget: selected?.pairsByTarget ?? new Map(),
-    identityByTarget: selected?.identityByTarget ?? new Map(),
-    patternKey: selected?.pattern ?? ''
-  };
-}
-function compareRelationSummaries(a, b) {
-  if (Boolean(a.oneToOne) !== Boolean(b.oneToOne)) return a.oneToOne ? -1 : 1;
-  if (a.mappedTurnCount !== b.mappedTurnCount) return b.mappedTurnCount - a.mappedTurnCount;
-  if (a.conflicts !== b.conflicts) return a.conflicts - b.conflicts;
-  if (a.coverage !== b.coverage) return b.coverage - a.coverage;
-  return b.resolvedMarkerCount - a.resolvedMarkerCount;
-}
-
-function summarizePositionalAlignments({ markerCount = 0, knownTurnCount = 0, collections = [] } = {}) {
-  let candidateCount = 0;
-  let bestMappedTurns = 0;
-  for (const orders of collections) {
-    if (!Array.isArray(orders) || orders.length === 0) continue;
-    const maxOffset = Math.max(markerCount, orders.length);
-    for (let offset = -maxOffset; offset <= maxOffset; offset += 1) {
-      const mapped = [];
-      for (let markerIndex = 0; markerIndex < markerCount; markerIndex += 1) {
-        const itemIndex = markerIndex + offset;
-        if (itemIndex < 0 || itemIndex >= orders.length) continue;
-        const order = orders[itemIndex];
-        if (Number.isInteger(order)) mapped.push(order);
-      }
-      const unique = new Set(mapped);
-      bestMappedTurns = Math.max(bestMappedTurns, unique.size);
-      if (knownTurnCount > 0 && mapped.length === knownTurnCount && unique.size === knownTurnCount) candidateCount += 1;
-    }
-  }
-  return {
-    candidateCount,
-    bestCoverage: knownTurnCount > 0 ? roundRatio(bestMappedTurns / knownTurnCount) : 0
-  };
-}
-
-function dedupeCollections(values) {
-  const seen = new Set();
-  return values.filter((value) => {
-    const key = `${value.pattern}\u0000${value.items.map((item) => item.targetOrder).join(',')}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function isRelationScalar(value) {
-  if (typeof value === 'string') return value.length > 0 && value.length <= 256;
-  return Number.isFinite(value);
-}
-
-function relationScalarEqual(a, b) {
-  return typeof a === typeof b && a === b;
-}
-
-function safeAttributeValue(node, name) {
-  try {
-    const value = node?.getAttribute?.(name);
-    return value == null ? null : String(value);
-  } catch {
-    return null;
-  }
-}
-
-function roundRatio(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(1, Math.round(number * 1000) / 1000));
-}
-
-function collectMarkerFiberSample(node, sampleIndex, orderById) {
-  const ownKeys = reactOwnKeys(node);
-  const fiberKey = ownKeys.find((key) => key.startsWith(REACT_FIBER_PREFIX) || key.startsWith(REACT_CONTAINER_PREFIX));
-  if (!fiberKey) return { sampleIndex, present: false, componentChain: [], knownTurnMatches: [], candidatePaths: [], handlerTraits: [] };
-  let fiber = safeDataValue(node, fiberKey);
-  const componentChain = [];
-  const knownTurnMatches = [];
-  const candidatePaths = [];
-  const handlerTraits = [];
-  const seen = new Set();
-  for (let depth = 0; fiber && depth < 20 && !seen.has(fiber); depth += 1) {
-    seen.add(fiber);
-    componentChain.push(describeFiber(fiber));
-    for (const propName of ['memoizedProps', 'pendingProps', 'memoizedState']) {
-      const value = safeDataValue(fiber, propName);
-      if (value == null) continue;
-      const prefix = `fiber[${depth}].${propName}`;
-      for (const hit of findKnownTurnMatches(value, orderById, { maxDepth: 5, maxNodes: 800 })) knownTurnMatches.push({ ...hit, path: `${prefix}.${hit.path}`, fiberDepth: depth });
-      for (const hit of collectCandidatePaths(value, { maxDepth: 4, maxNodes: 500 })) candidatePaths.push({ ...hit, path: `${prefix}.${hit.path}` });
-      for (const hit of collectHandlerTraits(value, { maxDepth: 3, maxNodes: 220 })) handlerTraits.push({ ...hit, path: `${prefix}.${hit.path}` });
-    }
-    fiber = safeDataValue(fiber, 'return');
-  }
-  return {
-    sampleIndex,
-    present: true,
-    componentChain,
-    knownTurnMatches: dedupeMatches(knownTurnMatches).slice(0, 80),
-    candidatePaths: dedupePaths(candidatePaths).slice(0, 100),
-    handlerTraits: dedupeHandlerTraits(handlerTraits).slice(0, 60)
-  };
-}
-
-function minKnownTurnDepth(samples) {
-  const depths = samples.flatMap((entry) => entry.knownTurnMatches ?? []).map((entry) => entry.fiberDepth).filter(Number.isFinite);
-  return depths.length ? Math.min(...depths) : null;
-}
-
-function sampleMarkers(markers, limit) {
-  if (!Array.isArray(markers) || markers.length <= limit) return Array.isArray(markers) ? markers : [];
-  const out = [];
-  for (let i = 0; i < limit; i += 1) {
-    const index = Math.round((i * (markers.length - 1)) / Math.max(1, limit - 1));
-    if (!out.includes(markers[index])) out.push(markers[index]);
-  }
-  return out;
-}
-
-function collectHandlerTraits(root, { maxDepth = 3, maxNodes = 200 } = {}) {
-  const hits = [];
-  walkData(root, { maxDepth, maxNodes }, ({ path, key, value }) => {
-    if (typeof value !== 'function') return;
-    if (!/(click|navigate|scroll|jump|select|press|pointer|intent|capture|restore)/i.test(String(key ?? ''))) return;
-    hits.push({ path, name: String(key ?? ''), arity: value.length, sourceTraits: functionSourceTraits(value) });
-  });
-  return dedupeHandlerTraits(hits).slice(0, 60);
-}
-
-function functionSourceTraits(fn) {
-  let source = '';
-  try { source = Function.prototype.toString.call(fn); } catch { return []; }
-  const traits = [];
-  for (const token of ['scrollIntoView','scrollTo','scrollBy','captureNavigation','prepareRestoreLock','saveNow','preventDefault','stopPropagation']) {
-    if (source.includes(token)) traits.push(token);
-  }
-  return traits;
-}
-
-function dedupeHandlerTraits(values) {
-  const seen = new Set();
-  return values.filter((value) => {
-    const key = `${value.path}\u0000${value.name}\u0000${(value.sourceTraits ?? []).join(',')}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function summarizeRequiredDepth({ markerCount, level1, level2, level3 }) {
-  const l1Keys = level1?.codexThreadScrollHandlers?.keys ?? [];
-  const directL1 = l1Keys.some((entry) => /^(scrollToIndex|jumpToTurn|navigateToMessage|navigateToTurn|scrollToItem)$/i.test(entry.name));
-  if (directL1) return { recommendedDepth: 'L1', reason: 'direct-navigation-handler-visible' };
-  if (!(markerCount > 0)) return { recommendedDepth: 'pending-marker', reason: 'official-marker-not-mounted' };
-  if (level2?.markerSamplesWithKnownTurnMatch > 0) return { recommendedDepth: 'L2', reason: 'marker-react-props-map-to-known-turn' };
-  if (level3?.markerSamplesWithKnownTurnMatch > 0) return { recommendedDepth: 'L3', reason: 'marker-fiber-chain-maps-to-known-turn', shallowestFiberDepth: level3.shallowestKnownTurnDepth };
-  return { recommendedDepth: 'deeper-than-L3', reason: 'marker-props-and-return-chain-have-no-known-turn-match' };
-}
-
-function findKnownTurnMatches(root, orderById, { maxDepth = 3, maxNodes = 300 } = {}) {
-  if (!root || orderById.size === 0) return [];
-  const hits = [];
-  walkData(root, { maxDepth, maxNodes }, ({ path, value }) => {
-    if (typeof value !== 'string') return;
-    const order = orderById.get(value);
-    if (!Number.isInteger(order)) return;
-    hits.push({ path, targetOrder: order, targetLabel: `Q${order + 1}` });
-  });
-  return dedupeMatches(hits).slice(0, 40);
-}
-
-function collectCandidatePaths(root, { maxDepth = 3, maxNodes = 250 } = {}) {
-  const hits = [];
-  walkData(root, { maxDepth, maxNodes }, ({ path, key, value }) => {
-    if (!key || !CANDIDATE_KEY_RE.test(key)) return;
-    hits.push({ path, type: valueType(value), shape: valueShape(value) });
-  });
-  return dedupePaths(hits).slice(0, 60);
-}
-
-function walkData(root, { maxDepth, maxNodes }, visitor) {
-  const queue = [{ value: root, path: '', depth: 0 }];
-  const seen = new Set();
-  let visited = 0;
-  while (queue.length && visited < maxNodes) {
-    const current = queue.shift();
-    const value = current.value;
-    if (value == null || (typeof value !== 'object' && typeof value !== 'function')) continue;
-    if (seen.has(value)) continue;
-    seen.add(value);
-    visited += 1;
-    if (current.depth >= maxDepth) continue;
-    const descriptors = safeDescriptors(value);
-    for (const [key, descriptor] of Object.entries(descriptors)) {
-      if (!('value' in descriptor)) continue;
-      const child = descriptor.value;
-      const path = current.path ? `${current.path}.${key}` : key;
-      visitor({ path, key, value: child });
-      if (isPlainInspectable(child)) queue.push({ value: child, path, depth: current.depth + 1 });
-    }
-    if (Array.isArray(value)) {
-      for (let index = 0; index < Math.min(value.length, 20); index += 1) {
-        const child = value[index];
-        const path = `${current.path}[${index}]`;
-        visitor({ path, key: String(index), value: child });
-        if (isPlainInspectable(child)) queue.push({ value: child, path, depth: current.depth + 1 });
-      }
-    }
-  }
-}
-
-function describeFiber(fiber) {
-  const type = safeDataValue(fiber, 'elementType') ?? safeDataValue(fiber, 'type');
-  return {
-    tag: Number.isFinite(safeDataValue(fiber, 'tag')) ? Number(safeDataValue(fiber, 'tag')) : null,
-    component: componentName(type),
-    hasMemoizedProps: safeDataValue(fiber, 'memoizedProps') != null,
-    hasMemoizedState: safeDataValue(fiber, 'memoizedState') != null
-  };
-}
-
-function componentName(type) {
-  if (typeof type === 'string') return type;
-  if (typeof type === 'function') return type.displayName || type.name || 'function';
-  if (type && typeof type === 'object') return String(safeDataValue(type, 'displayName') ?? safeDataValue(type, 'name') ?? 'object');
-  return null;
-}
-
-function reactOwnKeys(node) {
-  return safeOwnNames(node).filter((key) => key.startsWith('__react')).slice(0, 20);
-}
-
-function describeOwnKeys(value, limit) {
-  return safeOwnNames(value).slice(0, limit).map((name) => {
-    const child = safeDataValue(value, name);
-    return { name, type: valueType(child), arity: typeof child === 'function' ? child.length : null, sourceTraits: typeof child === 'function' ? functionSourceTraits(child) : [] };
-  });
-}
-
-function safeOwnNames(value) {
-  try { return Object.getOwnPropertyNames(value ?? {}); } catch { return []; }
-}
-
-function safeDescriptors(value) {
-  try { return Object.getOwnPropertyDescriptors(value ?? {}); } catch { return {}; }
-}
-
-function safeDataValue(value, key) {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value ?? {}, key);
-    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
-  } catch { return undefined; }
-}
-
-function isPlainInspectable(value) {
-  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
-  const tag = Object.prototype.toString.call(value);
-  return tag === '[object Object]' || tag === '[object Array]' || typeof value === 'function';
-}
-
-function valueType(value) {
-  if (Array.isArray(value)) return 'array';
-  if (value === null) return 'null';
-  return typeof value;
-}
-
-function valueShape(value) {
-  if (typeof value === 'string') return { length: value.length, uuidLike: /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(value), numericLike: /^\d+$/.test(value) };
-  if (Array.isArray(value)) return { length: value.length };
-  if (typeof value === 'function') return { arity: value.length };
-  if (value && typeof value === 'object') return { keys: safeOwnNames(value).slice(0, 12) };
-  return null;
-}
-
-function dedupeMatches(values) {
-  const seen = new Set();
-  return values.filter((value) => {
-    const key = `${value.path}\u0000${value.targetOrder}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function dedupePaths(values) {
-  const seen = new Set();
-  return values.filter((value) => {
-    const key = `${value.path}\u0000${value.type}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-Object.assign(exports, { collectHostInternalDepthProbe, collectL3ExactKeyJoinDryRunMap });
-
-},
 "src/v3/bootstrap.js": (module, exports, __require) => {
 const { EventBus } = __require("src/v3/core/event-bus.js");
 const { LocalStorageAdapter } = __require("src/v3/core/storage.js");
@@ -6054,32 +6049,973 @@ const { TimelineState } = __require("src/v3/core/timeline-state.js");
 const { PromptStore } = __require("src/v3/core/prompt-store.js");
 const { SettingsStore } = __require("src/v3/core/settings-store.js");
 const { TimelineCache } = __require("src/v3/core/timeline-cache.js");
+const { WorkTimelineCache } = __require("src/v3/core/work-timeline-cache.js");
+const { normalizeQuestionDisplayText } = __require("src/v3/core/question-display.js");
 const { SURFACE } = __require("src/v3/host/host-interface.js");
 const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js");
 const { parseSidebarConversationKey } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
-const { OfficialNavigationProbe, analyzeOfficialNavigationLearning, analyzeOfficialNavigationMapping, sanitizeOfficialNavigationHistory, sanitizeOfficialNavigationLearningHistory, sanitizeOfficialNavigationRecord, selectTrustedOfficialBridgePair } = __require("src/v3/diagnostics/official-navigation-probe.js");
-const { analyzeOfficialNavigationAutoMap, officialAutoMapSignature, sanitizeOfficialNavigationAutoSummary } = __require("src/v3/diagnostics/official-navigation-auto-map.js");
-const { collectHostInternalDepthProbe, collectL3ExactKeyJoinDryRunMap } = __require("src/v3/diagnostics/host-internal-depth-probe.js");
 
 const VERSION = "0.5.2";
-const OFFICIAL_NAVIGATION_RUNTIME_ENABLED = false;
-const L3_RUNTIME_ENABLED = false;
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
+const CHAT_PENDING_SELECTION_TTL_MS = 2600;
+const CHAT_DIRECT_REKEY_WINDOW_MS = 5000;
+const PINNED_CHAT_SELECTION_TTL_MS = 3200;
 const NAVIGATION_HISTORY_LIMIT = 5;
 const NAVIGATION_STEP_LIMIT = 16;
 const SLOW_NAVIGATION_HISTORY_LIMIT = 10;
 const SLOW_NAVIGATION_STORAGE_KEY = "gte.v3.navigation-diagnostics";
-const OFFICIAL_NAVIGATION_HISTORY_LIMIT = 10;
-const OFFICIAL_NAVIGATION_STORAGE_KEY = "gte.v3.official-navigation-diagnostics";
-const OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT = 32;
-const OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY = "gte.v3.official-navigation-learning";
-const OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS = [120, 400];
-const L3_ADAPTIVE_RESCAN_DELAYS_MS = [50, 120, 250];
-const L3_POST_NAVIGATION_SCAN_DELAY_MS = 180;
-const L3_EVENT_RECOVERY_DEBOUNCE_MS = 140;
+const CAPTURE_DIAGNOSTIC_LIMIT = 12;
+const CHAT_SCROLL_DIAGNOSTIC_LIMIT = 40;
+const CHAT_BOOTSTRAP_MAX_FAILURES = 3;
+const CHAT_BOOTSTRAP_RETRY_DELAYS_MS = [220, 700, 1500];
+
+function reconcileChatVisibleTurns(index, visibleRecords = [], diagnostics = null) {
+  const records = (Array.isArray(visibleRecords) ? visibleRecords : [])
+    .filter((record) => record?.id)
+    .map((record, position) => ({
+      ...record,
+      windowOrder: Number.isFinite(record.windowOrder) ? Number(record.windowOrder) : position
+    }));
+  if (!records.length) {
+    if (diagnostics) Object.assign(diagnostics, { recordCount: 0, orientation: "none", turns: [] });
+    return [];
+  }
+
+  const cacheRepair = repairReversedVisualDomOrders(index, records);
+  const existing = index?.getOrdered?.() ?? [];
+  const currentVisibleIds = new Set(records.map((record) => String(record.id)));
+  const resolved = new Map();
+  const anchorMeta = new Map();
+  const offsets = [];
+  const reverseOffsets = [];
+  const noteAnchor = (position, record, order, kind, extra = {}) => {
+    const windowOrder = Number(record.windowOrder);
+    const reverseWindowOrder = records.length - 1 - windowOrder;
+    offsets.push(order - windowOrder);
+    reverseOffsets.push(order - reverseWindowOrder);
+    anchorMeta.set(position, { kind, order, ...extra });
+  };
+
+  for (let position = 0; position < records.length; position += 1) {
+    const record = records[position];
+    if (record.orderTrust !== "window" && Number.isFinite(record.order)) {
+      const order = Number(record.order);
+      resolved.set(position, { id: String(record.id), order });
+      noteAnchor(position, record, order, "absolute");
+      continue;
+    }
+
+    const known = index?.get?.(record.id);
+    if (known && Number.isFinite(known.order)) {
+      const order = Number(known.order);
+      resolved.set(position, { id: String(record.id), order });
+      noteAnchor(position, record, order, "known-id");
+      continue;
+    }
+
+    const text = normalizeChatTurnText(record.text);
+    if (!text) {
+      anchorMeta.set(position, { kind: "no-text", order: null, textMatchCount: 0 });
+      continue;
+    }
+    const matches = existing.filter((candidate) => (
+      isTrustedChatOrderAnchor(candidate)
+      || (candidate?.source === "dom" && !currentVisibleIds.has(String(candidate.id)))
+    ) && normalizeChatTurnText(candidate.text) === text);
+    if (matches.length !== 1 || !Number.isFinite(matches[0].order)) {
+      anchorMeta.set(position, { kind: "text-unresolved", order: null, textMatchCount: matches.length });
+      continue;
+    }
+    const anchor = matches[0];
+    const order = Number(anchor.order);
+    if (anchor.source?.includes("capture")) {
+      index?.setAlias?.(record.id, anchor.id);
+      resolved.set(position, { id: String(anchor.id), order });
+    } else {
+      resolved.set(position, { id: String(record.id), order });
+    }
+    noteAnchor(position, record, order, "text-anchor", { textMatchCount: matches.length, captureAnchor: Boolean(anchor.source?.includes("capture")) });
+  }
+
+  const distinctOffsets = [...new Set(offsets.filter(Number.isFinite))];
+  const sharedOffset = distinctOffsets.length === 1 ? distinctOffsets[0] : null;
+  const distinctReverseOffsets = [...new Set(reverseOffsets.filter(Number.isFinite))];
+  const reverseSharedOffset = distinctReverseOffsets.length === 1 ? distinctReverseOffsets[0] : null;
+  const forwardMappedOrders = records
+    .filter((record) => record.orderTrust === "window")
+    .map((record) => Number.isFinite(sharedOffset) ? Number(record.windowOrder) + sharedOffset : null)
+    .filter(Number.isFinite);
+  const reverseMappedOrders = records
+    .filter((record) => record.orderTrust === "window")
+    .map((record) => Number.isFinite(reverseSharedOffset) ? (records.length - 1 - Number(record.windowOrder)) + reverseSharedOffset : null)
+    .filter(Number.isFinite);
+  const forwardHasNegative = forwardMappedOrders.some((order) => order < 0);
+  const reverseAllNonNegative = reverseMappedOrders.length > 0 && reverseMappedOrders.every((order) => order >= 0);
+  const useReverseWindow = Number.isFinite(sharedOffset)
+    && Number.isFinite(reverseSharedOffset)
+    && forwardHasNegative
+    && reverseAllNonNegative;
+  const orientation = useReverseWindow ? "reverse-window" : "forward-window";
+  const selectedOffset = useReverseWindow ? reverseSharedOffset : sharedOffset;
+  const output = [];
+  const turnDiagnostics = [];
+
+  for (let position = 0; position < records.length; position += 1) {
+    const record = records[position];
+    let mapped = resolved.get(position) ?? null;
+    let mappedBy = mapped ? anchorMeta.get(position)?.kind ?? "anchor" : null;
+    if (!mapped && record.orderTrust === "window" && Number.isFinite(selectedOffset)) {
+      const basisOrder = useReverseWindow
+        ? records.length - 1 - Number(record.windowOrder)
+        : Number(record.windowOrder);
+      mapped = { id: String(record.id), order: basisOrder + selectedOffset };
+      mappedBy = orientation;
+    }
+
+    const diag = {
+      position,
+      windowOrder: Number(record.windowOrder),
+      orderTrust: record.orderTrust ?? null,
+      idMode: diagnosticTurnIdMode(record.id),
+      anchorKind: anchorMeta.get(position)?.kind ?? null,
+      textMatchCount: Number(anchorMeta.get(position)?.textMatchCount ?? 0),
+      resolvedOrder: Number.isFinite(resolved.get(position)?.order) ? Number(resolved.get(position).order) : null,
+      mappedOrder: Number.isFinite(mapped?.order) ? Number(mapped.order) : null,
+      mappedBy,
+      accepted: false,
+      reason: null
+    };
+
+    if (!mapped || !Number.isFinite(mapped.order)) {
+      diag.reason = "unmapped";
+      turnDiagnostics.push(diag);
+      continue;
+    }
+    if (mapped.order < 0) {
+      diag.reason = "negative-order";
+      turnDiagnostics.push(diag);
+      continue;
+    }
+
+    const candidate = {
+      ...record,
+      id: mapped.id,
+      order: Number(mapped.order),
+      orderTrust: record.orderTrust === "window" ? "mapped" : record.orderTrust
+    };
+    const occupants = (index?.getOrdered?.() ?? []).filter((turn) => turn.id !== candidate.id && Number(turn.order) === candidate.order);
+    if (occupants.length) {
+      const legacyOccupant = occupants.length === 1 ? occupants[0] : null;
+      const promotedLegacy = record.orderTrust === "window"
+        && Number.isFinite(selectedOffset)
+        && legacyOccupant
+        && index?.replaceLegacyAnchor?.(legacyOccupant.id, candidate.id) === true;
+      const promotedStaleDom = !promotedLegacy
+        && record.orderTrust === "window"
+        && Number.isFinite(selectedOffset)
+        && legacyOccupant
+        && legacyOccupant.source === "dom"
+        && !currentVisibleIds.has(String(legacyOccupant.id))
+        && normalizeChatTurnText(legacyOccupant.text) === normalizeChatTurnText(candidate.text)
+        && index?.replaceStaleDomAnchor?.(legacyOccupant.id, candidate.id, { order: candidate.order, text: candidate.text }) === true;
+      if (!promotedLegacy && !promotedStaleDom) {
+        const text = normalizeChatTurnText(candidate.text);
+        const compatible = occupants.filter((turn) => isTrustedChatOrderAnchor(turn)
+          && text
+          && normalizeChatTurnText(turn.text) === text);
+        if (occupants.length !== 1 || compatible.length !== 1) {
+          diag.reason = "occupied-order";
+          diag.occupantCount = occupants.length;
+          turnDiagnostics.push(diag);
+          continue;
+        }
+        const anchor = compatible[0];
+        if (anchor.source?.includes("capture")) {
+          index?.setAlias?.(record.id, anchor.id);
+          candidate.id = String(anchor.id);
+          candidate.order = Number(anchor.order);
+        }
+      }
+    }
+    output.push(candidate);
+    diag.accepted = true;
+    diag.reason = "accepted";
+    turnDiagnostics.push(diag);
+  }
+
+  if (diagnostics) {
+    Object.assign(diagnostics, {
+      recordCount: records.length,
+      cacheRepair,
+      existingCount: existing.length,
+      anchorCount: resolved.size,
+      forwardSharedOffset: Number.isFinite(sharedOffset) ? sharedOffset : null,
+      reverseSharedOffset: Number.isFinite(reverseSharedOffset) ? reverseSharedOffset : null,
+      forwardHasNegative,
+      reverseAllNonNegative,
+      orientation,
+      turns: turnDiagnostics
+    });
+  }
+  return output.sort((a, b) => Number(a.windowOrder) - Number(b.windowOrder));
+}
+
+function repairReversedVisualDomOrders(index, records = []) {
+  const rows = (Array.isArray(records) ? records : [])
+    .filter((record) => diagnosticTurnIdMode(record?.id) === "uuid-like"
+      && Number.isFinite(record?.visualOrder));
+  if (rows.length < 2 || rows.length !== records.length) {
+    return { repaired: false, reason: "ineligible-visible-set", count: rows.length };
+  }
+  const visualOrders = rows.map((record) => Number(record.visualOrder));
+  if (new Set(visualOrders).size !== rows.length) {
+    return { repaired: false, reason: "ambiguous-visual-order", count: rows.length };
+  }
+  const known = rows.map((record) => {
+    const turn = index?.get?.(record.id) ?? null;
+    return turn && turn.id === String(record.id) ? turn : null;
+  });
+  if (known.some((turn) => !turn || turn.source !== "dom" || !Number.isFinite(turn.order))) {
+    return { repaired: false, reason: "not-dom-only-known-set", count: rows.length };
+  }
+  const sortedOrders = known.map((turn) => Number(turn.order)).sort((a, b) => a - b);
+  if (new Set(sortedOrders).size !== rows.length) {
+    return { repaired: false, reason: "duplicate-known-orders", count: rows.length };
+  }
+  for (let i = 1; i < sortedOrders.length; i += 1) {
+    if (sortedOrders[i] !== sortedOrders[i - 1] + 1) {
+      return { repaired: false, reason: "noncontiguous-known-orders", count: rows.length };
+    }
+  }
+  const visualRows = rows
+    .map((record) => ({ record, known: index.get(record.id) }))
+    .sort((a, b) => Number(a.record.visualOrder) - Number(b.record.visualOrder));
+  const visualKnownOrders = visualRows.map((entry) => Number(entry.known.order));
+  const reversed = [...sortedOrders].reverse();
+  const exactlyReversed = visualKnownOrders.every((order, i) => order === reversed[i]);
+  if (!exactlyReversed) {
+    return { repaired: false, reason: "not-exactly-reversed", count: rows.length };
+  }
+  const assignments = visualRows.map((entry, i) => ({
+    id: String(entry.record.id),
+    order: sortedOrders[i]
+  }));
+  const repaired = Boolean(index?.reassignDomOrders?.(assignments));
+  return {
+    repaired,
+    reason: repaired ? "visual-order-reversal" : "reassign-rejected",
+    count: rows.length,
+    minOrder: sortedOrders[0],
+    maxOrder: sortedOrders.at(-1)
+  };
+}
+
+function analyzeChatBootstrapWindow(records = [], { allowPartial = true } = {}) {
+  const input = Array.isArray(records) ? records : [];
+  const uuidRows = input
+    .map((record, position) => ({
+      record,
+      position,
+      id: String(record?.id ?? ""),
+      visualOrder: Number.isFinite(record?.visualOrder) ? Number(record.visualOrder) : null,
+      windowOrder: Number.isFinite(record?.windowOrder) ? Number(record.windowOrder) : position
+    }))
+    .filter((entry) => diagnosticTurnIdMode(entry.id) === "uuid-like");
+  if (!uuidRows.length) {
+    return {
+      turns: [],
+      basis: "none",
+      partial: Boolean(input.length),
+      rawCount: input.length,
+      uuidCount: 0
+    };
+  }
+  if (!allowPartial && uuidRows.length !== input.length) {
+    return {
+      turns: [],
+      basis: "none",
+      partial: true,
+      rawCount: input.length,
+      uuidCount: uuidRows.length
+    };
+  }
+
+  const visualOrders = uuidRows.map((entry) => entry.visualOrder);
+  const hasStableVisualOrder = visualOrders.every(Number.isFinite)
+    && new Set(visualOrders).size === uuidRows.length;
+  const windowOrders = uuidRows.map((entry) => entry.windowOrder);
+  const hasStableWindowOrder = windowOrders.every(Number.isFinite)
+    && new Set(windowOrders).size === uuidRows.length;
+  if (!hasStableVisualOrder && !hasStableWindowOrder) {
+    return {
+      turns: [],
+      basis: "none",
+      partial: uuidRows.length !== input.length,
+      rawCount: input.length,
+      uuidCount: uuidRows.length
+    };
+  }
+
+  const basis = hasStableVisualOrder ? "visual" : "window";
+  const rows = [...uuidRows].sort((left, right) => {
+    const leftOrder = basis === "visual" ? left.visualOrder : left.windowOrder;
+    const rightOrder = basis === "visual" ? right.visualOrder : right.windowOrder;
+    return leftOrder - rightOrder || left.position - right.position;
+  });
+  return {
+    turns: rows.map(({ record, id }) => ({
+      id,
+      text: String(record?.text ?? ""),
+      shortText: String(record?.shortText ?? record?.text ?? ""),
+      type: record?.type ?? "text"
+    })),
+    basis,
+    partial: uuidRows.length !== input.length || basis !== "visual",
+    rawCount: input.length,
+    uuidCount: uuidRows.length
+  };
+}
+
+function normalizeChatBootstrapWindow(records = []) {
+  return analyzeChatBootstrapWindow(records).turns;
+}
+
+function readChatBootstrapFlexDirection(container, windowRef) {
+  const computed = String(windowRef?.getComputedStyle?.(container)?.flexDirection ?? "").trim();
+  if (computed) return computed;
+  return String(container?.style?.flexDirection ?? "").trim();
+}
+
+function isLogicalChatBootstrapBasis(basis) {
+  return basis === "visual"
+    || basis === "container-reverse-window"
+    || basis === "container-forward-window";
+}
+
+function analyzeChatBootstrapWindowForContainer(records = [], container = null, windowRef = null, options = {}) {
+  const analyzed = analyzeChatBootstrapWindow(records, options);
+  if (!analyzed.turns.length || analyzed.basis !== "window") return analyzed;
+  const flexDirection = readChatBootstrapFlexDirection(container, windowRef);
+  if (flexDirection === "column-reverse") {
+    return {
+      ...analyzed,
+      turns: [...analyzed.turns].reverse(),
+      basis: "container-reverse-window"
+    };
+  }
+  if (flexDirection === "column") {
+    return {
+      ...analyzed,
+      basis: "container-forward-window"
+    };
+  }
+  return { ...analyzed, turns: [], basis: "none" };
+}
+
+function bootstrapSequenceCoversIds(turns = [], requiredIds = []) {
+  const available = new Set((Array.isArray(turns) ? turns : []).map((turn) => String(turn?.id ?? "")).filter(Boolean));
+  return (Array.isArray(requiredIds) ? requiredIds : []).every((id) => available.has(String(id)));
+}
+
+function analyzeAbsoluteChatBootstrapWindow(records = []) {
+  const rows = (Array.isArray(records) ? records : [])
+    .filter((record) => record?.id
+      && record.orderTrust !== "window"
+      && Number.isFinite(record.order))
+    .map((record) => ({
+      id: String(record.id),
+      order: Number(record.order),
+      text: String(record?.text ?? ""),
+      shortText: String(record?.shortText ?? record?.text ?? ""),
+      type: record?.type ?? "text"
+    }))
+    .sort((left, right) => left.order - right.order);
+  const uniqueOrders = new Set(rows.map((row) => row.order));
+  if (!rows.length || rows.length !== (Array.isArray(records) ? records.length : 0) || uniqueOrders.size !== rows.length) {
+    return { turns: [], basis: "absolute", partial: true };
+  }
+  return { turns: rows, basis: "absolute", partial: false };
+}
+
+function buildAbsoluteChatBootstrapSweepSequence(windows = []) {
+  const byOrder = new Map();
+  let conflict = false;
+  let windowCount = 0;
+  for (const window of Array.isArray(windows) ? windows : []) {
+    const analyzed = Array.isArray(window?.turns) && window.basis === "absolute"
+      ? window
+      : analyzeAbsoluteChatBootstrapWindow(window);
+    if (!analyzed.turns?.length) continue;
+    windowCount += 1;
+    for (const turn of analyzed.turns) {
+      const order = Number(turn.order);
+      if (!Number.isFinite(order) || order < 0) {
+        conflict = true;
+        continue;
+      }
+      const previous = byOrder.get(order);
+      if (previous && String(previous.id) !== String(turn.id)
+        && normalizeChatTurnText(previous.text) !== normalizeChatTurnText(turn.text)) {
+        conflict = true;
+        continue;
+      }
+      if (!previous || normalizeChatTurnText(turn.text).length >= normalizeChatTurnText(previous.text).length) {
+        byOrder.set(order, { ...turn });
+      }
+    }
+  }
+  const orders = [...byOrder.keys()].sort((a, b) => a - b);
+  const contiguous = orders.length > 0
+    && orders[0] === 0
+    && orders.every((order, index) => order === index);
+  const turns = contiguous ? orders.map((order) => byOrder.get(order)) : [];
+  const missingText = turns.filter((turn) => !normalizeChatTurnText(turn?.text)).length;
+  return {
+    turns: !conflict && contiguous && missingText === 0 ? turns : [],
+    windowCount,
+    skippedWindows: 0,
+    missingText,
+    complete: !conflict && contiguous && turns.length > 0 && missingText === 0
+  };
+}
+
+function bootstrapWindowOrientations(window) {
+  const turns = Array.isArray(window?.turns) ? window.turns : [];
+  if (!turns.length) return [];
+  const forward = turns.map((turn) => ({ ...turn }));
+  if (isLogicalChatBootstrapBasis(window?.basis) || turns.length < 2) return [forward];
+  return [forward, [...forward].reverse()];
+}
+
+function bootstrapOverlapSize(sequence = [], window = []) {
+  const max = Math.min(sequence.length, window.length);
+  for (let size = max; size >= 1; size -= 1) {
+    let match = true;
+    for (let offset = 0; offset < size; offset += 1) {
+      if (sequence[sequence.length - size + offset]?.id !== window[offset]?.id) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return size;
+  }
+  return 0;
+}
+
+function containsBootstrapWindow(sequence = [], window = []) {
+  if (!window.length || sequence.length < window.length) return false;
+  for (let start = 0; start <= sequence.length - window.length; start += 1) {
+    let match = true;
+    for (let offset = 0; offset < window.length; offset += 1) {
+      if (sequence[start + offset]?.id !== window[offset]?.id) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+function enrichBootstrapTurns(sequence = [], windows = []) {
+  const bestById = new Map();
+  const prefer = (left, right) => {
+    const leftText = normalizeChatTurnText(left);
+    const rightText = normalizeChatTurnText(right);
+    return rightText.length > leftText.length ? right : left;
+  };
+  for (const window of windows) {
+    for (const turn of Array.isArray(window?.turns) ? window.turns : []) {
+      const id = String(turn?.id ?? "");
+      if (!id) continue;
+      const previous = bestById.get(id) ?? { id, text: "", shortText: "", type: "text" };
+      bestById.set(id, {
+        id,
+        text: prefer(previous.text, String(turn?.text ?? "")),
+        shortText: prefer(previous.shortText, String(turn?.shortText ?? turn?.text ?? "")),
+        type: previous.type !== "text" ? previous.type : (turn?.type ?? previous.type)
+      });
+    }
+  }
+  return sequence.map((turn) => ({ ...turn, ...(bestById.get(String(turn?.id ?? "")) ?? {}) }));
+}
+
+function buildChatBootstrapSweepSequence(windows = []) {
+  const analyzed = (Array.isArray(windows) ? windows : [])
+    .map((window) => {
+      if (Array.isArray(window?.turns) && window.turns.length) {
+        return {
+          turns: window.turns.map((turn) => ({ ...turn })),
+          basis: window.basis ?? "visual",
+          partial: Boolean(window.partial)
+        };
+      }
+      return analyzeChatBootstrapWindow(window);
+    })
+    .filter((window) => window.turns.length && isLogicalChatBootstrapBasis(window.basis));
+
+  const orderedIds = [];
+  const seen = new Set();
+  const bestById = new Map();
+  let skippedWindows = 0;
+  for (const window of analyzed) {
+    if (!window.turns.length) {
+      skippedWindows += 1;
+      continue;
+    }
+    for (const turn of window.turns) {
+      const id = String(turn?.id ?? "");
+      if (!id || diagnosticTurnIdMode(id) !== "uuid-like") continue;
+      if (!seen.has(id)) {
+        seen.add(id);
+        orderedIds.push(id);
+      }
+      const previous = bestById.get(id) ?? { id, text: "", shortText: "", type: "text" };
+      const nextText = String(turn?.text ?? "");
+      const nextShortText = String(turn?.shortText ?? turn?.text ?? "");
+      bestById.set(id, {
+        id,
+        text: normalizeChatTurnText(nextText).length >= normalizeChatTurnText(previous.text).length ? nextText : previous.text,
+        shortText: normalizeChatTurnText(nextShortText).length >= normalizeChatTurnText(previous.shortText).length ? nextShortText : previous.shortText,
+        type: previous.type !== "text" ? previous.type : (turn?.type ?? previous.type)
+      });
+    }
+  }
+  const turns = orderedIds.map((id) => bestById.get(id)).filter(Boolean);
+  const missingText = turns.filter((turn) => !normalizeChatTurnText(turn?.text)).length;
+  return {
+    turns: missingText === 0 ? turns : [],
+    windowCount: analyzed.length,
+    skippedWindows,
+    missingText,
+    complete: analyzed.length > 0 && turns.length > 0 && missingText === 0
+  };
+}
+
+function stitchChatBootstrapWindows(windows = []) {
+  const analyzed = (Array.isArray(windows) ? windows : [])
+    .map((window) => {
+      if (Array.isArray(window?.turns) && window.turns.length) {
+        return {
+          turns: window.turns.map((turn) => ({ ...turn })),
+          basis: window.basis ?? "visual",
+          partial: Boolean(window.partial)
+        };
+      }
+      return analyzeChatBootstrapWindow(window);
+    })
+    .filter((window) => window.turns.length);
+  if (!analyzed.length) {
+    return { turns: [], connectedWindows: 0, totalWindows: 0, skippedWindows: 0, complete: false };
+  }
+
+  const initialWindow = analyzed[0].turns;
+  const ordered = [...analyzed].reverse();
+  let best = null;
+
+  for (const seed of bootstrapWindowOrientations(ordered[0])) {
+    const sequence = seed.map((turn) => ({ ...turn }));
+    let connectedWindows = 1;
+    let skippedWindows = 0;
+
+    for (let i = 1; i < ordered.length; i += 1) {
+      const candidateWindow = ordered[i];
+      const orientations = bootstrapWindowOrientations(candidateWindow);
+      let bestOrientation = null;
+      let bestOverlap = 0;
+
+      for (const candidate of orientations) {
+        if (candidate.every((turn) => sequence.some((known) => known.id === turn.id))) {
+          bestOrientation = candidate;
+          bestOverlap = candidate.length;
+          break;
+        }
+        const overlap = bootstrapOverlapSize(sequence, candidate);
+        if (overlap > bestOverlap) {
+          bestOrientation = candidate;
+          bestOverlap = overlap;
+        }
+      }
+
+      if (!bestOrientation || !bestOverlap) {
+        skippedWindows += 1;
+        continue;
+      }
+      for (const turn of bestOrientation.slice(bestOverlap)) {
+        if (!sequence.some((known) => known.id === turn.id)) sequence.push({ ...turn });
+      }
+      connectedWindows += 1;
+    }
+
+    const complete = containsBootstrapWindow(sequence, initialWindow);
+    const candidate = {
+      turns: complete ? enrichBootstrapTurns(sequence, analyzed) : [],
+      connectedWindows,
+      totalWindows: analyzed.length,
+      skippedWindows,
+      complete
+    };
+    if (!best
+      || Number(candidate.complete) > Number(best.complete)
+      || (candidate.complete === best.complete && candidate.turns.length > best.turns.length)
+      || (candidate.complete === best.complete && candidate.turns.length === best.turns.length
+        && candidate.connectedWindows > best.connectedWindows)) {
+      best = candidate;
+    }
+  }
+
+  return best ?? {
+    turns: [],
+    connectedWindows: 0,
+    totalWindows: analyzed.length,
+    skippedWindows: analyzed.length,
+    complete: false
+  };
+}
+
+function diagnosticTurnIdMode(id) {
+  const value = String(id ?? "");
+  if (/^(?:fallback-turn|turn-index)-\d+$/.test(value)) return "fallback";
+  if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(value)) return "uuid-like";
+  return value ? "other" : "none";
+}
+
+function isTrustedChatOrderAnchor(record) {
+  if (!record?.id || !Number.isFinite(record.order)) return false;
+  if (record.source?.includes("capture")) return true;
+  return /^fallback-turn-\d+$/.test(String(record.id)) || /^turn-index-\d+$/.test(String(record.id));
+}
+
+function normalizeChatTurnText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function stableSyntheticChatNamespace(prefix, value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  let hash = 0xcbf29ce484222325n;
+  for (const char of text) {
+    hash ^= BigInt(char.codePointAt(0));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return String(prefix) + hash.toString(16).padStart(16, "0");
+}
+
+function stablePinnedChatNamespace(value) {
+  return stableSyntheticChatNamespace("pinned-chat:", value);
+}
+
+function stableProjectChatNamespace(projectId, title) {
+  const project = String(projectId ?? "").trim();
+  const normalizedTitle = normalizeChatTurnText(title);
+  if (!project || !normalizedTitle) return null;
+  return stableSyntheticChatNamespace("project-chat:", project + "\n" + normalizedTitle);
+}
+
+function visibleChatSelectionSignature(records = []) {
+  return (Array.isArray(records) ? records : [])
+    .map((turn) => String(turn?.id ?? "").trim() + "\u0001" + normalizeChatTurnText(turn?.text))
+    .filter(Boolean)
+    .join("\u0002");
+}
+
+const CHAT_BOOTSTRAP_VISUAL_STRIP_ATTRIBUTES = [
+  "id",
+  "data-turn",
+  "data-message-author-role",
+  "data-testid",
+  "data-user-message-bubble",
+  "data-markdown-text-tone",
+  "data-message-author",
+  "data-turn-id-container",
+  "data-turn-id",
+  "data-content-search-turn-key",
+  "data-turn-key"
+];
+
+function scrubChatBootstrapVisualClone(root) {
+  const nodes = [root, ...(root?.querySelectorAll?.("*") ?? [])];
+  for (const node of nodes) {
+    for (const attribute of CHAT_BOOTSTRAP_VISUAL_STRIP_ATTRIBUTES) {
+      try { node?.removeAttribute?.(attribute); } catch {}
+    }
+  }
+}
+
+function chatBootstrapBackgroundColor(container, windowRef) {
+  let node = container;
+  for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement ?? null) {
+    const color = String(windowRef?.getComputedStyle?.(node)?.backgroundColor ?? "").trim();
+    if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") return color;
+  }
+  return "Canvas";
+}
+
+function beginChatBootstrapVisualFreeze({ document, window, container } = {}) {
+  if (!container?.cloneNode || !container?.getBoundingClientRect || !document?.body?.appendChild) return null;
+  const rect = container.getBoundingClientRect();
+  if (!rect || Number(rect.width) < 1 || Number(rect.height) < 1) return null;
+  let clone = null;
+  try {
+    clone = container.cloneNode(true);
+    scrubChatBootstrapVisualClone(clone);
+    clone.setAttribute?.("aria-hidden", "true");
+    clone.setAttribute?.("data-gte-chat-bootstrap-freeze", "true");
+    try { clone.inert = true; } catch {}
+    const style = clone.style;
+    if (!style) return null;
+    style.setProperty("position", "fixed", "important");
+    style.setProperty("left", Math.round(Number(rect.left) || 0) + "px", "important");
+    style.setProperty("top", Math.round(Number(rect.top) || 0) + "px", "important");
+    style.setProperty("width", Math.round(Number(rect.width) || 0) + "px", "important");
+    style.setProperty("height", Math.round(Number(rect.height) || 0) + "px", "important");
+    style.setProperty("margin", "0", "important");
+    style.setProperty("overflow", "hidden", "important");
+    style.setProperty("pointer-events", "none", "important");
+    style.setProperty("visibility", "visible", "important");
+    style.setProperty("opacity", "1", "important");
+    style.setProperty("z-index", "2147483000", "important");
+    style.setProperty("background-color", chatBootstrapBackgroundColor(container, window), "important");
+    document.body.appendChild(clone);
+    try { clone.scrollTop = Number(container.scrollTop) || 0; } catch {}
+    const previousVisibility = container.style?.getPropertyValue?.("visibility") ?? "";
+    const previousVisibilityPriority = container.style?.getPropertyPriority?.("visibility") ?? "";
+    container.style?.setProperty?.("visibility", "hidden", "important");
+    return { clone, container, previousVisibility, previousVisibilityPriority };
+  } catch {
+    try { clone?.remove?.(); } catch {}
+    return null;
+  }
+}
+
+function endChatBootstrapVisualFreeze(state) {
+  if (!state) return;
+  const { clone, container, previousVisibility, previousVisibilityPriority } = state;
+  try {
+    if (previousVisibility) container?.style?.setProperty?.("visibility", previousVisibility, previousVisibilityPriority || "");
+    else container?.style?.removeProperty?.("visibility");
+  } catch {}
+  try { clone?.remove?.(); } catch {}
+}
+
+function waitChatBootstrapFrame(windowRef) {
+  return new Promise((resolve) => {
+    if (typeof windowRef?.requestAnimationFrame === "function") windowRef.requestAnimationFrame(() => resolve());
+    else (windowRef?.setTimeout ?? setTimeout)(resolve, 0);
+  });
+}
+
+function resolveProjectChatSelection(target) {
+  const trigger = target?.closest?.("[data-thread-title-trigger]") ?? null;
+  if (!trigger) return null;
+  if (trigger.closest?.("[data-pinned-content-tab-drop-key], [data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]")) {
+    return null;
+  }
+  const projectScope = trigger.closest?.("[data-sidebar-project-container-id], [data-app-action-sidebar-project-id]") ?? null;
+  if (!projectScope) return null;
+  const projectId = projectScope.getAttribute?.("data-sidebar-project-container-id")
+    ?? projectScope.getAttribute?.("data-app-action-sidebar-project-id")
+    ?? "";
+  const titleNode = trigger.querySelector?.("[data-thread-title]") ?? null;
+  const title = normalizeChatTurnText(titleNode?.textContent ?? trigger.textContent ?? "");
+  if (!projectId || !title) return null;
+
+  const matches = [...(projectScope.querySelectorAll?.("[data-thread-title-trigger]") ?? [])]
+    .filter((candidate) => {
+      const candidateTitleNode = candidate?.querySelector?.("[data-thread-title]") ?? null;
+      return normalizeChatTurnText(candidateTitleNode?.textContent ?? candidate?.textContent ?? "") === title;
+    });
+  if (matches.length !== 1) return null;
+  const conversationId = stableProjectChatNamespace(projectId, title);
+  return conversationId ? { conversationId, titleMatchCount: matches.length } : null;
+}
+
+function canonicalChatConversationId(value) {
+  const id = String(value ?? "").trim();
+  if (!id || id.startsWith("local:")) return id || null;
+  return parseSidebarConversationKey(id);
+}
+
+function normalizePinnedChatComparableText(value) {
+  return normalizeQuestionDisplayText(value).replace(/\s+/g, " ").trim();
+}
+
+function resolvePinnedChatConversationCandidate(visibleRecords = [], candidates = []) {
+  const visible = (Array.isArray(visibleRecords) ? visibleRecords : []).filter((record) => record?.id);
+  if (!visible.length) return null;
+
+  const normalizedCandidates = (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => candidate?.conversationId && Array.isArray(candidate.turns) && candidate.turns.length)
+    .map((candidate) => ({
+      conversationId: String(candidate.conversationId),
+      turns: candidate.turns
+    }));
+  if (!normalizedCandidates.length) return null;
+
+  const visibleTexts = visible
+    .map((record) => normalizeChatTurnText(record.text))
+    .filter((text) => text && text !== "[图片或文件]");
+  if (visibleTexts.length >= 2) {
+    const textMatches = new Set();
+    for (const candidate of normalizedCandidates) {
+      const candidateTexts = candidate.turns
+        .map((turn) => normalizeChatTurnText(turn?.text))
+        .filter((text) => text && text !== "[图片或文件]");
+      if (countContiguousSequence(candidateTexts, visibleTexts) === 1) {
+        textMatches.add(candidate.conversationId);
+      }
+    }
+    if (textMatches.size === 1) {
+      return {
+        conversationId: [...textMatches][0],
+        evidence: "visible-text-sequence",
+        score: visibleTexts.length
+      };
+    }
+  }
+
+  const comparableVisibleTexts = visible
+    .map((record) => normalizePinnedChatComparableText(record.text))
+    .filter((text) => text && text !== "[图片或文件]");
+  if (comparableVisibleTexts.length >= 2) {
+    const comparableMatches = new Set();
+    for (const candidate of normalizedCandidates) {
+      const comparableCandidateTexts = candidate.turns
+        .map((turn) => normalizePinnedChatComparableText(turn?.text))
+        .filter((text) => text && text !== "[图片或文件]");
+      if (countContiguousSequence(comparableCandidateTexts, comparableVisibleTexts) === 1) {
+        comparableMatches.add(candidate.conversationId);
+      }
+    }
+    if (comparableMatches.size === 1) {
+      return {
+        conversationId: [...comparableMatches][0],
+        evidence: "visible-normalized-text-sequence",
+        score: comparableVisibleTexts.length
+      };
+    }
+  }
+
+  const stableVisibleIds = new Set(
+    visible
+      .map((record) => String(record?.id ?? ""))
+      .filter((id) => diagnosticTurnIdMode(id) === "uuid-like")
+  );
+  if (!stableVisibleIds.size) return null;
+
+  const idMatches = normalizedCandidates
+    .map((candidate) => ({
+      conversationId: candidate.conversationId,
+      count: candidate.turns.reduce(
+        (total, turn) => total + (stableVisibleIds.has(String(turn?.id ?? "")) ? 1 : 0),
+        0
+      )
+    }))
+    .filter((item) => item.count > 0);
+
+  if (idMatches.length === 1) {
+    return {
+      conversationId: idMatches[0].conversationId,
+      evidence: "visible-uuid-overlap",
+      score: idMatches[0].count
+    };
+  }
+  return null;
+}
+
+function countContiguousSequence(haystack, needle) {
+  if (!needle.length || haystack.length < needle.length) return 0;
+  let count = 0;
+  for (let start = 0; start <= haystack.length - needle.length; start += 1) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (haystack[start + offset] !== needle[offset]) { matched = false; break; }
+    }
+    if (matched) count += 1;
+  }
+  return count;
+}
+
+function longestContiguousVisibleTextRun(candidateTexts = [], visibleTexts = []) {
+  if (!candidateTexts.length || !visibleTexts.length) return 0;
+  let best = 0;
+  for (let visibleStart = 0; visibleStart < visibleTexts.length; visibleStart += 1) {
+    for (let candidateStart = 0; candidateStart < candidateTexts.length; candidateStart += 1) {
+      let length = 0;
+      while (visibleStart + length < visibleTexts.length
+        && candidateStart + length < candidateTexts.length
+        && visibleTexts[visibleStart + length] === candidateTexts[candidateStart + length]) length += 1;
+      if (length > best) best = length;
+    }
+  }
+  return best;
+}
+
+function diagnosePinnedChatCandidates(visibleRecords = [], candidates = [], { memoryIds = new Set(), cacheIds = new Set() } = {}) {
+  const visible = (Array.isArray(visibleRecords) ? visibleRecords : []).filter((record) => record?.id);
+  const visibleIds = new Set(visible.map((record) => String(record.id)));
+  const stableVisibleIds = new Set(
+    visible
+      .map((record) => String(record?.id ?? ""))
+      .filter((id) => diagnosticTurnIdMode(id) === "uuid-like")
+  );
+  const visibleTexts = visible.map((record) => normalizeChatTurnText(record.text)).filter((text) => text && text !== "[图片或文件]");
+  const visibleComparableTexts = visible.map((record) => normalizePinnedChatComparableText(record.text)).filter((text) => text && text !== "[图片或文件]");
+  const visibleTextSet = new Set(visibleTexts);
+  const visibleComparableTextSet = new Set(visibleComparableTexts);
+  const summaries = [];
+  let ordinal = 0;
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    if (!candidate?.conversationId || !Array.isArray(candidate.turns) || !candidate.turns.length) continue;
+    ordinal += 1;
+    const conversationId = String(candidate.conversationId);
+    const turns = candidate.turns;
+    const candidateTexts = turns.map((turn) => normalizeChatTurnText(turn?.text)).filter((text) => text && text !== "[图片或文件]");
+    const candidateComparableTexts = turns.map((turn) => normalizePinnedChatComparableText(turn?.text)).filter((text) => text && text !== "[图片或文件]");
+    const candidateTextSet = new Set(candidateTexts);
+    const candidateComparableTextSet = new Set(candidateComparableTexts);
+    const idOverlap = turns.reduce((total, turn) => total + (visibleIds.has(String(turn?.id ?? "")) ? 1 : 0), 0);
+    const stableIdOverlap = turns.reduce(
+      (total, turn) => total + (stableVisibleIds.has(String(turn?.id ?? "")) ? 1 : 0),
+      0
+    );
+    const exactTextOverlap = [...visibleTextSet].reduce((total, text) => total + (candidateTextSet.has(text) ? 1 : 0), 0);
+    const normalizedTextOverlap = [...visibleComparableTextSet].reduce((total, text) => total + (candidateComparableTextSet.has(text) ? 1 : 0), 0);
+    summaries.push({
+      candidate: ordinal,
+      source: memoryIds.has(conversationId) && cacheIds.has(conversationId) ? "memory+cache" : memoryIds.has(conversationId) ? "memory" : cacheIds.has(conversationId) ? "cache" : "unknown",
+      turnCount: turns.length,
+      idOverlap,
+      stableIdOverlap,
+      exactTextOverlap,
+      normalizedTextOverlap,
+      fullVisibleSequenceOccurrences: countContiguousSequence(candidateTexts, visibleTexts),
+      bestContiguousTextRun: longestContiguousVisibleTextRun(candidateTexts, visibleTexts),
+      fullNormalizedSequenceOccurrences: countContiguousSequence(candidateComparableTexts, visibleComparableTexts),
+      bestNormalizedContiguousTextRun: longestContiguousVisibleTextRun(candidateComparableTexts, visibleComparableTexts)
+    });
+  }
+  const resolved = resolvePinnedChatConversationCandidate(visible, candidates);
+  let resolvedCandidate = null;
+  if (resolved?.conversationId) {
+    const index = (Array.isArray(candidates) ? candidates : []).filter((candidate) => candidate?.conversationId && Array.isArray(candidate.turns) && candidate.turns.length).findIndex((candidate) => String(candidate.conversationId) === String(resolved.conversationId));
+    resolvedCandidate = index >= 0 ? index + 1 : null;
+  }
+  return {
+    visibleTurnCount: visible.length,
+    visibleUsableTextCount: visibleTexts.length,
+    visibleComparableTextCount: visibleComparableTexts.length,
+    candidateCount: summaries.length,
+    resolved: Boolean(resolved),
+    resolvedCandidate,
+    evidence: resolved?.evidence ?? null,
+    score: resolved?.score ?? null,
+    candidates: summaries
+  };
+}
 
 class TalkEnhancerV3App {
   constructor({ document, window, host = null, storage = null } = {}) {
@@ -6091,11 +7027,20 @@ class TalkEnhancerV3App {
     this.timelineState = new TimelineState();
     this.promptStore = new PromptStore({ storage: this.storage });
     this.settings = new SettingsStore({ storage: this.storage });
-    this.timelineCache = new TimelineCache({ storage: this.storage });
+    this.chatTimelineCache = new TimelineCache({ storage: this.storage });
+    this.timelineCache = this.chatTimelineCache;
+    this.workTimelineCache = new WorkTimelineCache({ storage: this.storage });
     this.cacheHydrationCounts = new Map();
     this.turnIndexes = new Map();
     this.currentConversationId = null;
-    this.lastNavigation = { target: null, verified: false, reason: "none", fastAttempted: false, fastSucceeded: false, fallbackReason: null, officialBridgeAttempted: false, officialBridgeSucceeded: false, officialBridgeFallbackReason: null };
+    this.recentStableChatIdentity = null;
+    this.chatConversationAliases = new Map();
+    this.pendingConversationSelectionId = null;
+    this.pendingConversationSelectionStartedAt = 0;
+    this.pendingPinnedChatSelection = null;
+    this.activePinnedChatConversationId = null;
+    this.lastPinnedClickTransition = null;
+    this.lastNavigation = { target: null, verified: false, reason: "none" };
     this.navigationRequestId = 0;
     this.navigationRunSequence = 0;
     this.activeNavigation = null;
@@ -6103,51 +7048,69 @@ class TalkEnhancerV3App {
     this.slowNavigationHistory = sanitizeSlowNavigationHistory(
       this.storage?.read?.(SLOW_NAVIGATION_STORAGE_KEY, [])
     );
-    this.officialNavigationHistory = sanitizeOfficialNavigationHistory(
-      this.storage?.read?.(OFFICIAL_NAVIGATION_STORAGE_KEY, []),
-      OFFICIAL_NAVIGATION_HISTORY_LIMIT
-    );
-    this.officialNavigationMapping = this.officialNavigationHistory.at(-1)?.mapping ?? null;
-    this.officialNavigationLearningHistory = sanitizeOfficialNavigationLearningHistory(
-      this.storage?.read?.(OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY, []),
-      OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT
-    );
-    this.officialNavigationLearning = analyzeOfficialNavigationLearning(this.officialNavigationLearningHistory);
-    this.officialBridgeAutoSessions = new Map();
-    this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "idle" });
-    this.officialBridgeAutoTimer = null;
-    this.officialNavigationSessionLearningHistory = [];
-    this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning([]);
-    this.officialBridgeInFlight = false;
-    this.hostInternalDepthProbe = null;
-    this.hostInternalDepthProbeByConversation = new Map();
-    this.hostInternalDepthProbeAttempts = new Map();
-    this.hostInternalDepthProbeTimer = null;
-    this.l3KeyJoinDryRunSessions = new Map();
-    this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary();
-    this.l3AdaptiveRescanTimer = null;
-    this.l3AdaptiveRescanGeneration = 0;
-    this.l3PostNavigationScanTimer = null;
-    this.l3EventRecoveryTimer = null;
-    this.l3EventRecoveryWatch = null;
-    this.officialNavigationPrivateMarkers = new Map();
-    this.officialNavigationPrivateSessions = new Map();
-    this.officialNavigationSessionPrivatePairsByTarget = new Map();
-    this.officialNavigationSessionPrivateTargetsByKey = new Map();
-    this.officialNavigationSessionPrivateConflictedTargets = new Set();
-    this.officialNavigationSessionPrivateConflictedKeys = new Set();
     this.navigationUxTimer = null;
     this.navigationUx = { state: "idle", target: null, targetOrder: null, pendingVisible: false };
     this.captureStatus = { status: "unavailable", turnCount: 0, lastError: "" };
+    this.captureDiagnostics = [];
+    this.chatScrollDiagnostics = [];
+    this.diagnosticConversationOrdinals = new Map();
+    this.nextDiagnosticConversationOrdinal = 1;
+    this.lastChatScrollDiagnosticSignature = null;
     this.destroyed = false;
     this.refreshFrame = null;
     this.observer = null;
     this.scrollContainer = null;
-    this.boundScroll = () => this.scheduleRefresh("scroll");
+    this.boundScroll = () => {
+      this.captureActiveChatBootstrapWindow(this.getChatBootstrapVisibleTurns());
+      this.recordChatScrollDiagnostic("scroll");
+      this.scheduleRefresh("scroll");
+    };
     this.boundRoute = () => this.scheduleRefresh("route");
     this.conversationSelectTimer = null;
+    this.chatIdentitySettleTimer = null;
+    this.chatIdentitySettleAttempt = 0;
     this.localNavigationSettleUntil = 0;
+    this.workEarlierHydrationGeneration = 0;
+    this.workEarlierHydrationPromise = null;
+    this.workEarlierHydrationExhausted = new Map();
+    this.chatEarlierHydrationGeneration = 0;
+    this.chatEarlierHydrationPromise = null;
+    this.chatEarlierHydrationExhausted = new Map();
+    this.chatBootstrapHydrationGeneration = 0;
+    this.chatBootstrapHydrationPromise = null;
+    this.chatBootstrapAttempted = new Set();
+    this.chatBootstrapFailures = new Map();
+    this.chatBootstrapRetryTimer = null;
+    this.chatBootstrapCollector = null;
+    this.chatBootstrapSampleTimer = null;
+    this.lastChatBootstrapDiagnostics = null;
+    this.pinnedChatProbeArmed = false;
+    this.pinnedChatProbe = null;
+    this.pinnedChatProbeBaselineId = null;
+    this.pinnedChatProbeBaselineRoute = null;
+    this.pinnedChatProbeObserver = null;
+    this.pinnedChatProbeTimers = [];
+    this.lastPinnedChatInference = {
+      inferredConversationSet: false,
+      result: "uninitialized",
+      directIdentityPresent: false,
+      directIdentityStable: false,
+      visibleTurnCount: 0,
+      candidateCount: 0,
+      evidence: null
+    };
+    this.lastRefreshDiagnostics = {
+      reason: null,
+      branch: "uninitialized",
+      resolvedIdentity: { present: false },
+      chatVisibleTurnsCount: 0,
+      routedVisibleTurnsCount: 0,
+      preReconcileIndexCount: 0,
+      trustedVisibleTurnsCount: 0,
+      postRefreshIndexCount: 0
+    };
     this.boundConversationSelect = (event) => this.handleConversationSelect(event);
+    this.boundPinnedChatProbeEvent = (event) => this.capturePinnedChatProbe(event);
     this.host = host ?? new CodexDesktopHost({
       document: this.document,
       window: this.window,
@@ -6160,25 +7123,8 @@ class TalkEnhancerV3App {
       host: this.host,
       promptStore: this.promptStore,
       onNavigate: (turnId) => this.navigate(turnId),
+      onLoadEarlier: () => this.loadAllEarlierHistory(),
       initialPanelOpen: this.settings.load().timelinePanelOpen
-    });
-    this.officialNavigationProbe = new OfficialNavigationProbe({
-      document: this.document,
-      window: this.window,
-      getContext: () => {
-        const identity = this.host.getConversationIdentity?.() ?? null;
-        return {
-          enabled: !this.destroyed && this.host.getSurface?.() === SURFACE.CONVERSATION && Boolean(this.currentConversationId),
-          sessionKey: this.currentConversationId,
-          host: identity?.host ?? null,
-          source: identity?.source ?? null,
-          stable: Boolean(identity?.stable)
-        };
-      },
-      getScrollContainer: () => this.host.getScrollContainer?.(),
-      getVisibleRange: () => this.getOfficialProbeVisibleRange(),
-      isOwnedEvent: (event) => this.officialBridgeInFlight || ((event?.composedPath?.() ?? []).some((node) => node?.id === "gte-root")),
-      onRecord: (record) => this.handleOfficialNavigationRecord(record)
     });
   }
 
@@ -6187,7 +7133,6 @@ class TalkEnhancerV3App {
     this.shell.mount();
     this.host.start?.();
     this.bindLifecycle();
-    if (OFFICIAL_NAVIGATION_RUNTIME_ENABLED) this.officialNavigationProbe.start();
     this.refresh("start");
     this.window.__GPTTalkEnhancerV3 = this;
     return this;
@@ -6195,26 +7140,37 @@ class TalkEnhancerV3App {
 
   bindLifecycle() {
     if (typeof this.window?.MutationObserver === "function" && this.document?.body) {
-      this.observer = new this.window.MutationObserver((records) => {
+      this.observer = new this.window.MutationObserver(() => {
+        this.captureActiveChatBootstrapWindow(this.getChatBootstrapVisibleTurns());
         this.scheduleRefresh("mutation");
-        if (L3_RUNTIME_ENABLED) this.handleL3EventRecoveryMutation(records);
       });
       this.observer.observe(this.document.body, { childList: true, subtree: true, attributes: true });
     }
     this.window?.addEventListener?.("popstate", this.boundRoute);
     this.window?.addEventListener?.("hashchange", this.boundRoute);
     this.document?.addEventListener?.("click", this.boundConversationSelect, true);
+    for (const type of ["pointerdown", "mousedown", "click", "pointerup"]) {
+      this.document?.addEventListener?.(type, this.boundPinnedChatProbeEvent, true);
+      this.window?.addEventListener?.(type, this.boundPinnedChatProbeEvent, true);
+    }
   }
 
   handleConversationSelect(event) {
     const row = event?.target?.closest?.(
-      "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id]"
+      "[data-sidebar-chatgpt-conversation-key], [data-app-action-sidebar-thread-id], [data-pinned-content-tab-drop-key], [data-thread-title-trigger]"
     );
     if (!row) return;
+    this.recordChatScrollDiagnostic("conversation-select-before", { force: true });
     const localId = row?.getAttribute?.("data-app-action-sidebar-thread-id") ?? null;
     const chatKey = row?.getAttribute?.("data-sidebar-chatgpt-conversation-key") ?? null;
+    const pinnedDropKey = row?.getAttribute?.("data-pinned-content-tab-drop-key") ?? null;
     const expectedChatId = chatKey ? parseSidebarConversationKey(chatKey) : null;
-    const localThreadSelected = Boolean(localId);
+    const pinnedConversationId = pinnedDropKey ? stablePinnedChatNamespace(pinnedDropKey) : null;
+    const projectSelection = !localId && !expectedChatId && !pinnedConversationId
+      ? resolveProjectChatSelection(event?.target)
+      : null;
+    const syntheticConversationId = pinnedConversationId ?? projectSelection?.conversationId ?? null;
+    const syntheticKind = pinnedConversationId ? "pinned" : projectSelection ? "project" : null;
     const currentIdentity = this.host.getConversationIdentity?.() ?? null;
     const currentLocalId = currentIdentity?.stable
       && currentIdentity?.host === "local"
@@ -6223,10 +7179,73 @@ class TalkEnhancerV3App {
       : "";
     const leavingCurrentLocal = Boolean(currentLocalId && (!localId || String(localId) !== currentLocalId));
     if (leavingCurrentLocal) this.host.persistLocalScrollPosition?.();
+    const localThreadSelected = Boolean(localId);
+    const pinnedChatSelected = Boolean(syntheticConversationId && !localThreadSelected && !expectedChatId);
+    if (!pinnedChatSelected) {
+      this.pendingPinnedChatSelection = null;
+      this.activePinnedChatConversationId = null;
+      this.lastPinnedClickTransition = null;
+    }
+    if (pinnedChatSelected) {
+      const baselineVisibleIds = new Set(
+        (this.host.getChatVisibleTurns?.() ?? this.host.getVisibleTurns?.() ?? [])
+          .map((turn) => String(turn?.id ?? "").trim())
+          .filter(Boolean)
+      );
+      const baselineVisibleSignature = visibleChatSelectionSignature(
+        this.host.getChatVisibleTurns?.() ?? this.host.getVisibleTurns?.() ?? []
+      );
+      if (syntheticConversationId === this.currentConversationId) {
+        this.pendingPinnedChatSelection = null;
+        this.activePinnedChatConversationId = syntheticConversationId;
+        this.lastPinnedClickTransition = {
+          state: "already-current",
+          baselineVisibleCount: baselineVisibleIds.size,
+          currentVisibleCount: baselineVisibleIds.size,
+          overlapCount: baselineVisibleIds.size
+        };
+      } else {
+        this.activePinnedChatConversationId = null;
+        this.pendingPinnedChatSelection = {
+          conversationId: syntheticConversationId,
+          kind: syntheticKind,
+          baselineConversationId: currentIdentity?.stable && currentIdentity?.host === "chatgpt"
+            ? canonicalChatConversationId(currentIdentity.id)
+            : canonicalChatConversationId(this.currentConversationId),
+          baselineVisibleIds,
+          baselineVisibleSignature,
+          startedAt: appNowMs(this.window),
+          observedRefreshes: 0
+        };
+        this.lastPinnedClickTransition = {
+          state: "armed",
+          baselineVisibleCount: baselineVisibleIds.size,
+          currentVisibleCount: baselineVisibleIds.size,
+          overlapCount: baselineVisibleIds.size
+        };
+        this.cancelChatEarlierHydration();
+        this.cancelChatBootstrapHydration();
+        this.shell?.updateTimeline?.([], null);
+        this.shell?.setQuestionHistoryState?.({ visible: false, loading: false, exhausted: false });
+      }
+    }
+    const expectedConversationId = localThreadSelected ? String(localId) : expectedChatId;
+    if (expectedConversationId && expectedConversationId !== this.currentConversationId) {
+      this.pendingConversationSelectionId = expectedConversationId;
+      this.pendingConversationSelectionStartedAt = appNowMs(this.window);
+      this.cancelWorkEarlierHydration();
+      this.cancelChatEarlierHydration();
+      this.shell?.updateTimeline?.([], null);
+      this.shell?.setQuestionHistoryState?.({ visible: false, loading: false, exhausted: false });
+    }
     this.localNavigationSettleUntil = localThreadSelected ? appNowMs(this.window) + LOCAL_NAVIGATION_SETTLE_MS : 0;
     this.invalidateNavigation("conversation-select");
     this.scheduleRefresh("conversation-select");
     this.clearConversationSelectTimer();
+    if (pinnedChatSelected) {
+      this.scheduleConversationSelectRetry({ expectedChatId: null, attempt: 0, delays: CHAT_CONVERSATION_SETTLE_DELAYS_MS });
+      return;
+    }
     if (localThreadSelected || !expectedChatId) {
       this.scheduleConversationSelectRetry({ expectedChatId: null, attempt: 0, delays: [240] });
       return;
@@ -6252,6 +7271,44 @@ class TalkEnhancerV3App {
       }
     }, delays[attempt]);
   }
+  clearChatIdentitySettleRetry({ resetAttempt = true } = {}) {
+    if (this.chatIdentitySettleTimer != null) {
+      const clear = this.window?.clearTimeout ?? clearTimeout;
+      clear(this.chatIdentitySettleTimer);
+      this.chatIdentitySettleTimer = null;
+    }
+    if (resetAttempt) this.chatIdentitySettleAttempt = 0;
+  }
+
+  scheduleChatIdentitySettleRetry() {
+    if (this.destroyed || this.chatIdentitySettleTimer != null) return false;
+    if (this.chatIdentitySettleAttempt >= CHAT_CONVERSATION_SETTLE_DELAYS_MS.length) return false;
+    if (String(this.currentConversationId ?? "").startsWith("local:")) return false;
+    const visibleChatTurns = this.host.getChatVisibleTurns?.() ?? [];
+    if (!visibleChatTurns.length) return false;
+
+    const attempt = this.chatIdentitySettleAttempt;
+    const set = this.window?.setTimeout ?? setTimeout;
+    this.chatIdentitySettleTimer = set(() => {
+      this.chatIdentitySettleTimer = null;
+      if (this.destroyed) return;
+      const surface = this.host.getSurface?.();
+      if (surface !== SURFACE.CONVERSATION) {
+        this.chatIdentitySettleAttempt = 0;
+        return;
+      }
+      const directIdentity = this.host.getDirectConversationIdentity?.() ?? null;
+      if (directIdentity?.stable) {
+        this.chatIdentitySettleAttempt = 0;
+        this.refresh("chat-identity-settled");
+        return;
+      }
+      this.chatIdentitySettleAttempt = attempt + 1;
+      this.refresh("chat-identity-settle-retry");
+    }, CHAT_CONVERSATION_SETTLE_DELAYS_MS[attempt]);
+    return true;
+  }
+
   scheduleRefresh(reason = "event") {
     if (this.destroyed || this.refreshFrame != null) return;
     const run = () => {
@@ -6262,25 +7319,406 @@ class TalkEnhancerV3App {
     else this.refreshFrame = this.window?.setTimeout?.(run, 0) ?? setTimeout(run, 0);
   }
 
-  refresh(reason = "manual") {
+  getPinnedChatCandidates() {
+    const byId = new Map();
+    const rememberCandidate = (conversationId, turns = []) => {
+      const canonicalId = canonicalChatConversationId(conversationId);
+      const id = canonicalId ? (this.chatConversationAliases.get(canonicalId) ?? canonicalId) : null;
+      if (!id || id.startsWith("local:")) return;
+      const records = Array.isArray(turns) ? turns : [];
+      const current = byId.get(id);
+      if (!current || records.length > current.turns.length) {
+        byId.set(id, { conversationId: id, turns: records });
+      }
+    };
+    for (const entry of this.chatTimelineCache.listConversations?.() ?? []) {
+      rememberCandidate(entry?.conversationId, entry?.turns ?? []);
+    }
+    for (const [conversationId, index] of this.turnIndexes) {
+      const turns = index?.getOrdered?.() ?? [];
+      if (!turns.length) continue;
+      rememberCandidate(conversationId, turns);
+    }
+    return [...byId.values()];
+  }
+
+  adoptDirectChatIdentity(identity, visibleRecords = []) {
+    if (!identity?.stable || identity.host !== "chatgpt" || !identity.id) {
+      return { identity, migrated: false, evidence: null };
+    }
+    const targetId = canonicalChatConversationId(identity.id);
+    if (!targetId) return { identity, migrated: false, evidence: null };
+    const normalizedIdentity = String(identity.id) === targetId ? identity : { ...identity, id: targetId };
+    const sourceId = String(this.currentConversationId ?? "").trim();
+    if (!sourceId || sourceId === targetId || sourceId.startsWith("local:")) {
+      return { identity: normalizedIdentity, migrated: false, evidence: null };
+    }
+
+    const sourceIndex = this.turnIndexes.get(sourceId) ?? null;
+    if (!sourceIndex) return { identity: normalizedIdentity, migrated: false, evidence: null };
+    const canonicalSourceId = canonicalChatConversationId(sourceId);
+    const sameCanonicalConversation = canonicalSourceId === targetId;
+    const sourceTurns = sourceIndex.getOrdered?.() ?? [];
+    const visible = Array.isArray(visibleRecords) ? visibleRecords : [];
+    const sourceIds = new Set(sourceTurns.map((turn) => String(turn?.id ?? "")).filter(Boolean));
+    const exactVisibleIdOverlap = visible.some((turn) => sourceIds.has(String(turn?.id ?? "")));
+    const recent = this.recentStableChatIdentity;
+    const recentAgeMs = Number.isFinite(recent?.confirmedAt)
+      ? Math.max(0, appNowMs(this.window) - Number(recent.confirmedAt))
+      : Number.POSITIVE_INFINITY;
+    const recentOneTurnDirectRekey = !sourceId.startsWith("pinned-chat:")
+      && !this.pendingConversationSelectionId
+      && recent?.conversationId === canonicalSourceId
+      && recentAgeMs <= CHAT_DIRECT_REKEY_WINDOW_MS
+      && sourceTurns.length === 1
+      && visible.length === 1
+      && sourceTurns[0]?.visible === true
+      && normalizeChatTurnText(sourceTurns[0]?.text)
+      && normalizeChatTurnText(sourceTurns[0]?.text) === normalizeChatTurnText(visible[0]?.text);
+    if (!sameCanonicalConversation && !exactVisibleIdOverlap && !recentOneTurnDirectRekey) {
+      return { identity: normalizedIdentity, migrated: false, evidence: null };
+    }
+
+    const targetIndex = this.getTurnIndex(targetId);
+    targetIndex.mergeMany(sourceTurns);
+    const sourceHydration = Number(this.cacheHydrationCounts.get(sourceId) ?? 0);
+    const targetHydration = Number(this.cacheHydrationCounts.get(targetId) ?? 0);
+    if (sourceHydration || targetHydration) {
+      this.cacheHydrationCounts.set(targetId, Math.max(sourceHydration, targetHydration));
+    }
+    const sourceViewState = this.timelineState.get(sourceId);
+    if (sourceViewState) this.timelineState.update(targetId, sourceViewState);
+    this.persistTimelineCache(targetId, targetIndex);
+    if (canonicalSourceId && canonicalSourceId !== targetId) this.chatConversationAliases.set(canonicalSourceId, targetId);
+    return {
+      identity: normalizedIdentity,
+      migrated: true,
+      evidence: sameCanonicalConversation
+        ? "canonical-id-handoff"
+        : exactVisibleIdOverlap ? "visible-id-handoff" : "recent-one-turn-direct-rekey"
+    };
+  }
+
+  rememberStableChatIdentity(identity, visibleRecords = []) {
+    if (!identity?.stable || identity.host !== "chatgpt" || !identity.id) return false;
+    const visibleIds = (Array.isArray(visibleRecords) ? visibleRecords : [])
+      .map((record) => String(record?.id ?? "").trim())
+      .filter(Boolean);
+    const conversationId = canonicalChatConversationId(identity.id);
+    if (!conversationId) return false;
+    this.recentStableChatIdentity = {
+      conversationId,
+      visibleIds: new Set(visibleIds),
+      confirmedAt: appNowMs(this.window)
+    };
+    return true;
+  }
+
+  resolveRecentStableChatIdentity(visibleRecords = []) {
+    const recent = this.recentStableChatIdentity;
+    if (!recent?.conversationId || !(recent.visibleIds instanceof Set) || !recent.visibleIds.size) return null;
+    const currentIds = new Set(
+      (Array.isArray(visibleRecords) ? visibleRecords : [])
+        .map((record) => String(record?.id ?? "").trim())
+        .filter(Boolean)
+    );
+    if (!currentIds.size) return null;
+    const overlap = [...currentIds].some((id) => recent.visibleIds.has(id));
+    return overlap ? recent.conversationId : null;
+  }
+
+  refreshPinnedChatInference(surface) {
+    const hasDirectIdentityApi = typeof this.host.getDirectConversationIdentity === "function";
+    let directIdentity = hasDirectIdentityApi
+      ? this.host.getDirectConversationIdentity()
+      : this.host.getConversationIdentity?.() ?? null;
+    const pendingPinned = this.pendingPinnedChatSelection;
+    if (pendingPinned && surface === SURFACE.CONVERSATION && this.host.getChatVisibleTurns && this.host.setInferredChatConversationId) {
+      pendingPinned.observedRefreshes = Number(pendingPinned.observedRefreshes ?? 0) + 1;
+      const visible = this.host.getChatVisibleTurns?.() ?? [];
+      const currentIds = new Set(visible.map((turn) => String(turn?.id ?? "").trim()).filter(Boolean));
+      const baselineIds = pendingPinned.baselineVisibleIds instanceof Set ? pendingPinned.baselineVisibleIds : new Set();
+      const overlapCount = [...currentIds].reduce((total, id) => total + (baselineIds.has(id) ? 1 : 0), 0);
+      const ageMs = Math.max(0, appNowMs(this.window) - Number(pendingPinned.startedAt || 0));
+      const expired = ageMs >= PINNED_CHAT_SELECTION_TTL_MS;
+      const currentVisibleSignature = visibleChatSelectionSignature(visible);
+      const baselineVisibleSignature = String(pendingPinned.baselineVisibleSignature ?? "");
+      const projectTransitioned = pendingPinned.kind === "project"
+        && currentIds.size > 0
+        && pendingPinned.observedRefreshes >= 2
+        && Boolean(currentVisibleSignature)
+        && currentVisibleSignature !== baselineVisibleSignature;
+      const transitioned = pendingPinned.kind === "project"
+        ? projectTransitioned
+        : currentIds.size > 0
+          && (baselineIds.size > 0 ? overlapCount === 0 : pendingPinned.observedRefreshes >= 2);
+      const directId = directIdentity?.stable && directIdentity.host === "chatgpt"
+        ? canonicalChatConversationId(directIdentity.id)
+        : null;
+      const directChanged = Boolean(directId && directId !== pendingPinned.baselineConversationId);
+      const staleBaselineDirect = Boolean(directId && directId === pendingPinned.baselineConversationId);
+
+      this.lastPinnedClickTransition = {
+        state: expired && !staleBaselineDirect
+          ? "expired"
+          : transitioned
+            ? (directChanged ? "direct-transition" : staleBaselineDirect ? "waiting-stale-direct" : "visible-window-transition")
+            : "waiting",
+        ageMs: Math.round(ageMs),
+        baselineVisibleCount: baselineIds.size,
+        currentVisibleCount: currentIds.size,
+        overlapCount,
+        observedRefreshes: pendingPinned.observedRefreshes,
+        selectionKind: pendingPinned.kind ?? "pinned",
+        signatureChanged: Boolean(currentVisibleSignature && currentVisibleSignature !== baselineVisibleSignature)
+      };
+
+      if (transitioned && directChanged) {
+        this.pendingPinnedChatSelection = null;
+      } else if (transitioned && staleBaselineDirect) {
+        this.host.clearInferredChatConversationId?.();
+        this.lastPinnedChatInference = {
+          inferredConversationSet: false,
+          result: "pinned-click-waiting-for-stale-direct-to-clear",
+          directIdentityPresent: true,
+          directIdentityStable: true,
+          visibleTurnCount: visible.length,
+          candidateCount: 0,
+          evidence: null
+        };
+        return null;
+      } else if (transitioned) {
+        const inferredConversationSet = Boolean(this.host.setInferredChatConversationId(pendingPinned.conversationId));
+        const inferredIdentity = this.host.getConversationIdentity?.() ?? null;
+        this.pendingPinnedChatSelection = null;
+        this.activePinnedChatConversationId = inferredConversationSet ? pendingPinned.conversationId : null;
+        if (inferredIdentity?.stable && inferredIdentity.host === "chatgpt") {
+          this.rememberStableChatIdentity(inferredIdentity, visible);
+        }
+        this.lastPinnedChatInference = {
+          inferredConversationSet,
+          result: inferredConversationSet
+            ? (pendingPinned.kind === "project" ? "project-chat-click-visible-window-transition" : "pinned-click-visible-window-transition")
+            : (pendingPinned.kind === "project" ? "project-chat-click-inference-failed" : "pinned-click-inference-failed"),
+          directIdentityPresent: Boolean(directIdentity),
+          directIdentityStable: Boolean(directIdentity?.stable),
+          visibleTurnCount: visible.length,
+          candidateCount: 0,
+          evidence: pendingPinned.kind === "project"
+            ? "project-chat-click-visible-window-transition"
+            : "pinned-click-visible-window-transition"
+        };
+        return inferredIdentity;
+      } else if (!expired || staleBaselineDirect) {
+        this.host.clearInferredChatConversationId?.();
+        this.lastPinnedChatInference = {
+          inferredConversationSet: false,
+          result: "pinned-click-waiting-for-content-transition",
+          directIdentityPresent: Boolean(directIdentity),
+          directIdentityStable: Boolean(directIdentity?.stable),
+          visibleTurnCount: visible.length,
+          candidateCount: 0,
+          evidence: null
+        };
+        return null;
+      } else {
+        this.pendingPinnedChatSelection = null;
+        this.activePinnedChatConversationId = null;
+      }
+    }
+    if (directIdentity?.stable) {
+      this.pendingPinnedChatSelection = null;
+      this.activePinnedChatConversationId = null;
+      const visible = directIdentity.host === "chatgpt" ? this.host.getChatVisibleTurns?.() ?? [] : [];
+      const handoff = directIdentity.host === "chatgpt"
+        ? this.adoptDirectChatIdentity(directIdentity, visible)
+        : { identity: directIdentity, migrated: false, evidence: null };
+      directIdentity = handoff.identity;
+      this.host.clearInferredChatConversationId?.();
+      if (directIdentity.host === "chatgpt") {
+        this.rememberStableChatIdentity(directIdentity, visible);
+      } else if (directIdentity.host === "local") {
+        this.recentStableChatIdentity = null;
+      }
+      this.lastPinnedChatInference = {
+        inferredConversationSet: false,
+        result: "direct-stable",
+        directIdentityPresent: true,
+        directIdentityStable: true,
+        visibleTurnCount: visible.length,
+        candidateCount: 0,
+        evidence: handoff.evidence,
+        handoffMigrated: handoff.migrated
+      };
+      return directIdentity;
+    }
+    if (surface === SURFACE.CONVERSATION && this.activePinnedChatConversationId && this.host.setInferredChatConversationId) {
+      const visible = this.host.getChatVisibleTurns?.() ?? [];
+      const inferredConversationSet = Boolean(this.host.setInferredChatConversationId(this.activePinnedChatConversationId));
+      const inferredIdentity = this.host.getConversationIdentity?.() ?? null;
+      if (inferredIdentity?.stable && inferredIdentity.host === "chatgpt") {
+        this.rememberStableChatIdentity(inferredIdentity, visible);
+      }
+      this.lastPinnedChatInference = {
+        inferredConversationSet,
+        result: inferredConversationSet
+          ? (String(this.activePinnedChatConversationId).startsWith("project-chat:") ? "project-chat-click-latched" : "pinned-click-latched")
+          : (String(this.activePinnedChatConversationId).startsWith("project-chat:") ? "project-chat-click-latch-failed" : "pinned-click-latch-failed"),
+        directIdentityPresent: false,
+        directIdentityStable: false,
+        visibleTurnCount: visible.length,
+        candidateCount: 0,
+        evidence: String(this.activePinnedChatConversationId).startsWith("project-chat:")
+          ? "project-chat-click-latched"
+          : "pinned-click-latched"
+      };
+      return inferredIdentity;
+    }
+    if (surface !== SURFACE.CONVERSATION || !this.host.getChatVisibleTurns || !this.host.setInferredChatConversationId) {
+      this.activePinnedChatConversationId = null;
+      this.host.clearInferredChatConversationId?.();
+      this.lastPinnedChatInference = {
+        inferredConversationSet: false,
+        result: "ineligible",
+        directIdentityPresent: Boolean(directIdentity),
+        directIdentityStable: Boolean(directIdentity?.stable),
+        visibleTurnCount: 0,
+        candidateCount: 0,
+        evidence: null
+      };
+      return directIdentity;
+    }
+    const visible = this.host.getChatVisibleTurns?.() ?? [];
+    const recentConversationId = this.resolveRecentStableChatIdentity(visible);
+    if (recentConversationId) {
+      const inferredConversationSet = Boolean(this.host.setInferredChatConversationId(recentConversationId));
+      const inferredIdentity = this.host.getConversationIdentity?.() ?? directIdentity;
+      if (inferredIdentity?.stable && inferredIdentity.host === "chatgpt") {
+        this.rememberStableChatIdentity(inferredIdentity, visible);
+      }
+      this.lastPinnedChatInference = {
+        inferredConversationSet,
+        result: inferredConversationSet ? "recent-visible-id-overlap" : "recent-visible-id-overlap-failed",
+        directIdentityPresent: Boolean(directIdentity),
+        directIdentityStable: Boolean(directIdentity?.stable),
+        visibleTurnCount: visible.length,
+        candidateCount: 1,
+        evidence: "recent-visible-id-overlap"
+      };
+      return inferredIdentity;
+    }
+
+    const candidates = this.getPinnedChatCandidates();
+    const resolved = resolvePinnedChatConversationCandidate(visible, candidates);
+    if (!resolved?.conversationId) {
+      this.host.clearInferredChatConversationId?.();
+      this.lastPinnedChatInference = {
+        inferredConversationSet: false,
+        result: "no-unique-candidate",
+        directIdentityPresent: Boolean(directIdentity),
+        directIdentityStable: Boolean(directIdentity?.stable),
+        visibleTurnCount: visible.length,
+        candidateCount: candidates.length,
+        evidence: null
+      };
+      return directIdentity;
+    }
+    const inferredConversationSet = Boolean(this.host.setInferredChatConversationId(resolved.conversationId));
+    const inferredIdentity = this.host.getConversationIdentity?.() ?? directIdentity;
+    if (inferredIdentity?.stable && inferredIdentity.host === "chatgpt") {
+      this.rememberStableChatIdentity(inferredIdentity, visible);
+    }
+    this.lastPinnedChatInference = {
+      inferredConversationSet,
+      result: inferredConversationSet ? "inferred-set" : "inferred-set-failed",
+      directIdentityPresent: Boolean(directIdentity),
+      directIdentityStable: Boolean(directIdentity?.stable),
+      visibleTurnCount: visible.length,
+      candidateCount: candidates.length,
+      evidence: resolved.evidence ?? null
+    };
+    return inferredIdentity;
+  }  refresh(reason = "manual") {
     if (this.destroyed) return this.status();
     const surface = this.host.getSurface();
-    const conversationId = this.host.getConversationId();
-    const conversationIdentity = this.host.getConversationIdentity?.() ?? null;
+    const conversationIdentity = this.refreshPinnedChatInference(surface);
+    const conversationId = conversationIdentity?.id ?? this.host.getConversationId();
+    this.recordChatScrollDiagnostic("refresh-start:" + reason);
+    const refreshDiagnostics = {
+      reason,
+      branch: "unresolved",
+      resolvedIdentity: conversationIdentity
+        ? { present: true, host: conversationIdentity.host ?? null, source: conversationIdentity.source ?? null, stable: Boolean(conversationIdentity.stable) }
+        : { present: false },
+      chatVisibleTurnsCount: Number(this.lastPinnedChatInference?.visibleTurnCount ?? 0),
+      routedVisibleTurnsCount: 0,
+      preReconcileIndexCount: 0,
+      trustedVisibleTurnsCount: 0,
+      postRefreshIndexCount: 0
+    };
     this.shell.setTheme(this.host.getTheme());
     this.shell.setSurface(surface);
 
+    if (this.pendingConversationSelectionId) {
+      const pendingId = String(this.pendingConversationSelectionId);
+      const comparablePendingId = pendingId.startsWith("local:") ? pendingId : canonicalChatConversationId(pendingId);
+      const rawConversationId = String(conversationId ?? "");
+      const comparableConversationId = rawConversationId.startsWith("local:")
+        ? rawConversationId
+        : canonicalChatConversationId(rawConversationId);
+      const matchedPending = comparableConversationId === comparablePendingId && conversationIdentity?.stable;
+      const pendingAgeMs = this.pendingConversationSelectionStartedAt > 0
+        ? Math.max(0, appNowMs(this.window) - this.pendingConversationSelectionStartedAt)
+        : 0;
+      const expiredPending = this.pendingConversationSelectionStartedAt > 0
+        && pendingAgeMs >= CHAT_PENDING_SELECTION_TTL_MS;
+      if (matchedPending || expiredPending) {
+        this.pendingConversationSelectionId = null;
+        this.pendingConversationSelectionStartedAt = 0;
+        refreshDiagnostics.pendingResolution = matchedPending ? "matched" : "expired";
+      } else if (surface === SURFACE.CONVERSATION) {
+        refreshDiagnostics.branch = "conversation-transition";
+        refreshDiagnostics.pendingAgeMs = pendingAgeMs;
+        refreshDiagnostics.postRefreshIndexCount = Number(this.currentConversationId ? this.turnIndexes.get(this.currentConversationId)?.size?.() ?? 0 : 0);
+        this.shell.updateTimeline([], null);
+        this.shell.setQuestionHistoryState?.({ visible: false, loading: false, exhausted: false });
+        this.bindScrollContainer(null);
+        this.shell.refreshComposerAnchor();
+        this.lastRefreshDiagnostics = refreshDiagnostics;
+        this.recordChatScrollDiagnostic("refresh-end:" + reason);
+        this.updateDebug(reason + "-conversation-transition");
+        return this.status();
+      }
+    }
+
     if (surface === SURFACE.CONVERSATION && conversationId) {
+      this.clearChatIdentitySettleRetry();
+      refreshDiagnostics.branch = "resolved-conversation";
       this.activateConversation(conversationId);
       const index = this.getTurnIndex(conversationId);
+      refreshDiagnostics.preReconcileIndexCount = Number(index.size?.() ?? 0);
       const visible = this.host.getVisibleTurns();
-      index.setVisible(visible);
-      if (conversationIdentity?.source === "sidebar-local" && conversationIdentity?.stable) index.reindexUuidV7?.();
-      if (OFFICIAL_NAVIGATION_RUNTIME_ENABLED) {
-        this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
-      } else {
-        this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
+      if (conversationIdentity?.host === "chatgpt") {
+        this.captureActiveChatBootstrapWindow(this.getChatBootstrapVisibleTurns());
       }
+      refreshDiagnostics.routedVisibleTurnsCount = visible.length;
+      const reconcileDiagnostics = {};
+      const trustedVisible = conversationIdentity?.host === "chatgpt"
+        ? reconcileChatVisibleTurns(index, visible, reconcileDiagnostics)
+        : visible;
+      if (conversationIdentity?.host === "chatgpt") refreshDiagnostics.chatReconcile = reconcileDiagnostics;
+      refreshDiagnostics.trustedVisibleTurnsCount = trustedVisible.length;
+      if (conversationIdentity?.host === "chatgpt") {
+        refreshDiagnostics.chatBootstrapStarted = this.maybeStartChatTrueTopBootstrap({
+          conversationId,
+          index,
+          identity: conversationIdentity,
+          visibleRecords: visible,
+          trustedVisible
+        });
+      }
+      index.setVisible(trustedVisible);
+      if (conversationIdentity?.source === "sidebar-local" && conversationIdentity?.stable) index.reindexUuidV7?.();
       if (this.navigationUx.state === "pending" && this.navigationUx.target) {
         const pendingRecord = index.get(this.navigationUx.target);
         const pendingOrder = Number.isFinite(pendingRecord?.order) ? Number(pendingRecord.order) : null;
@@ -6292,38 +7730,67 @@ class TalkEnhancerV3App {
       const activeTurnId = index.resolveCanonicalId(this.host.getActiveTurnId());
       this.conversations.update(conversationId, { turnCount: index.size(), activeTurnId, route: this.host.getRoute?.() ?? "" });
       this.shell.updateTimeline(index.getOrdered(), activeTurnId);
-      if (L3_RUNTIME_ENABLED) this.scheduleHostInternalDepthProbe(conversationId, index, conversationIdentity);
+      const localWork = Boolean(conversationIdentity?.stable && conversationIdentity.host === "local" && conversationIdentity.source === "sidebar-local");
+      const chatConversation = Boolean(conversationIdentity?.stable && conversationIdentity.host === "chatgpt");
+      const turnCount = Number(index.size?.() ?? 0);
+      refreshDiagnostics.postRefreshIndexCount = turnCount;
+      const exhausted = localWork
+        ? this.workEarlierHydrationExhausted.get(conversationId) === turnCount
+        : chatConversation && this.chatEarlierHydrationExhausted.get(conversationId) === turnCount;
+      this.shell.setQuestionHistoryState?.({
+        visible: localWork || chatConversation,
+        loading: localWork ? Boolean(this.workEarlierHydrationPromise) : chatConversation && Boolean(this.chatEarlierHydrationPromise),
+        exhausted
+      });
       this.bindScrollContainer(this.host.getScrollContainer?.());
     } else if (surface === SURFACE.CONVERSATION && this.currentConversationId) {
-      if (this.navigationUx.state === "pending") this.invalidateNavigation("conversation-identity-transient");
-      this.bindScrollContainer(this.host.getScrollContainer?.());
+      const ownedChatOperation = Boolean(
+        (this.chatEarlierHydrationPromise || this.chatBootstrapHydrationPromise)
+        && !this.pendingConversationSelectionId
+        && !this.pendingPinnedChatSelection
+      );
+      const currentIndex = this.turnIndexes.get(this.currentConversationId) ?? null;
+      refreshDiagnostics.postRefreshIndexCount = Number(currentIndex?.size?.() ?? 0);
+      if (ownedChatOperation && currentIndex) {
+        refreshDiagnostics.branch = "identity-transient-preserve-chat-operation";
+        const activeTurnId = currentIndex.resolveCanonicalId?.(this.host.getActiveTurnId?.()) ?? null;
+        this.shell.updateTimeline(currentIndex.getOrdered?.() ?? [], activeTurnId);
+        this.shell.setQuestionHistoryState?.({ visible: true, loading: true, exhausted: false });
+        this.bindScrollContainer(this.host.getScrollContainer?.());
+        this.scheduleChatIdentitySettleRetry();
+      } else {
+        refreshDiagnostics.branch = "identity-transient-clear-ui";
+        if (this.navigationUx.state === "pending") this.invalidateNavigation("conversation-identity-transient");
+        this.shell.updateTimeline([], null);
+        this.shell.setQuestionHistoryState?.({ visible: false, loading: false, exhausted: false });
+        this.bindScrollContainer(this.host.getScrollContainer?.());
+        this.scheduleChatIdentitySettleRetry();
+      }
     } else {
+      refreshDiagnostics.branch = surface === SURFACE.CONVERSATION ? "conversation-without-identity" : "non-conversation";
       if (surface !== SURFACE.MEDIA_VIEWER) this.deactivateConversationView();
+      if (surface === SURFACE.CONVERSATION) {
+        this.shell.updateTimeline([], null);
+        this.scheduleChatIdentitySettleRetry();
+      } else {
+        this.clearChatIdentitySettleRetry();
+      }
+      this.shell.setQuestionHistoryState?.({ visible: false, loading: false, exhausted: false });
       this.bindScrollContainer(null);
     }
 
     this.shell.refreshComposerAnchor();
+    this.lastRefreshDiagnostics = refreshDiagnostics;
+    this.recordChatScrollDiagnostic("refresh-end:" + reason);
     this.updateDebug(reason);
     return this.status();
-  }
-
-  activateConversation(conversationId) {
+  }  activateConversation(conversationId) {
     if (this.currentConversationId === conversationId) return;
     if (this.currentConversationId) {
       this.saveConversationView(this.currentConversationId);
       this.invalidateNavigation("conversation-changed");
     }
     this.currentConversationId = conversationId;
-    this.clearOfficialBridgeAutoTimer();
-    this.clearHostInternalDepthProbeTimer();
-    this.clearL3AdaptiveRescanTimer();
-    this.clearL3PostNavigationScanTimer();
-    this.clearL3EventRecoveryWatch();
-    this.hostInternalDepthProbe = this.hostInternalDepthProbeByConversation.get(conversationId) ?? null;
-    const existingAutoSession = this.officialBridgeAutoSessions.get(conversationId);
-    if (existingAutoSession) existingAutoSession.retryAttempt = 0;
-    this.officialNavigationSessionLearningHistory = [];
-    this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning([]);
     const conversation = this.conversations.activateConversation(conversationId, this.host.getRoute?.() ?? "");
     if (conversation?.captureStatus?.status === "unavailable" && this.captureStatus?.status !== "unavailable") {
       this.conversations.setCaptureStatus(conversationId, this.captureStatus);
@@ -6333,7 +7800,6 @@ class TalkEnhancerV3App {
   }
 
   deactivateConversationView() {
-    this.clearL3EventRecoveryWatch();
     if (this.currentConversationId) {
       this.saveConversationView(this.currentConversationId);
       this.invalidateNavigation("conversation-deactivated");
@@ -6347,10 +7813,14 @@ class TalkEnhancerV3App {
     if (view) this.timelineState.update(conversationId, view);
   }
 
+  getTimelineCache(conversationId) {
+    return String(conversationId ?? "").startsWith("local:") ? this.workTimelineCache : this.chatTimelineCache;
+  }
+
   getTurnIndex(conversationId) {
     if (!this.turnIndexes.has(conversationId)) {
       const index = new TurnIndex();
-      const cached = this.timelineCache.load(conversationId);
+      const cached = this.getTimelineCache(conversationId).load(conversationId);
       if (cached.length) index.mergeMany(cached.map((turn) => ({ ...turn, source: "dom", visible: false })));
       this.cacheHydrationCounts.set(conversationId, cached.length);
       this.turnIndexes.set(conversationId, index);
@@ -6360,22 +7830,609 @@ class TalkEnhancerV3App {
 
   persistTimelineCache(conversationId, index = this.turnIndexes.get(conversationId)) {
     if (!conversationId || !index) return false;
-    return this.timelineCache.save(conversationId, index.getOrdered());
+    return this.getTimelineCache(conversationId).save(conversationId, index.getOrdered());
   }
 
-  handleCapture({ conversationId, turns } = {}) {
+  getDiagnosticConversationOrdinal(conversationId) {
+    const id = String(conversationId ?? "").trim();
+    if (!id) return null;
+    if (!this.diagnosticConversationOrdinals.has(id)) {
+      this.diagnosticConversationOrdinals.set(id, this.nextDiagnosticConversationOrdinal++);
+    }
+    return this.diagnosticConversationOrdinals.get(id);
+  }
+
+  recordCaptureDiagnostic({ conversationId, turns = [], payload = null, beforeTurns = [], afterTurns = [] } = {}) {
+    const incoming = Array.isArray(turns) ? turns : [];
+    const before = Array.isArray(beforeTurns) ? beforeTurns : [];
+    const after = Array.isArray(afterTurns) ? afterTurns : [];
+    const beforeCaptureIds = new Set(before.filter((turn) => String(turn?.source ?? "").includes("capture")).map((turn) => String(turn.id)));
+    const incomingIds = new Set(incoming.map((turn) => String(turn?.id ?? "")).filter(Boolean));
+    const incomingOrders = incoming.map((turn) => Number(turn?.order)).filter(Number.isFinite).sort((a, b) => a - b);
+    const previousCaptureCount = beforeCaptureIds.size;
+    const retainedCaptureCount = [...beforeCaptureIds].filter((id) => incomingIds.has(id)).length;
+    const removedCaptureCount = previousCaptureCount - retainedCaptureCount;
+    const addedCaptureCount = [...incomingIds].filter((id) => !beforeCaptureIds.has(id)).length;
+    const mappingCount = payload?.mapping && typeof payload.mapping === "object" ? Object.keys(payload.mapping).length : 0;
+    this.captureDiagnostics.push({
+      sequence: this.captureDiagnostics.length ? Number(this.captureDiagnostics.at(-1)?.sequence ?? 0) + 1 : 1,
+      conversationOrdinal: this.getDiagnosticConversationOrdinal(conversationId),
+      relationToCurrent: !this.currentConversationId ? "no-current" : String(this.currentConversationId) === String(conversationId) ? "matches-current" : "background",
+      incomingTurnCount: incoming.length,
+      incomingOrderMin: incomingOrders.length ? incomingOrders[0] : null,
+      incomingOrderMax: incomingOrders.length ? incomingOrders.at(-1) : null,
+      incomingStartsAtZero: incomingOrders.length ? incomingOrders[0] === 0 : false,
+      incomingIdModes: diagnosticIdModeCounts(incoming),
+      mappingCount,
+      currentNodePresent: Boolean(payload?.current_node),
+      previousIndexCount: before.length,
+      previousCaptureCount,
+      retainedCaptureCount,
+      removedCaptureCount,
+      addedCaptureCount,
+      afterIndexCount: after.length
+    });
+    this.captureDiagnostics = this.captureDiagnostics.slice(-CAPTURE_DIAGNOSTIC_LIMIT);
+  }
+
+  recordChatScrollDiagnostic(reason = "manual", { force = false } = {}) {
+    const surface = this.host?.getSurface?.();
+    if (surface !== SURFACE.CONVERSATION) return false;
+    if (this.host?.getHostMode?.() === "work") return false;
+    const identity = this.host?.getConversationIdentity?.() ?? null;
+    const currentId = this.currentConversationId ?? identity?.id ?? null;
+    if (identity?.host === "local" || String(currentId ?? "").startsWith("local:")) return false;
+    const container = this.host?.getScrollContainer?.() ?? null;
+    if (!container) return false;
+    const visible = this.host?.getChatVisibleTurns?.() ?? [];
+    const index = currentId ? this.turnIndexes.get(currentId) ?? null : null;
+    const activeId = this.host?.getActiveTurnId?.() ?? null;
+    const activeRecord = index?.get?.(activeId) ?? null;
+    const visibleOrders = visible
+      .map((turn) => {
+        const known = index?.get?.(turn?.id);
+        if (Number.isFinite(known?.order)) return Number(known.order);
+        if (turn?.orderTrust !== "window" && Number.isFinite(turn?.order)) return Number(turn.order);
+        return null;
+      })
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const flexDirection = this.window?.getComputedStyle?.(container)?.flexDirection
+      ?? container?.style?.flexDirection
+      ?? null;
+    const entry = {
+      sequence: this.chatScrollDiagnostics.length ? Number(this.chatScrollDiagnostics.at(-1)?.sequence ?? 0) + 1 : 1,
+      reason,
+      conversationOrdinal: this.getDiagnosticConversationOrdinal(currentId),
+      identity: identity
+        ? { present: true, host: identity.host ?? null, source: identity.source ?? null, stable: Boolean(identity.stable) }
+        : { present: false },
+      activeOrder: Number.isFinite(activeRecord?.order) ? Number(activeRecord.order) : null,
+      visibleOrderMin: visibleOrders.length ? visibleOrders[0] : null,
+      visibleOrderMax: visibleOrders.length ? visibleOrders.at(-1) : null,
+      visibleTurnCount: visible.length,
+      scrollTop: diagnosticRound(container.scrollTop),
+      scrollHeight: diagnosticRound(container.scrollHeight),
+      clientHeight: diagnosticRound(container.clientHeight),
+      flexDirection
+    };
+    const signature = JSON.stringify({
+      conversationOrdinal: entry.conversationOrdinal,
+      identity: entry.identity,
+      activeOrder: entry.activeOrder,
+      visibleOrderMin: entry.visibleOrderMin,
+      visibleOrderMax: entry.visibleOrderMax,
+      visibleTurnCount: entry.visibleTurnCount,
+      scrollTop: entry.scrollTop,
+      scrollHeight: entry.scrollHeight,
+      clientHeight: entry.clientHeight,
+      flexDirection: entry.flexDirection
+    });
+    if (!force && signature === this.lastChatScrollDiagnosticSignature) return false;
+    this.lastChatScrollDiagnosticSignature = signature;
+    this.chatScrollDiagnostics.push(entry);
+    this.chatScrollDiagnostics = this.chatScrollDiagnostics.slice(-CHAT_SCROLL_DIAGNOSTIC_LIMIT);
+    return true;
+  }
+
+  handleCapture({ conversationId, turns, payload } = {}) {
     if (!conversationId) return;
     const index = this.getTurnIndex(conversationId);
+    const beforeTurns = index.getOrdered();
     index.replaceCapture(turns ?? []);
+    const afterTurns = index.getOrdered();
+    this.recordCaptureDiagnostic({ conversationId, turns: turns ?? [], payload, beforeTurns, afterTurns });
     this.persistTimelineCache(conversationId, index);
     this.conversations.setCaptureStatus(conversationId, { status: "active", turnCount: index.size(), lastError: "" });
-    if (this.currentConversationId === conversationId) this.scheduleRefresh("capture");
+    if (this.currentConversationId === conversationId) {
+      this.scheduleRefresh("capture");
+    } else if (!this.currentConversationId
+      && this.host.getSurface?.() === SURFACE.CONVERSATION
+      && !(this.host.getDirectConversationIdentity?.()?.stable)) {
+      this.scheduleRefresh("capture-candidate");
+    }
   }
 
   handleCaptureStatus(status = {}) {
     this.captureStatus = { ...this.captureStatus, ...status };
     if (this.currentConversationId) this.conversations.setCaptureStatus(this.currentConversationId, this.captureStatus);
     this.updateDebug("capture-status");
+  }
+
+  maybeStartWorkEarlierHydration({ conversationId, index, identity, explicit = false, stopAfterBatch = false } = {}) {
+    if (!explicit) return false;
+    const localWork = Boolean(identity?.stable && identity.host === "local" && identity.source === "sidebar-local");
+    const panelOpen = Boolean(this.shell?.getStatus?.().questionPanelOpen);
+    if (!localWork || !conversationId || !index || !panelOpen) {
+      if (conversationId && !panelOpen) this.workEarlierHydrationExhausted.delete(conversationId);
+      return false;
+    }
+    if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
+    const turnCount = Number(index.size?.() ?? 0);
+    if (this.workEarlierHydrationExhausted.get(conversationId) === turnCount) return false;
+    if (this.workEarlierHydrationPromise) return true;
+    this.shell.setQuestionHistoryState?.({ visible: true, loading: true, exhausted: false });
+
+    const generation = ++this.workEarlierHydrationGeneration;
+    const isCurrent = () => {
+      const currentIdentity = this.host.getConversationIdentity?.() ?? null;
+      return !this.destroyed
+        && generation === this.workEarlierHydrationGeneration
+        && conversationId === this.currentConversationId
+        && conversationId === this.host.getConversationId?.()
+        && currentIdentity?.stable
+        && currentIdentity.host === "local"
+        && currentIdentity.source === "sidebar-local"
+        && Boolean(this.shell?.getStatus?.().questionPanelOpen)
+        && this.activeNavigation?.status !== "running"
+        && this.navigationUx.state !== "pending";
+    };
+    const task = Promise.resolve(this.host.hydrateWorkEarlierHistory?.({
+      isCurrent,
+      stopAfterBatch,
+      onProgress: () => this.scheduleRefresh("work-earlier-history-progress")
+    }))
+      .then((result) => {
+        const currentIndex = this.turnIndexes.get(conversationId);
+        const currentCount = Number(currentIndex?.size?.() ?? turnCount);
+        if (result?.reason === "earlier-boundary-exhausted") this.workEarlierHydrationExhausted.set(conversationId, currentCount);
+        else this.workEarlierHydrationExhausted.delete(conversationId);
+        if (isCurrent()) this.scheduleRefresh("work-earlier-history-done");
+        return result;
+      })
+      .finally(() => {
+        if (this.workEarlierHydrationPromise === task) this.workEarlierHydrationPromise = null;
+        this.scheduleRefresh("work-earlier-history-finalize");
+      });
+    this.workEarlierHydrationPromise = task;
+    return true;
+  }
+
+  getChatBootstrapVisibleTurns() {
+    if (typeof this.host?.getChatVisibleTurns === "function") {
+      return this.host.getChatVisibleTurns() ?? [];
+    }
+    return this.host?.getVisibleTurns?.() ?? [];
+  }
+
+  captureActiveChatBootstrapWindow(records = null) {
+    const collector = this.chatBootstrapCollector;
+    if (!collector || collector.conversationId !== this.currentConversationId) return false;
+    try {
+      return Boolean(collector.capture?.(records));
+    } catch {
+      return false;
+    }
+  }
+
+  startChatBootstrapSampleLoop(conversationId, generation, intervalMs = 24) {
+    this.stopChatBootstrapSampleLoop();
+    const tick = () => {
+      if (this.destroyed
+        || generation !== this.chatBootstrapHydrationGeneration
+        || this.chatBootstrapCollector?.conversationId !== conversationId
+        || this.currentConversationId !== conversationId) {
+        this.chatBootstrapSampleTimer = null;
+        return;
+      }
+      this.captureActiveChatBootstrapWindow(this.getChatBootstrapVisibleTurns());
+      this.chatBootstrapSampleTimer = this.window?.setTimeout?.(tick, intervalMs) ?? setTimeout(tick, intervalMs);
+    };
+    this.chatBootstrapSampleTimer = this.window?.setTimeout?.(tick, intervalMs) ?? setTimeout(tick, intervalMs);
+  }
+
+  stopChatBootstrapSampleLoop() {
+    if (this.chatBootstrapSampleTimer == null) return;
+    if (typeof this.window?.clearTimeout === "function") this.window.clearTimeout(this.chatBootstrapSampleTimer);
+    else clearTimeout(this.chatBootstrapSampleTimer);
+    this.chatBootstrapSampleTimer = null;
+  }
+
+  maybeStartChatTrueTopBootstrap({ conversationId, index, identity, visibleRecords = [], trustedVisible = [] } = {}) {
+    const chatConversation = Boolean(identity?.stable && identity.host === "chatgpt");
+    if (!chatConversation || !conversationId || !index) return false;
+    const explicitChatVisible = this.getChatBootstrapVisibleTurns();
+    const visible = explicitChatVisible.length
+      ? explicitChatVisible
+      : (Array.isArray(visibleRecords) ? visibleRecords : []);
+    const existingTurns = index.getOrdered?.() ?? [];
+    const visibleIds = new Set(visible.map((record) => String(record?.id ?? "")).filter(Boolean));
+    const existingVisibleOverlap = existingTurns.some((turn) => visibleIds.has(String(turn?.id ?? "")));
+    const syntheticChat = (String(conversationId).startsWith("pinned-chat:")
+      || String(conversationId).startsWith("project-chat:"))
+      && identity?.source === "inferred-visible-chat";
+    const repairIncompletePinnedCache = syntheticChat
+      && existingTurns.length > 0
+      && (Array.isArray(trustedVisible) ? trustedVisible.length : 0) === 0
+      && !existingVisibleOverlap
+      && existingTurns.every((turn) => turn?.source === "dom");
+    if (existingTurns.length !== 0 && !repairIncompletePinnedCache) return false;
+    if (!visible.length) return false;
+    const container = this.host.getScrollContainer?.() ?? null;
+    if (!container || container.isConnected === false) return false;
+    const initialUuidWindow = analyzeChatBootstrapWindowForContainer(
+      visible,
+      container,
+      this.window,
+      { allowPartial: false }
+    );
+    const initialAbsoluteWindow = analyzeAbsoluteChatBootstrapWindow(visible);
+    const bootstrapMode = initialUuidWindow.turns.length && isLogicalChatBootstrapBasis(initialUuidWindow.basis)
+      ? "uuid"
+      : initialAbsoluteWindow.turns.length
+        ? "absolute"
+        : null;
+    if (!bootstrapMode) return false;
+    if (bootstrapMode === "uuid" && Array.isArray(trustedVisible) && trustedVisible.length) return false;
+    if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
+    if (this.chatEarlierHydrationPromise || this.chatBootstrapHydrationPromise) return true;
+    if (this.chatBootstrapAttempted.has(conversationId)) return false;
+    const failureCount = Number(this.chatBootstrapFailures.get(conversationId) ?? 0);
+    if (failureCount >= CHAT_BOOTSTRAP_MAX_FAILURES) return false;
+    const originalScrollTop = Number(container.scrollTop);
+    let visualFreeze = beginChatBootstrapVisualFreeze({
+      document: this.document,
+      window: this.window,
+      container
+    });
+    const visualFreezeApplied = Boolean(visualFreeze);
+    const windows = [];
+    const sweepWindows = [];
+    const collectorStats = {
+      attempts: 0,
+      rejected: 0,
+      duplicates: 0,
+      partial: 0,
+      fallbackOrder: 0
+    };
+    const captureWindow = (records = null) => {
+      collectorStats.attempts += 1;
+      const current = Array.isArray(records) ? records : this.getChatBootstrapVisibleTurns();
+      const analyzed = bootstrapMode === "absolute"
+        ? analyzeAbsoluteChatBootstrapWindow(current)
+        : analyzeChatBootstrapWindow(current, { allowPartial: true });
+      if (!analyzed.turns.length) {
+        collectorStats.rejected += 1;
+        return false;
+      }
+      const signature = analyzed.turns.map((turn) => turn.id).join("|") + ":" + analyzed.basis;
+      const previous = windows.at(-1);
+      if (previous?.signature === signature) {
+        collectorStats.duplicates += 1;
+        return false;
+      }
+      if (windows.length >= 256) {
+        collectorStats.rejected += 1;
+        return false;
+      }
+      if (analyzed.partial) collectorStats.partial += 1;
+      if (analyzed.basis !== "visual") collectorStats.fallbackOrder += 1;
+      windows.push({ signature, ...analyzed });
+      return true;
+    };
+    const captureSweepWindow = (records = null) => {
+      const current = Array.isArray(records) ? records : this.getChatBootstrapVisibleTurns();
+      const analyzed = bootstrapMode === "absolute"
+        ? analyzeAbsoluteChatBootstrapWindow(current)
+        : analyzeChatBootstrapWindowForContainer(current, container, this.window, { allowPartial: true });
+      if (!analyzed.turns.length || (bootstrapMode === "uuid" && !isLogicalChatBootstrapBasis(analyzed.basis))) return false;
+      const signature = analyzed.turns.map((turn) => turn.id).join("|");
+      const previous = sweepWindows.at(-1);
+      if (previous?.signature === signature) return false;
+      sweepWindows.push({ signature, ...analyzed });
+      return true;
+    };
+    this.chatBootstrapCollector = { conversationId, capture: captureWindow };
+    captureWindow();
+    if (bootstrapMode === "uuid" && windows.length) {
+      const initialSignature = initialUuidWindow.turns.map((turn) => turn.id).join("|") + ":" + initialUuidWindow.basis;
+      windows[0] = { signature: initialSignature, ...initialUuidWindow };
+    }
+    this.shell?.showToast?.("正在加载时间线…");
+    const generation = ++this.chatBootstrapHydrationGeneration;
+    this.startChatBootstrapSampleLoop(conversationId, generation, 24);
+    const isCurrent = () => {
+      const currentIdentity = this.host.getConversationIdentity?.() ?? null;
+      if (this.destroyed
+        || generation !== this.chatBootstrapHydrationGeneration
+        || conversationId !== this.currentConversationId
+        || this.pendingConversationSelectionId
+        || this.pendingPinnedChatSelection
+        || this.host.getSurface?.() !== SURFACE.CONVERSATION
+        || this.activeNavigation?.status === "running"
+        || this.navigationUx.state === "pending") return false;
+      if (!currentIdentity?.stable) return true;
+      if (currentIdentity.host !== "chatgpt") return false;
+      return canonicalChatConversationId(currentIdentity.id) === canonicalChatConversationId(conversationId);
+    };
+
+    const task = Promise.resolve(this.host.hydrateChatEarlierHistory?.({
+      isCurrent,
+      maxBoundaryStalls: 2,
+      onProgress: () => {
+        captureWindow();
+        this.scheduleRefresh("chat-bootstrap-progress");
+      }
+    }))
+      .then(async (result) => {
+        captureWindow();
+        let sweepResult = null;
+        let sweepSequence = { turns: [], windowCount: 0, skippedWindows: 0, missingText: 0, complete: false };
+        if (result?.reason === "earlier-boundary-exhausted" && isCurrent() && typeof this.host.sweepLoadedChatHistory === "function") {
+          this.stopChatBootstrapSampleLoop();
+          sweepResult = await this.host.sweepLoadedChatHistory({
+            isCurrent,
+            maxSteps: 256,
+            stepRatio: 0.75,
+            settleWaitMs: 8,
+            onWindow: ({ turns } = {}) => {
+              captureSweepWindow(turns);
+            }
+          });
+          captureSweepWindow();
+          if (sweepResult?.reason === "sweep-complete") {
+            sweepSequence = bootstrapMode === "absolute"
+              ? buildAbsoluteChatBootstrapSweepSequence(sweepWindows)
+              : buildChatBootstrapSweepSequence(sweepWindows);
+          }
+        }
+        const stitchedFallback = result?.reason === "earlier-boundary-exhausted" && bootstrapMode === "uuid"
+          ? stitchChatBootstrapWindows(windows)
+          : { turns: [], connectedWindows: 0, totalWindows: windows.length, complete: false, skippedWindows: 0 };
+        const stitched = sweepResult?.reason === "sweep-complete" && sweepSequence.complete
+          ? {
+              turns: sweepSequence.turns,
+              connectedWindows: sweepSequence.windowCount,
+              totalWindows: sweepSequence.windowCount,
+              complete: true,
+              skippedWindows: sweepSequence.skippedWindows
+            }
+          : stitchedFallback;
+        const collectionMode = sweepResult?.reason === "sweep-complete" && sweepSequence.complete
+          ? "loaded-sweep"
+          : "event-stitch";
+        const initialRequiredIds = bootstrapMode === "uuid"
+          ? initialUuidWindow.turns.map((turn) => String(turn.id))
+          : [];
+        const coversInitialWindow = bootstrapMode !== "uuid"
+          || bootstrapSequenceCoversIds(stitched.turns, initialRequiredIds);
+        let bootstrapped = false;
+        if (result?.reason === "earlier-boundary-exhausted"
+          && stitched.complete
+          && stitched.turns.length
+          && coversInitialWindow
+          && isCurrent()) {
+          const currentIndex = this.turnIndexes.get(conversationId) ?? index;
+          const snapshot = stitched.turns.map((turn, order) => ({
+            id: turn.id,
+            order,
+            text: turn.text,
+            shortText: turn.shortText,
+            type: turn.type,
+            source: "dom",
+            visible: false
+          }));
+          const replaced = repairIncompletePinnedCache
+            ? currentIndex.replaceDomSnapshot?.(snapshot) === true
+            : false;
+          if (!replaced) currentIndex.mergeMany(snapshot);
+          this.persistTimelineCache(conversationId, currentIndex);
+          this.chatEarlierHydrationExhausted.set(conversationId, Number(currentIndex.size?.() ?? stitched.turns.length));
+          this.chatBootstrapAttempted.add(conversationId);
+          this.chatBootstrapFailures.delete(conversationId);
+          bootstrapped = true;
+        } else if (isCurrent()) {
+          this.chatBootstrapFailures.set(
+            conversationId,
+            Math.min(CHAT_BOOTSTRAP_MAX_FAILURES, failureCount + 1)
+          );
+        }
+        this.lastChatBootstrapDiagnostics = {
+          conversationOrdinal: this.getDiagnosticConversationOrdinal(conversationId),
+          result: result?.reason ?? null,
+          windowCount: windows.length,
+          connectedWindows: stitched.connectedWindows,
+          stitchedTurnCount: stitched.turns.length,
+          skippedWindows: Number(stitched.skippedWindows ?? 0),
+          completeChain: Boolean(stitched.complete),
+          collectorAttempts: collectorStats.attempts,
+          collectorRejected: collectorStats.rejected,
+          collectorDuplicates: collectorStats.duplicates,
+          partialWindows: collectorStats.partial,
+          fallbackOrderWindows: collectorStats.fallbackOrder,
+          repairedIncompleteCache: Boolean(bootstrapped && repairIncompletePinnedCache),
+          bootstrapMode,
+          collectionMode,
+          sweepResult: sweepResult?.reason ?? null,
+          sweepWindowCount: sweepWindows.length,
+          sweepTurnCount: sweepSequence.turns.length,
+          sweepMissingText: Number(sweepSequence.missingText ?? 0),
+          coversInitialWindow,
+          bootstrapFailureCount: Number(this.chatBootstrapFailures.get(conversationId) ?? 0),
+          visualFreezeApplied,
+          bootstrapped
+        };
+        if (container === this.host.getScrollContainer?.() && container.isConnected !== false && Number.isFinite(originalScrollTop)) {
+          try { container.scrollTop = originalScrollTop; } catch {}
+          if (visualFreeze) {
+            await waitChatBootstrapFrame(this.window);
+            await waitChatBootstrapFrame(this.window);
+          }
+        }
+        if (visualFreeze) {
+          endChatBootstrapVisualFreeze(visualFreeze);
+          visualFreeze = null;
+        }
+        if (isCurrent()) this.scheduleRefresh("chat-bootstrap-done");
+        return result;
+      })
+      .finally(() => {
+        if (visualFreeze) {
+          if (container === this.host.getScrollContainer?.() && container.isConnected !== false && Number.isFinite(originalScrollTop)) {
+            try { container.scrollTop = originalScrollTop; } catch {}
+          }
+          endChatBootstrapVisualFreeze(visualFreeze);
+          visualFreeze = null;
+        }
+        if (this.chatBootstrapHydrationPromise === task) this.chatBootstrapHydrationPromise = null;
+        if (this.chatBootstrapCollector?.conversationId === conversationId) this.chatBootstrapCollector = null;
+        this.stopChatBootstrapSampleLoop();
+        const failures = Number(this.chatBootstrapFailures.get(conversationId) ?? 0);
+        if (!this.chatBootstrapAttempted.has(conversationId)
+          && failures > 0
+          && failures < CHAT_BOOTSTRAP_MAX_FAILURES
+          && this.currentConversationId === conversationId) {
+          if (this.chatBootstrapRetryTimer != null) {
+            (this.window?.clearTimeout ?? clearTimeout)(this.chatBootstrapRetryTimer);
+          }
+          const delayMs = CHAT_BOOTSTRAP_RETRY_DELAYS_MS[Math.min(
+            failures - 1,
+            CHAT_BOOTSTRAP_RETRY_DELAYS_MS.length - 1
+          )];
+          this.chatBootstrapRetryTimer = (this.window?.setTimeout ?? setTimeout)(() => {
+            this.chatBootstrapRetryTimer = null;
+            if (!this.destroyed && this.currentConversationId === conversationId) {
+              this.scheduleRefresh("chat-bootstrap-retry");
+            }
+          }, delayMs);
+        }
+        this.scheduleRefresh("chat-bootstrap-finalize");
+      });
+    this.chatBootstrapHydrationPromise = task;
+    this.lastChatBootstrapDiagnostics = {
+      conversationOrdinal: this.getDiagnosticConversationOrdinal(conversationId),
+      result: "running",
+      windowCount: windows.length,
+      connectedWindows: 0,
+      stitchedTurnCount: 0,
+      skippedWindows: 0,
+      completeChain: false,
+      collectorAttempts: collectorStats.attempts,
+      collectorRejected: collectorStats.rejected,
+      collectorDuplicates: collectorStats.duplicates,
+      partialWindows: collectorStats.partial,
+      fallbackOrderWindows: collectorStats.fallbackOrder,
+      repairedIncompleteCache: false,
+      bootstrapMode,
+      collectionMode: "running",
+      sweepResult: null,
+      sweepWindowCount: 0,
+      sweepTurnCount: 0,
+      sweepMissingText: 0,
+      coversInitialWindow: false,
+      bootstrapFailureCount: failureCount,
+      visualFreezeApplied,
+      bootstrapped: false
+    };
+    return true;
+  }
+
+  maybeStartChatEarlierHydration({ conversationId, index, identity, explicit = false } = {}) {
+    if (!explicit) return false;
+    const chatConversation = Boolean(identity?.stable && identity.host === "chatgpt");
+    const panelOpen = Boolean(this.shell?.getStatus?.().questionPanelOpen);
+    if (!chatConversation || !conversationId || !index || !panelOpen) {
+      if (conversationId && !panelOpen) this.chatEarlierHydrationExhausted.delete(conversationId);
+      return false;
+    }
+    if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
+    const turnCount = Number(index.size?.() ?? 0);
+    if (this.chatEarlierHydrationExhausted.get(conversationId) === turnCount) return false;
+    if (this.chatEarlierHydrationPromise) return true;
+    this.shell.setQuestionHistoryState?.({ visible: true, loading: true, exhausted: false });
+
+    const generation = ++this.chatEarlierHydrationGeneration;
+    const isCurrent = () => {
+      const currentIdentity = this.host.getConversationIdentity?.() ?? null;
+      if (this.destroyed
+        || generation !== this.chatEarlierHydrationGeneration
+        || conversationId !== this.currentConversationId
+        || this.pendingConversationSelectionId
+        || this.pendingPinnedChatSelection
+        || this.host.getSurface?.() !== SURFACE.CONVERSATION
+        || !Boolean(this.shell?.getStatus?.().questionPanelOpen)
+        || this.activeNavigation?.status === "running"
+        || this.navigationUx.state !== "idle") return false;
+      if (!currentIdentity?.stable) return true;
+      if (currentIdentity.host !== "chatgpt") return false;
+      return canonicalChatConversationId(currentIdentity.id) === canonicalChatConversationId(conversationId);
+    };
+    const task = Promise.resolve(this.host.hydrateChatEarlierHistory?.({
+      isCurrent,
+      onProgress: () => this.scheduleRefresh("chat-earlier-history-progress")
+    }))
+      .then((result) => {
+        const currentIndex = this.turnIndexes.get(conversationId);
+        const currentCount = Number(currentIndex?.size?.() ?? turnCount);
+        if (result?.reason === "earlier-boundary-exhausted") this.chatEarlierHydrationExhausted.set(conversationId, currentCount);
+        else this.chatEarlierHydrationExhausted.delete(conversationId);
+        if (isCurrent()) this.scheduleRefresh("chat-earlier-history-done");
+        return result;
+      })
+      .finally(() => {
+        if (this.chatEarlierHydrationPromise === task) this.chatEarlierHydrationPromise = null;
+        this.scheduleRefresh("chat-earlier-history-finalize");
+      });
+    this.chatEarlierHydrationPromise = task;
+    return true;
+  }
+
+  loadAllEarlierHistory() {
+    const conversationId = this.currentConversationId;
+    const index = conversationId ? this.getTurnIndex(conversationId) : null;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    if (identity?.host === "local") {
+      return this.maybeStartWorkEarlierHydration({ conversationId, index, identity, explicit: true, stopAfterBatch: false });
+    }
+    if (identity?.host === "chatgpt") {
+      return this.maybeStartChatEarlierHydration({ conversationId, index, identity, explicit: true });
+    }
+    return false;
+  }
+
+  loadEarlierWorkBatch() {
+    const conversationId = this.currentConversationId;
+    const index = conversationId ? this.getTurnIndex(conversationId) : null;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    return this.maybeStartWorkEarlierHydration({ conversationId, index, identity, explicit: true, stopAfterBatch: true });
+  }
+
+  cancelWorkEarlierHydration() {
+    this.workEarlierHydrationGeneration += 1;
+  }
+
+  cancelChatEarlierHydration() {
+    this.chatEarlierHydrationGeneration += 1;
+  }
+
+  cancelChatBootstrapHydration() {
+    this.chatBootstrapHydrationGeneration += 1;
+    this.chatBootstrapCollector = null;
+    this.stopChatBootstrapSampleLoop();
+    if (this.chatBootstrapRetryTimer != null) {
+      (this.window?.clearTimeout ?? clearTimeout)(this.chatBootstrapRetryTimer);
+      this.chatBootstrapRetryTimer = null;
+    }
   }
 
   bindScrollContainer(container) {
@@ -6450,12 +8507,6 @@ class TalkEnhancerV3App {
       reason: result?.reason ?? (result?.ok ? "ok" : "unknown"),
       ok: Boolean(result?.ok),
       verified: Boolean(result?.verified),
-      fastAttempted: Boolean(result?.fastAttempted),
-      fastSucceeded: Boolean(result?.fastSucceeded),
-      fallbackReason: result?.fallbackReason ?? null,
-      officialBridgeAttempted: Boolean(result?.officialBridgeAttempted),
-      officialBridgeSucceeded: Boolean(result?.officialBridgeSucceeded),
-      officialBridgeFallbackReason: result?.officialBridgeFallbackReason ?? null,
       slowestStep,
       currentStep: null,
       steps
@@ -6478,12 +8529,6 @@ class TalkEnhancerV3App {
         reason: completed.reason,
         ok: completed.ok,
         verified: completed.verified,
-        fastAttempted: completed.fastAttempted,
-        fastSucceeded: completed.fastSucceeded,
-        fallbackReason: completed.fallbackReason,
-        officialBridgeAttempted: completed.officialBridgeAttempted,
-        officialBridgeSucceeded: completed.officialBridgeSucceeded,
-        officialBridgeFallbackReason: completed.officialBridgeFallbackReason,
         slowestStep: completed.slowestStep,
         slowSteps,
         steps
@@ -6495,140 +8540,6 @@ class TalkEnhancerV3App {
     }
     if (this.activeNavigation?.runId === run.runId) this.activeNavigation = null;
     this.publishNavigationDiagnostics();
-  }
-
-  getOfficialProbeVisibleRange() {
-    const index = this.currentConversationId ? this.getTurnIndex(this.currentConversationId) : null;
-    const orders = [];
-    for (const turn of this.host.getVisibleTurns?.() ?? []) {
-      const record = turn?.id && index ? index.get(turn.id) : null;
-      const order = Number.isFinite(record?.order) ? Number(record.order) : (!index && Number.isFinite(turn?.order) ? Number(turn.order) : null);
-      if (Number.isFinite(order)) orders.push(order);
-    }
-    const unique = [...new Set(orders)].sort((a, b) => a - b);
-    if (!unique.length) return null;
-    return { min: unique[0], max: unique.at(-1), count: unique.length };
-  }
-
-  resetOfficialNavigationPrivateSession() {
-    this.officialNavigationPrivateMarkers?.clear?.();
-    this.officialNavigationSessionPrivatePairsByTarget = new Map();
-    this.officialNavigationSessionPrivateTargetsByKey = new Map();
-    this.officialNavigationSessionPrivateConflictedTargets = new Set();
-    this.officialNavigationSessionPrivateConflictedKeys = new Set();
-  }
-
-  activateOfficialNavigationPrivateSession(conversationId) {
-    this.officialNavigationPrivateMarkers?.clear?.();
-    if (!conversationId) {
-      this.resetOfficialNavigationPrivateSession();
-      return;
-    }
-    let session = this.officialNavigationPrivateSessions.get(conversationId);
-    if (!session) {
-      session = {
-        pairsByTarget: new Map(),
-        targetsByKey: new Map(),
-        conflictedTargets: new Set(),
-        conflictedKeys: new Set()
-      };
-      this.officialNavigationPrivateSessions.set(conversationId, session);
-    }
-    this.officialNavigationSessionPrivatePairsByTarget = session.pairsByTarget;
-    this.officialNavigationSessionPrivateTargetsByKey = session.targetsByKey;
-    this.officialNavigationSessionPrivateConflictedTargets = session.conflictedTargets;
-    this.officialNavigationSessionPrivateConflictedKeys = session.conflictedKeys;
-  }
-
-  handleOfficialPrivateMarker(marker) {
-    const probeId = Number(marker?.probeId);
-    const sessionKey = typeof marker?.sessionKey === "string" ? marker.sessionKey : null;
-    const markerKey = typeof marker?.markerKey === "string" ? marker.markerKey.trim() : "";
-    if (!Number.isInteger(probeId) || probeId <= 0 || !sessionKey || sessionKey !== this.currentConversationId || !markerKey) return;
-    this.officialNavigationPrivateMarkers.set(probeId, { sessionKey, markerKey });
-    while (this.officialNavigationPrivateMarkers.size > 32) this.officialNavigationPrivateMarkers.delete(this.officialNavigationPrivateMarkers.keys().next().value);
-  }
-
-  recordOfficialPrivateMarkerLearning({ probeId, targetOrder, knownTurnCount }) {
-    const privateMarker = this.officialNavigationPrivateMarkers.get(Number(probeId));
-    this.officialNavigationPrivateMarkers.delete(Number(probeId));
-    if (!privateMarker || privateMarker.sessionKey !== this.currentConversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
-    const markerKey = privateMarker.markerKey;
-    if (!markerKey || this.officialNavigationSessionPrivateConflictedKeys.has(markerKey) || this.officialNavigationSessionPrivateConflictedTargets.has(targetOrder)) return;
-    const existingTarget = this.officialNavigationSessionPrivateTargetsByKey.get(markerKey);
-    const existingPair = this.officialNavigationSessionPrivatePairsByTarget.get(targetOrder);
-    if ((Number.isInteger(existingTarget) && existingTarget !== targetOrder) || (existingPair?.markerKey && existingPair.markerKey !== markerKey)) {
-      this.officialNavigationSessionPrivateConflictedKeys.add(markerKey);
-      this.officialNavigationSessionPrivateConflictedTargets.add(targetOrder);
-      if (Number.isInteger(existingTarget)) this.officialNavigationSessionPrivateConflictedTargets.add(existingTarget);
-      if (existingPair?.markerKey) this.officialNavigationSessionPrivateConflictedKeys.add(existingPair.markerKey);
-      this.officialNavigationSessionPrivateTargetsByKey.delete(markerKey);
-      this.officialNavigationSessionPrivatePairsByTarget.delete(targetOrder);
-      return;
-    }
-    const hits = existingPair?.markerKey === markerKey ? Number(existingPair.hits || 0) + 1 : 1;
-    this.officialNavigationSessionPrivateTargetsByKey.set(markerKey, targetOrder);
-    this.officialNavigationSessionPrivatePairsByTarget.set(targetOrder, { markerKey, hits, knownTurnCount: Number(knownTurnCount) || 0 });
-  }
-
-  getTrustedOfficialPrivatePair({ targetOrder, index }) {
-    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || this.officialNavigationSessionPrivateConflictedTargets.has(targetOrder)) return null;
-    const pair = this.officialNavigationSessionPrivatePairsByTarget.get(targetOrder);
-    if (!pair?.markerKey || Number(pair.hits) < 2 || this.officialNavigationSessionPrivateConflictedKeys.has(pair.markerKey)) return null;
-    if (Number(pair.knownTurnCount) !== Number(index.size?.() ?? 0)) return null;
-    const buttons = Array.from(this.document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-    const matches = buttons.filter((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim() === pair.markerKey);
-    if (matches.length !== 1) return null;
-    return { marker: matches[0], targetOrder, hits: Number(pair.hits) };
-  }
-
-  handleOfficialNavigationRecord(record) {
-    const index = this.currentConversationId ? this.getTurnIndex(this.currentConversationId) : null;
-    const mapping = analyzeOfficialNavigationMapping({ document: this.document, turns: index?.getOrdered?.() ?? [] });
-    const activeTurnId = index?.resolveCanonicalId?.(this.host.getActiveTurnId?.());
-    const activeRecord = activeTurnId ? index?.get?.(activeTurnId) : null;
-    const marker = record?.marker ?? null;
-    const learningSample = marker && Number.isFinite(activeRecord?.order) ? {
-      markerIndex: marker.markerIndex,
-      markerCount: marker.markerCount,
-      targetOrder: Number(activeRecord.order),
-      knownTurnCount: index?.size?.() ?? null,
-      host: record?.host ?? null,
-      classification: record?.classification ?? null,
-      observedAt: new Date().toISOString()
-    } : null;
-    const clean = sanitizeOfficialNavigationRecord({ ...record, mapping, learningSample });
-    if (!clean) return;
-    this.officialNavigationMapping = clean.mapping ?? null;
-    if (clean.learningSample) {
-      this.officialNavigationLearningHistory = [...this.officialNavigationLearningHistory, clean.learningSample].slice(-OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT);
-      this.officialNavigationLearning = analyzeOfficialNavigationLearning(this.officialNavigationLearningHistory);
-      this.storage?.write?.(OFFICIAL_NAVIGATION_LEARNING_STORAGE_KEY, this.officialNavigationLearningHistory);
-      this.officialNavigationSessionLearningHistory = [...this.officialNavigationSessionLearningHistory, clean.learningSample].slice(-OFFICIAL_NAVIGATION_LEARNING_HISTORY_LIMIT);
-      this.officialNavigationSessionLearning = analyzeOfficialNavigationLearning(this.officialNavigationSessionLearningHistory);
-    }
-    this.officialNavigationHistory = [...this.officialNavigationHistory, clean].slice(-OFFICIAL_NAVIGATION_HISTORY_LIMIT);
-    this.storage?.write?.(OFFICIAL_NAVIGATION_STORAGE_KEY, this.officialNavigationHistory);
-    this.publishOfficialNavigationDiagnostics();
-  }
-
-  publishOfficialNavigationDiagnostics() {
-    if (!this.window) return;
-    const current = this.window.__GPTTalkEnhancerDebug ?? {};
-    this.window.__GPTTalkEnhancerDebug = {
-      ...current,
-      officialNavigationHistory: this.officialNavigationHistory.map((item) => JSON.parse(JSON.stringify(item))),
-      lastOfficialNavigation: this.officialNavigationHistory.length ? JSON.parse(JSON.stringify(this.officialNavigationHistory.at(-1))) : null,
-      officialNavigationMapping: this.officialNavigationMapping ? JSON.parse(JSON.stringify(this.officialNavigationMapping)) : null,
-      officialNavigationLearning: JSON.parse(JSON.stringify(this.officialNavigationLearning)),
-      officialNavigationSessionLearning: JSON.parse(JSON.stringify(this.officialNavigationSessionLearning)),
-      officialBridgeAuto: JSON.parse(JSON.stringify(this.officialBridgeAuto)),
-      officialBridgeSessionTrustedTargets: this.getOfficialBridgeSessionTrustedTargets(),
-      hostInternalDepthProbe: this.hostInternalDepthProbe ? JSON.parse(JSON.stringify(this.hostInternalDepthProbe)) : null,
-      l3RuntimeEnabled: L3_RUNTIME_ENABLED,
-      l3KeyJoinDryRun: createL3KeyJoinDryRunSummary(this.l3KeyJoinDryRun),
-      officialNavigationLearningHistory: this.officialNavigationLearningHistory.map((item) => ({ ...item }))
-    };
   }
 
   publishNavigationDiagnostics() {
@@ -6643,571 +8554,16 @@ class TalkEnhancerV3App {
     };
   }
 
-  getOfficialBridgeAutoSession(conversationId) {
-    if (!conversationId) return null;
-    let session = this.officialBridgeAutoSessions.get(conversationId);
-    if (!session) {
-      session = {
-        conversationId,
-        status: "auto-scanning",
-        stableScans: 0,
-        lastSignature: null,
-        pairsByTarget: new Map(),
-        knownTurnCount: 0,
-        retryAttempt: 0,
-        summary: sanitizeOfficialNavigationAutoSummary({ status: "auto-scanning" })
-      };
-      this.officialBridgeAutoSessions.set(conversationId, session);
-    }
-    return session;
-  }
-
-  clearHostInternalDepthProbeTimer() {
-    if (this.hostInternalDepthProbeTimer == null) return;
-    const clear = this.window?.clearTimeout ?? clearTimeout;
-    clear(this.hostInternalDepthProbeTimer);
-    this.hostInternalDepthProbeTimer = null;
-  }
-
-  getL3KeyJoinDryRunSession(conversationId) {
-    if (!conversationId) return null;
-    let session = this.l3KeyJoinDryRunSessions.get(conversationId);
-    if (!session) {
-      session = {
-        status: "idle",
-        stableScans: 0,
-        patternKey: null,
-        identityByTarget: new Map(),
-        knownTurnCount: 0,
-        pairsByTarget: new Map(),
-        adaptiveRescanState: "idle",
-        adaptiveRescanAttempt: 0,
-        summary: createL3KeyJoinDryRunSummary()
-      };
-      this.l3KeyJoinDryRunSessions.set(conversationId, session);
-    }
-    return session;
-  }
-
-  runL3ResearchScan({ targetOrder = null } = {}) {
-    if (this.isLocalWorkNavigationActive()) {
-      return createL3KeyJoinDryRunSummary({ status: "research-blocked-navigation" });
-    }
-    const conversationId = this.currentConversationId;
-    const index = conversationId ? this.getTurnIndex(conversationId) : null;
-    const identity = this.host.getConversationIdentity?.() ?? null;
-    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
-      const unavailable = createL3KeyJoinDryRunSummary({ status: "research-unavailable" });
-      this.l3KeyJoinDryRun = unavailable;
-      this.updateDebug("l3-research-unavailable");
-      return unavailable;
-    }
-    const session = this.getL3KeyJoinDryRunSession(conversationId);
-    const scan = collectL3ExactKeyJoinDryRunMap({
-      document: this.document,
-      turns: index.getOrdered?.() ?? [],
-      preferredPattern: session?.patternKey ?? null
-    });
-    const source = scan?.summary ?? {};
-    const target = Number.isInteger(targetOrder) && targetOrder >= 0 ? targetOrder : -1;
-    const result = createL3KeyJoinDryRunSummary({
-      status: "research-one-shot",
-      stableScans: session?.stableScans ?? 0,
-      mappedTurnCount: Number(source.mappedTurnCount) || 0,
-      coverage: Number(source.coverage) || 0,
-      conflicts: Number(source.conflicts) || 0,
-      exactPatternCount: Number(source.exactPatternCount) || 0,
-      mappingAgreement: Boolean(source.mappingAgreement),
-      ...createL3FreshDiagnostics(scan, target),
-      mappingStable: null,
-      adaptiveRescanState: "research-frozen",
-      adaptiveRescanAttempt: 0,
-      freshMapAccepted: false
-    });
-    this.l3KeyJoinDryRun = result;
-    this.updateDebug("l3-research-one-shot");
-    return result;
-  }
-  refreshL3KeyJoinDryRun({ conversationId, index, identity, finalAttempt = false } = {}) {
-    if (this.isLocalWorkNavigationActive()) return null;
-    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
-      this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary({ status: "unavailable" });
-      return null;
-    }
-    const session = this.getL3KeyJoinDryRunSession(conversationId);
-    const scan = collectL3ExactKeyJoinDryRunMap({
-      document: this.document,
-      turns: index.getOrdered?.() ?? [],
-      preferredPattern: session.patternKey
-    });
-    const summary = scan?.summary ?? {};
-    const exact = Boolean(
-      summary.oneToOne
-      && summary.coverage === 1
-      && Number(summary.conflicts) === 0
-      && scan?.patternKey
-      && scan?.identityByTarget instanceof Map
-      && scan.identityByTarget.size === Number(summary.knownTurnCount ?? 0)
-    );
-    if (exact) {
-      const sameIdentity = Boolean(
-        session.patternKey
-        && session.patternKey === scan.patternKey
-        && sameL3KeyJoinIdentityMap(session.identityByTarget, scan.identityByTarget)
-      );
-      session.stableScans = sameIdentity ? session.stableScans + 1 : 1;
-      session.patternKey = scan.patternKey;
-      session.identityByTarget = new Map(scan.identityByTarget);
-      session.knownTurnCount = Number(summary.knownTurnCount) || 0;
-      session.pairsByTarget = scan.pairsByTarget instanceof Map ? scan.pairsByTarget : new Map();
-      session.status = session.stableScans >= 2 ? "dry-run-ready" : (finalAttempt ? "dry-run-unstable" : "dry-run-scanning");
-    } else {
-      session.status = "dry-run-unavailable";
-      session.stableScans = 0;
-      session.patternKey = null;
-      session.identityByTarget = new Map();
-      session.knownTurnCount = Number(summary.knownTurnCount) || Number(index.size?.() ?? 0);
-      session.pairsByTarget = new Map();
-    }
-    session.summary = createL3KeyJoinDryRunSummary({
-      status: session.status,
-      stableScans: session.stableScans,
-      mappedTurnCount: Number(summary.mappedTurnCount) || 0,
-      coverage: Number(summary.coverage) || 0,
-      conflicts: Number(summary.conflicts) || 0,
-      exactPatternCount: Number(summary.exactPatternCount) || 0,
-      mappingAgreement: Boolean(summary.mappingAgreement)
-    });
-    this.l3KeyJoinDryRun = session.summary;
-    return session;
-  }
-
-  recordL3KeyJoinDryRunTarget({ targetOrder, index, identity } = {}) {
-    if (this.isLocalWorkNavigationActive()) return this.l3KeyJoinDryRun;
-    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return this.l3KeyJoinDryRun;
-    const conversationId = this.currentConversationId;
-    const session = conversationId ? this.l3KeyJoinDryRunSessions.get(conversationId) : null;
-    const currentScan = session?.patternKey ? collectL3ExactKeyJoinDryRunMap({
-      document: this.document,
-      turns: index.getOrdered?.() ?? [],
-      preferredPattern: session.patternKey
-    }) : null;
-    const currentSummary = currentScan?.summary ?? null;
-    const mappingStable = Boolean(
-      session
-      && session.status === "dry-run-ready"
-      && Number(session.knownTurnCount) === Number(index.size?.() ?? 0)
-      && currentSummary?.oneToOne
-      && Number(currentSummary?.conflicts) === 0
-      && currentScan?.patternKey === session.patternKey
-      && sameL3KeyJoinIdentityMap(session.identityByTarget, currentScan?.identityByTarget)
-    );
-    const exactCurrent = isL3ExactKeyJoinScan(currentScan, index);
-    let adaptiveRescanState = session?.adaptiveRescanState ?? "idle";
-    let freshMapAccepted = null;
-    if (session && exactCurrent) {
-      this.clearL3AdaptiveRescanTimer();
-      this.clearL3EventRecoveryWatch();
-      if (!mappingStable) {
-        adoptL3ExactKeyJoinScan(session, currentScan);
-        adaptiveRescanState = "accepted-current";
-        freshMapAccepted = true;
-      } else {
-        adaptiveRescanState = "stable";
-        freshMapAccepted = false;
-      }
-      session.adaptiveRescanState = adaptiveRescanState;
-      session.adaptiveRescanAttempt = 0;
-    } else if (session && currentScan) {
-      this.clearL3AdaptiveRescanTimer();
-      this.clearL3EventRecoveryWatch();
-      adaptiveRescanState = "pending";
-      freshMapAccepted = false;
-      session.adaptiveRescanState = adaptiveRescanState;
-      session.adaptiveRescanAttempt = 0;
-    }
-    const summary = createL3KeyJoinDryRunSummary({
-      ...(session?.summary ?? this.l3KeyJoinDryRun),
-      status: session?.status ?? this.l3KeyJoinDryRun?.status,
-      stableScans: session?.stableScans ?? this.l3KeyJoinDryRun?.stableScans,
-      ...createL3FreshDiagnostics(currentScan, targetOrder),
-      mappingStable,
-      adaptiveRescanState,
-      adaptiveRescanAttempt: session?.adaptiveRescanAttempt ?? 0,
-      freshMapAccepted
-    });
-    this.l3KeyJoinDryRun = summary;
-    if (session) session.summary = summary;
-    this.updateDebug("l3-key-join-dry-run-target");
-    if (session && currentScan && !exactCurrent && conversationId) {
-      this.scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt: 0 });
-    }
-    return summary;
-  }
-
-  clearL3AdaptiveRescanTimer() {
-    this.l3AdaptiveRescanGeneration += 1;
-    if (this.l3AdaptiveRescanTimer == null) return;
-    const clear = this.window?.clearTimeout ?? clearTimeout;
-    clear(this.l3AdaptiveRescanTimer);
-    this.l3AdaptiveRescanTimer = null;
-  }
-
-  scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt = 0 } = {}) {
-    if (this.isLocalWorkNavigationActive()) return;
-    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0 || attempt >= L3_ADAPTIVE_RESCAN_DELAYS_MS.length) return;
-    const session = this.l3KeyJoinDryRunSessions.get(conversationId);
-    if (!session?.patternKey) return;
-    const generation = this.l3AdaptiveRescanGeneration;
-    const delayMs = L3_ADAPTIVE_RESCAN_DELAYS_MS[attempt];
-    const set = this.window?.setTimeout ?? setTimeout;
-    this.l3AdaptiveRescanTimer = set(() => {
-      this.l3AdaptiveRescanTimer = null;
-      if (this.destroyed || generation !== this.l3AdaptiveRescanGeneration || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
-      const index = this.getTurnIndex(conversationId);
-      const identity = this.host.getConversationIdentity?.() ?? null;
-      if (!index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
-      const scan = collectL3ExactKeyJoinDryRunMap({
-        document: this.document,
-        turns: index.getOrdered?.() ?? [],
-        preferredPattern: session.patternKey
-      });
-      session.adaptiveRescanAttempt = attempt + 1;
-      const exact = isL3ExactKeyJoinScan(scan, index);
-      let state = "pending";
-      let freshMapAccepted = false;
-      if (exact) {
-        adoptL3ExactKeyJoinScan(session, scan);
-        this.clearL3EventRecoveryWatch();
-        state = "recovered";
-        freshMapAccepted = true;
-      } else if (attempt + 1 >= L3_ADAPTIVE_RESCAN_DELAYS_MS.length) {
-        state = "exhausted-watching";
-      }
-      session.adaptiveRescanState = state;
-      session.summary = createL3KeyJoinDryRunSummary({
-        ...(session.summary ?? this.l3KeyJoinDryRun),
-        status: session.status,
-        stableScans: session.stableScans,
-        ...createL3FreshDiagnostics(scan, targetOrder),
-        mappingStable: false,
-        adaptiveRescanState: state,
-        adaptiveRescanAttempt: session.adaptiveRescanAttempt,
-        freshMapAccepted
-      });
-      this.l3KeyJoinDryRun = session.summary;
-      this.updateDebug("l3-key-join-adaptive-rescan");
-      if (!exact && state === "pending") this.scheduleL3AdaptiveRescan({ conversationId, targetOrder, attempt: attempt + 1 });
-      if (!exact && state === "exhausted-watching") this.startL3EventRecoveryWatch({ conversationId, targetOrder });
-    }, delayMs);
-  }
-
-  clearL3EventRecoveryTimer() {
-    if (this.l3EventRecoveryTimer == null) return;
-    const clear = this.window?.clearTimeout ?? clearTimeout;
-    clear(this.l3EventRecoveryTimer);
-    this.l3EventRecoveryTimer = null;
-  }
-
-  clearL3EventRecoveryWatch() {
-    this.clearL3EventRecoveryTimer();
-    this.l3EventRecoveryWatch = null;
-  }
-
-  startL3EventRecoveryWatch({ conversationId, targetOrder } = {}) {
-    this.clearL3EventRecoveryWatch();
-    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
-    const session = this.l3KeyJoinDryRunSessions.get(conversationId);
-    if (!session?.patternKey) return;
-    this.l3EventRecoveryWatch = { conversationId, targetOrder };
-  }
-
-  handleL3EventRecoveryMutation(records = []) {
-    const watch = this.l3EventRecoveryWatch;
-    if (!watch || this.isLocalWorkNavigationActive() || this.l3EventRecoveryTimer != null) return;
-    if (!Array.from(records ?? []).length) return;
-    if (this.currentConversationId !== watch.conversationId) {
-      this.clearL3EventRecoveryWatch();
-      return;
-    }
-    const set = this.window?.setTimeout ?? setTimeout;
-    this.l3EventRecoveryTimer = set(() => {
-      this.l3EventRecoveryTimer = null;
-      const currentWatch = this.l3EventRecoveryWatch;
-      if (this.destroyed || !currentWatch || currentWatch.conversationId !== watch.conversationId || this.currentConversationId !== watch.conversationId || this.isLocalWorkNavigationActive()) return;
-      const index = this.getTurnIndex(watch.conversationId);
-      const identity = this.host.getConversationIdentity?.() ?? null;
-      const session = this.l3KeyJoinDryRunSessions.get(watch.conversationId);
-      if (!index || !session?.patternKey || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
-        this.clearL3EventRecoveryWatch();
-        return;
-      }
-      const scan = collectL3ExactKeyJoinDryRunMap({
-        document: this.document,
-        turns: index.getOrdered?.() ?? [],
-        preferredPattern: session.patternKey
-      });
-      const exact = isL3ExactKeyJoinScan(scan, index);
-      let state = "exhausted-watching";
-      let freshMapAccepted = false;
-      if (exact) {
-        adoptL3ExactKeyJoinScan(session, scan);
-        state = "recovered-event";
-        freshMapAccepted = true;
-      }
-      session.adaptiveRescanState = state;
-      session.summary = createL3KeyJoinDryRunSummary({
-        ...(session.summary ?? this.l3KeyJoinDryRun),
-        status: session.status,
-        stableScans: session.stableScans,
-        ...createL3FreshDiagnostics(scan, watch.targetOrder),
-        mappingStable: false,
-        adaptiveRescanState: state,
-        adaptiveRescanAttempt: session.adaptiveRescanAttempt,
-        freshMapAccepted
-      });
-      this.l3KeyJoinDryRun = session.summary;
-      this.updateDebug("l3-key-join-event-recovery");
-      if (exact) this.clearL3EventRecoveryWatch();
-    }, L3_EVENT_RECOVERY_DEBOUNCE_MS);
-    this.l3EventRecoveryTimer?.unref?.();
-  }
-
-  isLocalWorkNavigationActive() {
-    return Boolean(this.activeNavigation?.status === "running"
-      && this.activeNavigation?.host === "local"
-      && this.activeNavigation?.source === "sidebar-local");
-  }
-
-  clearL3PostNavigationScanTimer() {
-    if (this.l3PostNavigationScanTimer == null) return;
-    const clear = this.window?.clearTimeout ?? clearTimeout;
-    clear(this.l3PostNavigationScanTimer);
-    this.l3PostNavigationScanTimer = null;
-  }
-
-  scheduleL3PostNavigationScan({ conversationId, targetOrder, requestId } = {}) {
-    this.clearL3PostNavigationScanTimer();
-    if (!conversationId || !Number.isInteger(targetOrder) || targetOrder < 0) return;
-    const set = this.window?.setTimeout ?? setTimeout;
-    this.l3PostNavigationScanTimer = set(() => {
-      this.l3PostNavigationScanTimer = null;
-      if (this.destroyed || requestId !== this.navigationRequestId || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
-      const index = this.getTurnIndex(conversationId);
-      const identity = this.host.getConversationIdentity?.() ?? null;
-      if (!index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
-      this.recordL3KeyJoinDryRunTarget({ targetOrder, index, identity });
-    }, L3_POST_NAVIGATION_SCAN_DELAY_MS);
-    this.l3PostNavigationScanTimer?.unref?.();
-  }
-
-  scheduleHostInternalDepthProbe(conversationId, index, identity) {
-    if (this.isLocalWorkNavigationActive()) return;
-    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return;
-    const existing = this.hostInternalDepthProbeByConversation.get(conversationId);
-    const drySession = this.l3KeyJoinDryRunSessions.get(conversationId) ?? null;
-    if (existing) {
-      this.hostInternalDepthProbe = existing;
-      if (!drySession || drySession.status !== "dry-run-scanning") {
-        if (drySession?.summary) this.l3KeyJoinDryRun = drySession.summary;
-        return;
-      }
-    }
-    if (this.hostInternalDepthProbeTimer != null) return;
-    const attempts = Number(this.hostInternalDepthProbeAttempts.get(conversationId) ?? 0);
-    const delays = [180, 420, 900, 1600, 2600];
-    const delayMs = delays[Math.min(attempts, delays.length - 1)];
-    const set = this.window?.setTimeout ?? setTimeout;
-    this.hostInternalDepthProbeTimer = set(() => {
-      this.hostInternalDepthProbeTimer = null;
-      if (this.destroyed || this.currentConversationId !== conversationId || this.isLocalWorkNavigationActive()) return;
-      const currentIdentity = this.host.getConversationIdentity?.() ?? null;
-      if (!currentIdentity?.stable || currentIdentity.host !== "local" || currentIdentity.source !== "sidebar-local") return;
-      const currentIndex = this.getTurnIndex(conversationId);
-      const attempt = attempts + 1;
-      this.hostInternalDepthProbeAttempts.set(conversationId, attempt);
-      try {
-        const result = collectHostInternalDepthProbe({ window: this.window, document: this.document, host: this.host, turns: currentIndex?.getOrdered?.() ?? [] });
-        const markerCount = Number(result?.level0?.officialMarkerCount ?? 0);
-        const markerComplete = markerCount > 0 || attempt >= delays.length;
-        const dryRunSession = markerCount > 0 ? this.refreshL3KeyJoinDryRun({ conversationId, index: currentIndex, identity: currentIdentity, finalAttempt: attempt >= delays.length }) : null;
-        const dryRunNeedsRetry = dryRunSession?.status === "dry-run-scanning";
-        this.hostInternalDepthProbe = { ...result, markerProbeAttempt: attempt, markerProbeComplete: markerComplete };
-        if (markerComplete) this.hostInternalDepthProbeByConversation.set(conversationId, this.hostInternalDepthProbe);
-        this.updateDebug("host-internal-depth-probe");
-        if (!markerComplete || dryRunNeedsRetry) this.scheduleHostInternalDepthProbe(conversationId, currentIndex, currentIdentity);
-      } catch (error) {
-        this.hostInternalDepthProbe = { error: String(error?.message ?? error ?? "unknown"), markerProbeAttempt: attempt, markerProbeComplete: true };
-        this.hostInternalDepthProbeByConversation.set(conversationId, this.hostInternalDepthProbe);
-        this.l3KeyJoinDryRun = createL3KeyJoinDryRunSummary({ status: "error" });
-        this.updateDebug("host-internal-depth-probe-error");
-      }
-    }, delayMs);
-    this.hostInternalDepthProbeTimer?.unref?.();
-  }
-
-  clearOfficialBridgeAutoTimer() {
-    if (this.officialBridgeAutoTimer == null) return;
-    const clear = this.window?.clearTimeout ?? clearTimeout;
-    clear(this.officialBridgeAutoTimer);
-    this.officialBridgeAutoTimer = null;
-  }
-
-  scheduleOfficialBridgeAutoRetry(conversationId, session) {
-    if (!conversationId || !session || session.status === "auto-official-ready" || this.officialBridgeAutoTimer != null) return;
-    const attempt = Number(session.retryAttempt) || 0;
-    if (attempt >= OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS.length) return;
-    const delayMs = OFFICIAL_BRIDGE_AUTO_RETRY_DELAYS_MS[attempt];
-    session.retryAttempt = attempt + 1;
-    const set = this.window?.setTimeout ?? setTimeout;
-    this.officialBridgeAutoTimer = set(() => {
-      this.officialBridgeAutoTimer = null;
-      if (this.destroyed || this.currentConversationId !== conversationId) return;
-      this.refresh("official-bridge-auto-scan");
-    }, delayMs);
-  }
-
-  refreshOfficialWorkAutoBridge({ conversationId, index, identity }) {
-    if (!conversationId || !index || !identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") {
-      if (conversationId === this.currentConversationId) this.officialBridgeAuto = sanitizeOfficialNavigationAutoSummary({ status: "fallback-self", recommendedMode: "fallback-self" });
-      return this.officialBridgeAuto;
-    }
-    const session = this.getOfficialBridgeAutoSession(conversationId);
-    const scan = analyzeOfficialNavigationAutoMap({
-      document: this.document,
-      turns: index.getOrdered?.() ?? [],
-      resolveMarkerKey: (markerKey) => this.host.resolveOfficialNavigationMarkerKey?.(markerKey) ?? null,
-      minCoverage: 0.8
-    });
-    const signature = scan.summary.readyCandidate ? officialAutoMapSignature(scan.privatePairs) : "";
-    if (scan.summary.readyCandidate && signature) {
-      session.stableScans = session.lastSignature === signature ? session.stableScans + 1 : 1;
-      session.lastSignature = signature;
-      session.knownTurnCount = scan.summary.knownTurnCount;
-      if (session.stableScans >= 2) {
-        session.status = "auto-official-ready";
-        session.pairsByTarget = new Map(scan.privatePairs.map((pair) => [pair.targetOrder, { markerKey: pair.markerKey, strategies: pair.strategies }]));
-        this.clearOfficialBridgeAutoTimer();
-      } else {
-        session.status = "auto-scanning";
-      }
-    } else {
-      session.status = "fallback-self";
-      session.stableScans = 0;
-      session.lastSignature = null;
-      session.pairsByTarget = new Map();
-      session.knownTurnCount = scan.summary.knownTurnCount;
-    }
-    session.summary = sanitizeOfficialNavigationAutoSummary({
-      ...scan.summary,
-      status: session.status,
-      stableScans: session.stableScans,
-      recommendedMode: session.status === "auto-official-ready" ? "auto-official-ready" : session.status === "auto-scanning" ? "auto-scanning" : "fallback-self"
-    });
-    this.officialBridgeAuto = session.summary;
-    this.scheduleOfficialBridgeAutoRetry(conversationId, session);
-    return session.summary;
-  }
-
-  getOfficialAutoBridgePair({ targetOrder, index }) {
-    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index || !this.currentConversationId) return null;
-    const session = this.officialBridgeAutoSessions.get(this.currentConversationId);
-    if (!session || session.status !== "auto-official-ready" || Number(session.knownTurnCount) !== Number(index.size?.() ?? 0)) return null;
-    const pair = session.pairsByTarget.get(targetOrder);
-    if (!pair?.markerKey) return null;
-    const buttons = Array.from(this.document?.querySelectorAll?.('[data-thread-user-message-navigation-item-id]') ?? []);
-    const matches = buttons.filter((button) => String(button?.getAttribute?.('data-thread-user-message-navigation-item-id') ?? '').trim() === pair.markerKey);
-    if (matches.length !== 1) return null;
-    return { marker: matches[0], targetOrder, strategies: [...(pair.strategies ?? [])] };
-  }
-
-  getOfficialBridgeSessionTrustedTargets() {
-    const session = this.currentConversationId ? this.officialBridgeAutoSessions.get(this.currentConversationId) : null;
-    if (!session || session.status !== "auto-official-ready") return [];
-    return [...session.pairsByTarget.entries()]
-      .map(([targetOrder, pair]) => ({ targetOrder: Number(targetOrder), trusted: true, source: "auto", strategies: [...(pair?.strategies ?? [])] }))
-      .sort((a, b) => a.targetOrder - b.targetOrder);
-  }
-
-  getOfficialBridgeActiveOrder(index) {
-    if (!index) return null;
-    const activeTurnId = index.resolveCanonicalId?.(this.host.getActiveTurnId?.());
-    const activeRecord = activeTurnId ? index.get?.(activeTurnId) : null;
-    return Number.isFinite(activeRecord?.order) ? Number(activeRecord.order) : null;
-  }
-
-  hasTrustedOfficialWorkBridgeCandidate({ targetOrder, index, identity }) {
-    if (!OFFICIAL_NAVIGATION_RUNTIME_ENABLED) return false;
-    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return false;
-    return Boolean(this.getOfficialAutoBridgePair({ targetOrder, index }));
-  }
-
-  async tryOfficialWorkBridge({ targetOrder, index, identity, isCurrent }) {
-    if (!identity?.stable || identity.host !== "local" || identity.source !== "sidebar-local") return { attempted: false, fallbackReason: "not-local-work" };
-    if (!Number.isInteger(targetOrder) || targetOrder < 0 || !index) return { attempted: false, fallbackReason: "invalid-target" };
-    const pair = this.getOfficialAutoBridgePair({ targetOrder, index });
-    if (!pair) return { attempted: false, fallbackReason: "auto-bridge-unavailable" };
-    const marker = pair.marker;
-    if (!marker || typeof marker.click !== "function") return { attempted: false, fallbackReason: "marker-unavailable" };
-
-    const startedAt = appNowMs(this.window);
-    let firstMatchedAt = null;
-    try {
-      this.officialBridgeInFlight = true;
-      marker.click();
-    } catch {
-      return { attempted: true, succeeded: false, fallbackReason: "marker-click-failed", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
-    } finally {
-      this.officialBridgeInFlight = false;
-    }
-
-    while (appNowMs(this.window) - startedAt <= 650) {
-      if (!isCurrent?.()) return { attempted: true, succeeded: false, fallbackReason: "superseded", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
-      const activeOrder = this.getOfficialBridgeActiveOrder(index);
-      const now = appNowMs(this.window);
-      if (activeOrder === targetOrder) {
-        if (firstMatchedAt == null) firstMatchedAt = now;
-        if (now - firstMatchedAt >= 80) {
-          this.host.persistLocalScrollPosition?.();
-          return {
-            attempted: true,
-            succeeded: true,
-            fallbackReason: null,
-            elapsedMs: Math.round(now - startedAt),
-            result: {
-              ok: true,
-              verified: true,
-              reason: "official-bridge",
-              settleMode: "official-bridge",
-              officialBridgeAttempted: true,
-              officialBridgeSucceeded: true,
-              officialBridgeFallbackReason: null,
-              steps: [{ mode: "official-bridge", direction: 0, elapsedMs: Math.round(now - startedAt), jumpPx: 0, waitMs: 0, targetOrder, progressKind: "target", before: null, after: null }]
-            }
-          };
-        }
-      } else {
-        firstMatchedAt = null;
-      }
-      await waitMs(this.window, 24);
-    }
-    return { attempted: true, succeeded: false, fallbackReason: "verify-timeout", elapsedMs: Math.round(appNowMs(this.window) - startedAt) };
-  }
-
   async navigate(turnId) {
     const conversationId = this.currentConversationId;
     const index = conversationId ? this.getTurnIndex(conversationId) : null;
     if (!index) return { ok: false, reason: "no-conversation" };
     const record = index.get(turnId);
     const targetOrder = Number.isFinite(record?.order) ? Number(record.order) : null;
+    this.cancelWorkEarlierHydration();
+    this.cancelChatEarlierHydration();
     const requestId = ++this.navigationRequestId;
     const identity = this.host.getConversationIdentity?.() ?? null;
-    const localWorkNavigation = Boolean(identity?.stable && identity.host === "local" && identity.source === "sidebar-local");
-    if (localWorkNavigation) {
-      this.clearL3AdaptiveRescanTimer();
-      this.clearL3PostNavigationScanTimer();
-      this.clearL3EventRecoveryWatch();
-    }
     const navigationRun = this.beginNavigationRun({ targetOrder, identity });
     this.clearNavigationUxTimer();
     this.setNavigationUx({ state: "pending", target: turnId, targetOrder, pendingVisible: false }, "navigate-start");
@@ -7223,7 +8579,6 @@ class TalkEnhancerV3App {
       && requestId === this.navigationRequestId
       && conversationId === this.currentConversationId
       && conversationId === this.host.getConversationId?.();
-    if (localWorkNavigation) this.host.notifyNavigationIntent?.();
     if (identity?.host === "local") {
       const remainingSettleMs = Math.max(0, this.localNavigationSettleUntil - appNowMs(this.window));
       if (remainingSettleMs > 0) {
@@ -7235,28 +8590,14 @@ class TalkEnhancerV3App {
         }
       }
     }
-    const bridge = { attempted: false, succeeded: false, fallbackReason: null, elapsedMs: 0 };
-    if (!isCurrent()) {
-      const superseded = { ok: false, target: turnId, verified: false, reason: "superseded", officialBridgeAttempted: Boolean(bridge.attempted), officialBridgeSucceeded: false, officialBridgeFallbackReason: bridge.fallbackReason ?? "superseded" };
-      this.completeNavigationRun(navigationRun, superseded);
-      return superseded;
-    }
-
     const allowMountedFastSettle = Boolean(identity?.stable && (identity.host === "chatgpt" || identity.host === "local"));
-    const cacheRestoredTurns = Number(this.cacheHydrationCounts.get(conversationId) ?? 0);
-    const knownTurns = Number(index.size?.() ?? 0);
-    const allowChatPredictiveFastPath = Boolean(
-      identity?.stable
-      && identity.host === "chatgpt"
-      && knownTurns >= 20
-      && cacheRestoredTurns >= Math.max(20, Math.ceil(knownTurns * 0.8))
-    );
-    let result = await this.host.navigateToTurn(turnId, {
+    const localWorkNavigation = Boolean(identity?.stable && identity.host === "local" && identity.source === "sidebar-local");
+    if (localWorkNavigation) this.host.notifyNavigationIntent?.();
+    const result = await this.host.navigateToTurn(turnId, {
       turns: index.getOrdered(),
       getTurns: () => index.getOrdered(),
       isCurrent,
       allowMountedFastSettle,
-      allowChatPredictiveFastPath,
       onTraceStep: (entry, steps) => this.recordNavigationStep(navigationRun, entry, steps)
     });
     if (requestId !== this.navigationRequestId) {
@@ -7286,12 +8627,6 @@ class TalkEnhancerV3App {
       domId: result?.domId ?? null,
       settleChecks: Number.isFinite(result?.settleChecks) ? result.settleChecks : null,
       settleMode: result?.settleMode ?? null,
-      fastAttempted: Boolean(result?.fastAttempted),
-      fastSucceeded: Boolean(result?.fastSucceeded),
-      fallbackReason: result?.fallbackReason ?? null,
-      officialBridgeAttempted: Boolean(result?.officialBridgeAttempted),
-      officialBridgeSucceeded: Boolean(result?.officialBridgeSucceeded),
-      officialBridgeFallbackReason: result?.officialBridgeFallbackReason ?? null,
       steps: Array.isArray(result?.steps) ? result.steps : [],
       targetOrder: latestTargetOrder
     };
@@ -7306,10 +8641,227 @@ class TalkEnhancerV3App {
       this.shell.showToast(`未能定位 ${label}，请再试一次`);
     }
     this.refresh("navigate-result");
-    if (L3_RUNTIME_ENABLED && localWorkNavigation && result?.ok && result?.verified && result?.reason !== "superseded") {
-      this.scheduleL3PostNavigationScan({ conversationId, targetOrder: latestTargetOrder, requestId });
+    const earliestKnownRecord = index.getOrdered?.()?.[0] ?? null;
+    const earliestKnownOrder = Number.isFinite(earliestKnownRecord?.order) ? Number(earliestKnownRecord.order) : null;
+    const explicitWorkEarlierIntent = Boolean(localWorkNavigation
+      && result?.ok
+      && result?.verified
+      && Number.isFinite(latestTargetOrder)
+      && Number.isFinite(earliestKnownOrder)
+      && latestTargetOrder === earliestKnownOrder);
+    if (explicitWorkEarlierIntent) {
+      this.maybeStartWorkEarlierHydration({ conversationId, index, identity, explicit: true, stopAfterBatch: true });
     }
     return result;
+  }
+
+  armPinnedChatProbe() {
+    this.stopPinnedChatProbe();
+    const baseline = this.host.getConversationIdentity?.() ?? null;
+    const baselineId = baseline?.id ?? null;
+    this.pinnedChatProbeBaselineId = baselineId;
+    const baselineRoute = String(this.host.getRoute?.() ?? this.window?.location?.href ?? "");
+    this.pinnedChatProbeBaselineRoute = baselineRoute;
+    const baselineRouteShape = sanitizeProbeHref(baselineRoute);
+    this.pinnedChatProbeArmed = true;
+    this.pinnedChatProbe = {
+      state: "armed",
+      captured: false,
+      eventCaptured: false,
+      transitionObserved: false,
+      baseline: {
+        identity: sanitizeProbeIdentity(baseline, baselineId),
+        routeShape: baselineRouteShape
+      },
+      eventType: null,
+      pathSource: null,
+      selectorMatches: null,
+      ancestry: [],
+      identityTimeline: [],
+      activeElementTimeline: [],
+      domMutations: []
+    };
+    const MutationObserverCtor = this.window?.MutationObserver;
+    if (typeof MutationObserverCtor === "function" && this.document?.body) {
+      try {
+        this.pinnedChatProbeObserver = new MutationObserverCtor((records = []) => {
+          const probe = this.pinnedChatProbe;
+          if (!this.pinnedChatProbeArmed || !probe) return;
+          for (const record of Array.from(records).slice(0, 20)) {
+            if (probe.domMutations.length >= 80) break;
+            probe.domMutations.push({
+              type: String(record?.type ?? "unknown"),
+              attributeName: record?.attributeName ? String(record.attributeName) : null,
+              target: sanitizeProbePath(probeParentChain(record?.target, 4), 4),
+              added: Array.from(record?.addedNodes ?? []).slice(0, 3).map((node) => sanitizeProbeNode(node))
+            });
+          }
+        });
+        this.pinnedChatProbeObserver.observe(this.document.body, { subtree: true, childList: true, attributes: true });
+      } catch {
+        this.pinnedChatProbeObserver = null;
+      }
+    }
+    for (const delayMs of [0, 80, 250, 600, 1200, 1800]) {
+      const set = this.window?.setTimeout ?? setTimeout;
+      const timer = set(() => this.samplePinnedChatProbe(delayMs), delayMs);
+      this.pinnedChatProbeTimers.push(timer);
+    }
+    this.updateDebug("pinned-chat-probe-armed");
+    return { armed: true };
+  }
+
+  samplePinnedChatProbe(afterMs = 0) {
+    const probe = this.pinnedChatProbe;
+    if (!this.pinnedChatProbeArmed || !probe) return false;
+    const identity = this.host.getConversationIdentity?.() ?? null;
+    const rawRoute = String(this.host.getRoute?.() ?? this.window?.location?.href ?? "");
+    const routeShape = sanitizeProbeHref(rawRoute);
+    const identityState = sanitizeProbeIdentity(identity, this.pinnedChatProbeBaselineId);
+    const routeChanged = Boolean(this.pinnedChatProbeBaselineRoute != null && rawRoute !== this.pinnedChatProbeBaselineRoute);
+    const identityChanged = identityState.idState === "changed";
+    probe.identityTimeline.push({ afterMs, ...identityState, routeShape, routeChanged });
+    probe.activeElementTimeline.push({
+      afterMs,
+      ancestry: sanitizeProbePath(probeParentChain(this.document?.activeElement, 6), 6)
+    });
+    if (identityChanged || routeChanged) {
+      probe.captured = true;
+      probe.transitionObserved = true;
+      probe.state = "transition-observed";
+    }
+    if (Number(afterMs) >= 1800) {
+      probe.state = probe.transitionObserved ? "completed-transition" : probe.eventCaptured ? "completed-event-only" : "completed-no-transition";
+      this.pinnedChatProbeArmed = false;
+      this.pinnedChatProbeObserver?.disconnect?.();
+      this.pinnedChatProbeObserver = null;
+      this.pinnedChatProbeBaselineId = null;
+      this.pinnedChatProbeBaselineRoute = null;
+    }
+    this.updateDebug("pinned-chat-probe-sample");
+    return true;
+  }
+
+  capturePinnedChatProbe(event) {
+    if (!this.pinnedChatProbeArmed || !this.pinnedChatProbe || this.pinnedChatProbe.eventCaptured) return false;
+    const target = event?.target ?? null;
+    const composedPath = typeof event?.composedPath === "function"
+      ? event.composedPath().filter(Boolean)
+      : [];
+    const pathNodes = composedPath.length ? composedPath : probeParentChain(target);
+    const probe = this.pinnedChatProbe;
+    probe.captured = true;
+    probe.eventCaptured = true;
+    probe.eventType = String(event?.type ?? "unknown");
+    probe.pathSource = composedPath.length ? "composedPath" : "parent-chain";
+    probe.selectorMatches = {
+      knownChatKey: Boolean(findProbePathMatch(pathNodes, "[data-sidebar-chatgpt-conversation-key]")),
+      knownWorkThread: Boolean(findProbePathMatch(pathNodes, "[data-app-action-sidebar-thread-id]")),
+      anchor: Boolean(findProbePathMatch(pathNodes, "a[href]"))
+    };
+    probe.ancestry = sanitizeProbePath(pathNodes);
+    probe.state = probe.transitionObserved ? "transition-observed" : "event-captured";
+    this.updateDebug("pinned-chat-probe-event");
+    return true;
+  }
+
+  stopPinnedChatProbe() {
+    this.pinnedChatProbeArmed = false;
+    this.pinnedChatProbeObserver?.disconnect?.();
+    this.pinnedChatProbeObserver = null;
+    this.pinnedChatProbeBaselineId = null;
+    this.pinnedChatProbeBaselineRoute = null;
+    const clear = this.window?.clearTimeout ?? clearTimeout;
+    for (const timer of this.pinnedChatProbeTimers ?? []) clear(timer);
+    this.pinnedChatProbeTimers = [];
+  }
+
+  capturePinnedChatState() {
+    const hostIdentity = this.host.getConversationIdentity?.() ?? null;
+    const directIdentity = this.host.getDirectConversationIdentity?.() ?? null;
+    const hostConversationId = this.host.getConversationId?.() ?? null;
+    const internalConversationId = this.currentConversationId ?? null;
+    const index = internalConversationId ? this.turnIndexes.get(internalConversationId) ?? null : null;
+    const visibleTurns = Array.isArray(this.host.getVisibleTurns?.()) ? this.host.getVisibleTurns() : [];
+    const chatVisibleTurns = Array.isArray(this.host.getChatVisibleTurns?.()) ? this.host.getChatVisibleTurns() : [];
+    const knownTurns = index?.getOrdered?.() ?? [];
+    const shellStatus = this.shell?.getStatus?.() ?? {};
+    const selectedRows = Array.from(this.document?.querySelectorAll?.("[data-sidebar-chatgpt-conversation-key]") ?? []);
+    const selectedCandidates = selectedRows.filter((row) => row?.getAttribute?.("aria-current") === "page" || Boolean(row?.querySelector?.("[aria-current='page']")));
+    const selectedParsed = selectedCandidates.map((row) => parseSidebarConversationKey(row?.getAttribute?.("data-sidebar-chatgpt-conversation-key"))).filter(Boolean);
+    const explicitNodes = Array.from(this.document?.querySelectorAll?.("[data-conversation-id], [data-thread-id]") ?? []);
+    const pinnedCandidates = this.getPinnedChatCandidates();
+    const memoryIds = new Set([...this.turnIndexes.keys()].filter((id) => id && !String(id).startsWith("local:")));
+    const cacheIds = new Set((this.chatTimelineCache.listConversations?.() ?? []).map((entry) => String(entry?.conversationId ?? "")).filter(Boolean));
+    const pinnedCandidateDiagnostics = diagnosePinnedChatCandidates(this.host.getChatVisibleTurns?.() ?? visibleTurns, pinnedCandidates, { memoryIds, cacheIds });
+    const summarizeOrders = (turns) => {
+      const orders = turns.map((turn) => Number(turn?.order)).filter(Number.isFinite).sort((a, b) => a - b);
+      return { count: turns.length, orderedCount: orders.length, min: orders.length ? orders[0] : null, max: orders.length ? orders.at(-1) : null };
+    };
+    const idModeCounts = (turns) => {
+      const counts = { fallback: 0, uuidLike: 0, other: 0 };
+      for (const turn of turns) {
+        const id = String(turn?.id ?? "");
+        if (/^(?:fallback-turn|turn-index)-\d+$/.test(id)) counts.fallback += 1;
+        else if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(id)) counts.uuidLike += 1;
+        else counts.other += 1;
+      }
+      return counts;
+    };
+    const selectedRelation = !hostConversationId || !selectedParsed.length
+      ? "unavailable"
+      : selectedParsed.some((value) => value === hostConversationId) ? "matches-host" : "differs-from-host";
+    const internalRelation = !hostConversationId || !internalConversationId
+      ? "unavailable"
+      : hostConversationId === internalConversationId ? "matches-host" : "differs-from-host";
+    const snapshot = {
+      surface: this.host.getSurface?.() ?? null,
+      routeShape: sanitizeProbeHref(this.host.getRoute?.() ?? this.window?.location?.href ?? ""),
+      hostIdentity: hostIdentity ? { present: true, host: hostIdentity.host ?? null, source: hostIdentity.source ?? null, kind: hostIdentity.kind ?? null, stable: Boolean(hostIdentity.stable), idShape: probeValueShape(hostIdentity.id ?? "") } : { present: false },
+      directIdentity: directIdentity ? { present: true, host: directIdentity.host ?? null, source: directIdentity.source ?? null, kind: directIdentity.kind ?? null, stable: Boolean(directIdentity.stable), idShape: probeValueShape(directIdentity.id ?? "") } : { present: false },
+      inferredConversationSet: Boolean(this.lastPinnedChatInference?.inferredConversationSet),
+      inferenceResult: this.lastPinnedChatInference?.result ?? null,
+      inferenceEvidence: this.lastPinnedChatInference?.evidence ?? null,
+      pinnedClickTransition: this.lastPinnedClickTransition ? { ...this.lastPinnedClickTransition } : null,
+      pinnedIdentityLatched: Boolean(this.activePinnedChatConversationId),
+      refreshResolvedIdentity: this.lastRefreshDiagnostics?.resolvedIdentity ?? { present: false },
+      refreshBranch: this.lastRefreshDiagnostics?.branch ?? null,
+      refreshCounts: {
+        chatVisibleTurns: Number(this.lastRefreshDiagnostics?.chatVisibleTurnsCount ?? 0),
+        routedVisibleTurns: Number(this.lastRefreshDiagnostics?.routedVisibleTurnsCount ?? 0),
+        preReconcileIndex: Number(this.lastRefreshDiagnostics?.preReconcileIndexCount ?? 0),
+        trustedVisibleTurns: Number(this.lastRefreshDiagnostics?.trustedVisibleTurnsCount ?? 0),
+        postRefreshIndex: Number(this.lastRefreshDiagnostics?.postRefreshIndexCount ?? 0)
+      },
+      reconcileDiagnostics: this.lastRefreshDiagnostics?.chatReconcile
+        ? JSON.parse(JSON.stringify(this.lastRefreshDiagnostics.chatReconcile))
+        : null,
+      internalConversation: { present: Boolean(internalConversationId), relationToHost: internalRelation, idShape: internalConversationId ? probeValueShape(internalConversationId) : "none" },
+      selectedChatRows: { total: selectedRows.length, selected: selectedCandidates.length, relationToHost: selectedRelation, keyShapes: selectedParsed.map(probeValueShape) },
+      explicitConversationNodes: { count: explicitNodes.length },
+      visibleTurns: { ...summarizeOrders(visibleTurns), idModes: idModeCounts(visibleTurns) },
+      chatVisibleTurns: { ...summarizeOrders(chatVisibleTurns), idModes: idModeCounts(chatVisibleTurns) },
+      timelineIndex: { ...summarizeOrders(knownTurns), idModes: idModeCounts(knownTurns), cacheRestoredTurns: this.cacheHydrationCounts.get(internalConversationId) ?? 0 },
+      visibleContent: Boolean(this.host?.conversation?.hasVisibleConversationContent?.()),
+      stableConversationRoot: Boolean(this.host?.conversation?.getStableConversationRoot?.()),
+      shell: {
+        timelineMounted: Boolean(shellStatus.timelineMounted),
+        timelineHidden: Boolean(shellStatus.timelineHidden),
+        timelineMarkerCount: Number(shellStatus.timelineMarkerCount ?? 0),
+        questionPanelOpen: Boolean(shellStatus.questionPanelOpen),
+        questionRenderCount: Number(shellStatus.questionRenderCount ?? 0),
+        questionTurnCount: Number(shellStatus.questionTurnCount ?? 0)
+      },
+      questionPanelOpen: Boolean(shellStatus.questionPanelOpen),
+      chatBootstrapDiagnostics: this.lastChatBootstrapDiagnostics ? { ...this.lastChatBootstrapDiagnostics } : null,
+      captureDiagnostics: this.captureDiagnostics.map((entry) => ({ ...entry })),
+      chatScrollDiagnostics: this.chatScrollDiagnostics.map((entry) => ({ ...entry, identity: { ...entry.identity } })),
+      sidebarStructure: collectSidebarStructureDiagnostics(this.document),
+      pinnedCandidateDiagnostics
+    };
+    this.pinnedChatStateSnapshot = snapshot;
+    this.updateDebug("pinned-chat-state-snapshot");
+    return JSON.parse(JSON.stringify(snapshot));
   }
 
   status() {
@@ -7351,19 +8903,14 @@ class TalkEnhancerV3App {
       navigationHistory: this.navigationHistory.map((item) => ({ ...item, steps: [...(item.steps ?? [])] })),
       slowNavigationHistory: this.slowNavigationHistory.map(cloneSlowNavigationRecord),
       lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
-      officialNavigationHistory: this.officialNavigationHistory.map((item) => JSON.parse(JSON.stringify(item))),
-      lastOfficialNavigation: this.officialNavigationHistory.length ? JSON.parse(JSON.stringify(this.officialNavigationHistory.at(-1))) : null,
-      officialNavigationMapping: this.officialNavigationMapping ? JSON.parse(JSON.stringify(this.officialNavigationMapping)) : null,
-      officialNavigationLearning: JSON.parse(JSON.stringify(this.officialNavigationLearning)),
-      officialNavigationSessionLearning: JSON.parse(JSON.stringify(this.officialNavigationSessionLearning)),
-      officialBridgeAuto: JSON.parse(JSON.stringify(this.officialBridgeAuto)),
-      officialBridgeSessionTrustedTargets: this.getOfficialBridgeSessionTrustedTargets(),
-      hostInternalDepthProbe: this.hostInternalDepthProbe ? JSON.parse(JSON.stringify(this.hostInternalDepthProbe)) : null,
-      l3RuntimeEnabled: L3_RUNTIME_ENABLED,
-      l3KeyJoinDryRun: createL3KeyJoinDryRunSummary(this.l3KeyJoinDryRun),
-      officialNavigationLearningHistory: this.officialNavigationLearningHistory.map((item) => ({ ...item })),
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
+      pinnedChatProbe: this.pinnedChatProbe ? JSON.parse(JSON.stringify(this.pinnedChatProbe)) : null,
+      pinnedClickTransition: this.lastPinnedClickTransition ? { ...this.lastPinnedClickTransition } : null,
+      pinnedIdentityLatched: Boolean(this.activePinnedChatConversationId),
+      chatBootstrapDiagnostics: this.lastChatBootstrapDiagnostics ? { ...this.lastChatBootstrapDiagnostics } : null,
+      captureDiagnostics: this.captureDiagnostics.map((entry) => ({ ...entry })),
+      chatScrollDiagnostics: this.chatScrollDiagnostics.map((entry) => ({ ...entry, identity: { ...entry.identity } })),
       hostContract,
       health: degraded ? "degraded" : "healthy"
     };
@@ -7376,6 +8923,11 @@ class TalkEnhancerV3App {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.cancelWorkEarlierHydration();
+    this.cancelChatEarlierHydration();
+    this.cancelChatBootstrapHydration();
+    this.pendingPinnedChatSelection = null;
+    this.activePinnedChatConversationId = null;
     this.navigationRequestId += 1;
     this.clearNavigationUxTimer();
     this.shell?.setNavigationState?.({ state: "idle", target: null, targetOrder: null, pendingVisible: false });
@@ -7385,12 +8937,13 @@ class TalkEnhancerV3App {
     this.window?.removeEventListener?.("popstate", this.boundRoute);
     this.window?.removeEventListener?.("hashchange", this.boundRoute);
     this.document?.removeEventListener?.("click", this.boundConversationSelect, true);
+    for (const type of ["pointerdown", "mousedown", "click", "pointerup"]) {
+      this.document?.removeEventListener?.(type, this.boundPinnedChatProbeEvent, true);
+      this.window?.removeEventListener?.(type, this.boundPinnedChatProbeEvent, true);
+    }
+    this.stopPinnedChatProbe();
     this.clearConversationSelectTimer();
-    this.clearOfficialBridgeAutoTimer();
-    this.clearHostInternalDepthProbeTimer();
-    this.clearL3AdaptiveRescanTimer();
-    this.clearL3EventRecoveryWatch();
-    this.officialNavigationProbe?.destroy?.();
+    this.clearChatIdentitySettleRetry();
     if (this.refreshFrame != null && typeof this.window?.cancelAnimationFrame === "function") this.window.cancelAnimationFrame(this.refreshFrame);
     this.host?.destroy?.();
     this.shell?.destroy?.();
@@ -7412,105 +8965,10 @@ function registerBundle(windowRef = globalThis.window) {
 
 if (typeof window !== "undefined") registerBundle(window);
 
-function createL3KeyJoinDryRunSummary(value = {}) {
-  const nullableBoolean = (input) => input === true ? true : input === false ? false : null;
-  const nullableCount = (input) => input == null || !Number.isFinite(Number(input)) ? null : Math.max(0, Math.floor(Number(input)));
-  const nullableRatio = (input) => input == null || !Number.isFinite(Number(input)) ? null : Math.max(0, Math.min(1, Number(input)));
-  return {
-    status: typeof value.status === "string" ? value.status : "idle",
-    stableScans: Math.max(0, Number(value.stableScans) || 0),
-    mappedTurnCount: Math.max(0, Number(value.mappedTurnCount) || 0),
-    coverage: Math.max(0, Math.min(1, Number(value.coverage) || 0)),
-    conflicts: Math.max(0, Number(value.conflicts) || 0),
-    exactPatternCount: Math.max(0, Number(value.exactPatternCount) || 0),
-    mappingAgreement: Boolean(value.mappingAgreement),
-    currentMarkerCount: nullableCount(value.currentMarkerCount),
-    currentKnownTurnCount: nullableCount(value.currentKnownTurnCount),
-    currentExactPatternCount: nullableCount(value.currentExactPatternCount),
-    currentRelationPatternCount: nullableCount(value.currentRelationPatternCount),
-    currentMarkersWithKeyJoinCandidates: nullableCount(value.currentMarkersWithKeyJoinCandidates),
-    currentKeyJoinMappedMarkers: nullableCount(value.currentKeyJoinMappedMarkers),
-    currentKeyJoinUniqueTurns: nullableCount(value.currentKeyJoinUniqueTurns),
-    currentBestKeyJoinCoverage: nullableRatio(value.currentBestKeyJoinCoverage),
-    currentBestKeyJoinConflicts: nullableCount(value.currentBestKeyJoinConflicts),
-    currentBestKeyJoinOneToOne: nullableBoolean(value.currentBestKeyJoinOneToOne),
-    currentMappedTurnCount: nullableCount(value.currentMappedTurnCount),
-    currentCoverage: nullableRatio(value.currentCoverage),
-    currentConflicts: nullableCount(value.currentConflicts),
-    currentOneToOne: nullableBoolean(value.currentOneToOne),
-    preferredPatternPresent: nullableBoolean(value.preferredPatternPresent),
-    alternateExactPatternAvailable: nullableBoolean(value.alternateExactPatternAvailable),
-    mappingStable: nullableBoolean(value.mappingStable),
-    targetResolvable: nullableBoolean(value.targetResolvable),
-    markerConnected: nullableBoolean(value.markerConnected),
-    adaptiveRescanState: typeof value.adaptiveRescanState === "string" ? value.adaptiveRescanState : "idle",
-    adaptiveRescanAttempt: Math.max(0, Number(value.adaptiveRescanAttempt) || 0),
-    freshMapAccepted: nullableBoolean(value.freshMapAccepted)
-  };
-}
-
-function isL3ExactKeyJoinScan(scan, index) {
-  const summary = scan?.summary ?? null;
-  const expectedKnownTurnCount = Number(index?.size?.() ?? 0);
-  return Boolean(
-    summary?.oneToOne
-    && Number(summary?.coverage) === 1
-    && Number(summary?.conflicts) === 0
-    && scan?.patternKey
-    && scan?.identityByTarget instanceof Map
-    && scan.identityByTarget.size === expectedKnownTurnCount
-    && Number(summary?.knownTurnCount) === expectedKnownTurnCount
-  );
-}
-
-function adoptL3ExactKeyJoinScan(session, scan) {
-  if (!session || !scan?.patternKey || !(scan?.identityByTarget instanceof Map)) return false;
-  session.patternKey = scan.patternKey;
-  session.identityByTarget = new Map(scan.identityByTarget);
-  session.knownTurnCount = Number(scan?.summary?.knownTurnCount) || 0;
-  session.pairsByTarget = scan.pairsByTarget instanceof Map ? scan.pairsByTarget : new Map();
-  session.status = "dry-run-ready";
-  session.stableScans = Math.max(2, Number(session.stableScans) || 0);
-  return true;
-}
-
-function createL3FreshDiagnostics(scan, targetOrder) {
-  const currentSummary = scan?.summary ?? null;
-  const pair = scan?.pairsByTarget instanceof Map ? scan.pairsByTarget.get(targetOrder) : null;
-  const marker = pair?.marker ?? null;
-  return {
-    currentMarkerCount: currentSummary ? currentSummary.markerCount : null,
-    currentKnownTurnCount: currentSummary ? currentSummary.knownTurnCount : null,
-    currentExactPatternCount: currentSummary ? currentSummary.exactPatternCount : null,
-    currentRelationPatternCount: currentSummary ? currentSummary.relationPatternCount : null,
-    currentMarkersWithKeyJoinCandidates: currentSummary ? currentSummary.markersWithKeyJoinCandidates : null,
-    currentKeyJoinMappedMarkers: currentSummary ? currentSummary.keyJoinMappedMarkers : null,
-    currentKeyJoinUniqueTurns: currentSummary ? currentSummary.keyJoinUniqueTurns : null,
-    currentBestKeyJoinCoverage: currentSummary ? currentSummary.bestKeyJoinCoverage : null,
-    currentBestKeyJoinConflicts: currentSummary ? currentSummary.bestKeyJoinConflicts : null,
-    currentBestKeyJoinOneToOne: currentSummary ? Boolean(currentSummary.bestKeyJoinOneToOne) : null,
-    currentMappedTurnCount: currentSummary ? currentSummary.mappedTurnCount : null,
-    currentCoverage: currentSummary ? currentSummary.coverage : null,
-    currentConflicts: currentSummary ? currentSummary.conflicts : null,
-    currentOneToOne: currentSummary ? Boolean(currentSummary.oneToOne) : null,
-    preferredPatternPresent: currentSummary?.preferredPatternPresent ?? null,
-    alternateExactPatternAvailable: currentSummary?.alternateExactPatternAvailable ?? null,
-    targetResolvable: Boolean(pair && pair.markerIndex != null),
-    markerConnected: Boolean(marker && marker.isConnected !== false)
-  };
-}
-function sameL3KeyJoinIdentityMap(left, right) {
-  if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
-  for (const [targetOrder, identity] of left.entries()) {
-    if (!right.has(targetOrder) || !Object.is(identity, right.get(targetOrder))) return false;
-  }
-  return true;
-}
-
 function isSlowNavigationStep(step = {}) {
   const elapsedMs = Number(step?.elapsedMs) || 0;
   const waitMs = Number(step?.waitMs) || 0;
-  if (step?.mode === "chat-progressive" || step?.mode === "chat-fast") return elapsedMs >= 100;
+  if (step?.mode === "chat-progressive") return elapsedMs >= 100;
   if (step?.mode === "work-wheel") return elapsedMs >= Math.max(180, waitMs * 1.5);
   return elapsedMs >= Math.max(100, waitMs * 1.5);
 }
@@ -7547,12 +9005,6 @@ function sanitizeSlowNavigationRecord(value = {}) {
     reason: typeof value.reason === "string" ? value.reason : null,
     ok: Boolean(value.ok),
     verified: Boolean(value.verified),
-    fastAttempted: Boolean(value.fastAttempted),
-    fastSucceeded: Boolean(value.fastSucceeded),
-    fallbackReason: typeof value.fallbackReason === "string" ? value.fallbackReason : null,
-    officialBridgeAttempted: Boolean(value.officialBridgeAttempted),
-    officialBridgeSucceeded: Boolean(value.officialBridgeSucceeded),
-    officialBridgeFallbackReason: typeof value.officialBridgeFallbackReason === "string" ? value.officialBridgeFallbackReason : null,
     slowestStep: cleanStep(value.slowestStep),
     slowSteps: (Array.isArray(value.slowSteps) ? value.slowSteps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT),
     steps: (Array.isArray(value.steps) ? value.steps : []).map(cleanStep).filter(Boolean).slice(-NAVIGATION_STEP_LIMIT)
@@ -7574,6 +9026,207 @@ function cloneSlowNavigationRecord(record) {
   return record ? JSON.parse(JSON.stringify(record)) : null;
 }
 
+function diagnosticRound(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 100) / 100 : null;
+}
+
+function diagnosticIdModeCounts(turns = []) {
+  const counts = { fallback: 0, uuidLike: 0, other: 0 };
+  for (const turn of Array.isArray(turns) ? turns : []) {
+    const id = String(turn?.id ?? "");
+    if (/^(?:fallback-turn|turn-index)-\d+$/.test(id)) counts.fallback += 1;
+    else if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(id)) counts.uuidLike += 1;
+    else if (id) counts.other += 1;
+  }
+  return counts;
+}
+
+function collectSidebarStructureDiagnostics(documentRef) {
+  const roots = Array.from(documentRef?.querySelectorAll?.("aside, nav, [role='navigation']") ?? []).slice(0, 8);
+  const nodes = [];
+  const seen = new Set();
+  for (const root of roots) {
+    const descendants = [root, ...Array.from(root?.querySelectorAll?.("*") ?? []).slice(0, 500)];
+    for (const node of descendants) {
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      nodes.push(node);
+    }
+  }
+  const dataAttributeCounts = new Map();
+  const hrefShapeCounts = new Map();
+  const candidateShapeCounts = new Map();
+  let ariaCurrentCount = 0;
+  let ariaSelectedCount = 0;
+  for (const node of nodes) {
+    const names = typeof node?.getAttributeNames === "function" ? node.getAttributeNames() : [];
+    const dataNames = names.filter((name) => String(name).startsWith("data-")).sort();
+    for (const name of dataNames) dataAttributeCounts.set(name, (dataAttributeCounts.get(name) ?? 0) + 1);
+    const hrefShape = sanitizeProbeHref(node?.getAttribute?.("href"));
+    if (hrefShape) hrefShapeCounts.set(hrefShape, (hrefShapeCounts.get(hrefShape) ?? 0) + 1);
+    if (node?.getAttribute?.("aria-current") != null) ariaCurrentCount += 1;
+    if (node?.getAttribute?.("aria-selected") != null) ariaSelectedCount += 1;
+  }
+  for (const node of nodes) {
+    const names = typeof node?.getAttributeNames === "function" ? node.getAttributeNames() : [];
+    const dataNames = names.filter((name) => String(name).startsWith("data-")).sort();
+    const hrefShape = sanitizeProbeHref(node?.getAttribute?.("href"));
+    const role = node?.getAttribute?.("role") ?? null;
+    const ariaCurrent = node?.getAttribute?.("aria-current") ?? null;
+    const ariaSelected = node?.getAttribute?.("aria-selected") ?? null;
+    if (!dataNames.length && !hrefShape && !role && ariaCurrent == null && ariaSelected == null) continue;
+    const tag = String(node?.tagName ?? "").toLowerCase();
+    const key = JSON.stringify({ tag: tag || null, role, hrefShape, dataNames, ariaCurrent, ariaSelected });
+    candidateShapeCounts.set(key, (candidateShapeCounts.get(key) ?? 0) + 1);
+  }
+  const ranked = (map, keyName) => [...map.entries()]
+    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, 40)
+    .map(([key, count]) => ({ [keyName]: key, count }));
+  return {
+    rootCount: roots.length,
+    scannedNodeCount: nodes.length,
+    ariaCurrentCount,
+    ariaSelectedCount,
+    dataAttributeNames: ranked(dataAttributeCounts, "name"),
+    hrefShapes: ranked(hrefShapeCounts, "shape"),
+    candidateShapes: [...candidateShapeCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 40)
+      .map(([key, count]) => ({ ...JSON.parse(key), count })),
+    pinnedRelations: collectPinnedSidebarRelations(documentRef)
+  };
+}
+
+function collectPinnedSidebarRelations(documentRef) {
+  const pinnedNodes = Array.from(documentRef?.querySelectorAll?.("[data-pinned-content-tab-drop-key]") ?? []).slice(0, 20);
+  return pinnedNodes.map((node, index) => {
+    const ancestors = probeParentChain(node, 10);
+    const parentShapes = ancestors.map((ancestor, depth) => ({
+      depth,
+      tag: String(ancestor?.tagName ?? "").toLowerCase() || null,
+      role: ancestor?.getAttribute?.("role") ?? null,
+      hrefShape: sanitizeProbeHref(ancestor?.getAttribute?.("href")),
+      dataNames: (typeof ancestor?.getAttributeNames === "function" ? ancestor.getAttributeNames() : [])
+        .filter((name) => String(name).startsWith("data-"))
+        .sort()
+    }));
+    const chatAncestorDepth = ancestors.findIndex((ancestor) => ancestor?.getAttribute?.("data-sidebar-chatgpt-conversation-key") != null);
+    const appThreadAncestorDepth = ancestors.findIndex((ancestor) => ancestor?.getAttribute?.("data-app-action-sidebar-thread-id") != null);
+    return {
+      index: index + 1,
+      tag: String(node?.tagName ?? "").toLowerCase() || null,
+      role: node?.getAttribute?.("role") ?? null,
+      chatAncestorDepth: chatAncestorDepth >= 0 ? chatAncestorDepth : null,
+      appThreadAncestorDepth: appThreadAncestorDepth >= 0 ? appThreadAncestorDepth : null,
+      descendantChatConversationCount: Number(node?.querySelectorAll?.("[data-sidebar-chatgpt-conversation-key]")?.length ?? 0),
+      descendantAppThreadCount: Number(node?.querySelectorAll?.("[data-app-action-sidebar-thread-id]")?.length ?? 0),
+      parentShapes
+    };
+  });
+}
+
+function probeParentChain(target, maxDepth = 10) {
+  const nodes = [];
+  let node = target ?? null;
+  for (let depth = 0; node && depth < maxDepth; depth += 1, node = node.parentElement ?? null) nodes.push(node);
+  return nodes;
+}
+
+function findProbePathMatch(nodes, selector) {
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    try {
+      if (node?.matches?.(selector)) return node;
+      if (node?.closest?.(selector) === node) return node;
+    } catch {}
+  }
+  return null;
+}
+
+function sanitizeProbeNode(node) {
+  if (!node || typeof node !== "object") return null;
+  return sanitizeProbePath([node], 1)[0] ?? null;
+}
+
+function sanitizeProbePath(nodes, maxDepth = 10) {
+  const rows = [];
+  const input = Array.isArray(nodes) ? nodes : [];
+  for (let depth = 0; depth < Math.min(maxDepth, input.length); depth += 1) {
+    const node = input[depth];
+    if (!node || typeof node !== "object") continue;
+    const names = typeof node.getAttributeNames === "function" ? node.getAttributeNames() : [];
+    const data = {};
+    for (const name of names) {
+      if (!String(name).startsWith("data-")) continue;
+      data[name] = sanitizeProbeAttribute(name, node.getAttribute?.(name));
+    }
+    rows.push({
+      depth,
+      tag: String(node.tagName ?? "").toLowerCase() || null,
+      role: node.getAttribute?.("role") ?? null,
+      ariaCurrent: node.getAttribute?.("aria-current") ?? null,
+      ariaSelected: node.getAttribute?.("aria-selected") ?? null,
+      classShape: sanitizeProbeClass(node.getAttribute?.("class") ?? node.className ?? ""),
+      hrefShape: sanitizeProbeHref(node.getAttribute?.("href")),
+      data
+    });
+  }
+  return rows;
+}
+
+function sanitizeProbeClass(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  return text.split(/\s+/).filter(Boolean).slice(0, 10).join(" ").slice(0, 160);
+}
+
+function sanitizeProbeAttribute(name, value) {
+  const key = String(name ?? "").toLowerCase();
+  const text = String(value ?? "");
+  if (!text) return "";
+  if (/(?:^|[-_])(id|key|thread|conversation)(?:$|[-_])/.test(key)) return `<redacted:${probeValueShape(text)}>`;
+  if (/(?:title|label|name|text|content)/.test(key)) return `<redacted:text-${Math.min(99, text.length)}>`;
+  return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+}
+
+function sanitizeProbeHref(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw, "https://probe.invalid");
+    const parts = url.pathname.split("/").map((part) => {
+      if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(part)) return "<id>";
+      if (/^[A-Za-z0-9_-]{20,}$/.test(part)) return "<id>";
+      return part;
+    });
+    return parts.join("/") || "/";
+  } catch {
+    return "<unparsed>";
+  }
+}
+
+function probeValueShape(value) {
+  const text = String(value ?? "");
+  if (/^local:/i.test(text)) return "local";
+  if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(text)) return "uuid-like";
+  if (text.includes(":")) return "namespaced";
+  return `opaque-${Math.min(99, text.length)}`;
+}
+
+function sanitizeProbeIdentity(identity, baselineId = null) {
+  if (!identity) return { present: false, host: null, source: null, kind: null, stable: false, idState: "none" };
+  const id = identity?.id ?? null;
+  return {
+    present: true,
+    host: identity?.host ?? null,
+    source: identity?.source ?? null,
+    kind: identity?.kind ?? null,
+    stable: Boolean(identity?.stable),
+    idState: !id ? "none" : baselineId && id === baselineId ? "same" : "changed"
+  };
+}
+
 function appNowMs(windowRef = globalThis.window) {
   const value = Number(windowRef?.performance?.now?.());
   return Number.isFinite(value) ? value : Date.now();
@@ -7584,7 +9237,7 @@ function waitMs(windowRef, ms) {
   return new Promise((resolve) => set(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-Object.assign(exports, { VERSION, TalkEnhancerV3App, registerBundle });
+Object.assign(exports, { VERSION, reconcileChatVisibleTurns, resolvePinnedChatConversationCandidate, TalkEnhancerV3App, registerBundle });
 
 },
   };

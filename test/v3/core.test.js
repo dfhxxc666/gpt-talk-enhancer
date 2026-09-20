@@ -6,6 +6,7 @@ import { TimelineState, sampleRailMarkers } from "../../src/v3/core/timeline-sta
 import { MemoryStorageAdapter } from "../../src/v3/core/storage.js";
 import { PromptStore } from "../../src/v3/core/prompt-store.js";
 import { TimelineCache, TIMELINE_CACHE_KEY } from "../../src/v3/core/timeline-cache.js";
+import { WorkTimelineCache, WORK_TIMELINE_CACHE_KEY } from "../../src/v3/core/work-timeline-cache.js";
 import { normalizeQuestionDisplayText } from "../../src/v3/core/question-display.js";
 
 function turns(count) {
@@ -55,6 +56,25 @@ test("TurnIndex keeps capture ordering when visible DOM order is partial", () =>
   assert.deepEqual(index.getVisible().map((turn) => turn.id), ["q4", "q5"]);
 });
 
+test("TurnIndex replaces a pure DOM snapshot but refuses to replace capture-backed records", () => {
+  const domOnly = new TurnIndex();
+  domOnly.mergeMany([
+    { id: "old-a", order: 0, text: "old A", source: "dom", visible: false },
+    { id: "old-b", order: 1, text: "old B", source: "dom", visible: false }
+  ]);
+  assert.equal(domOnly.replaceDomSnapshot([
+    { id: "new-a", order: 0, text: "new A", source: "dom", visible: false },
+    { id: "new-b", order: 1, text: "new B", source: "dom", visible: false },
+    { id: "new-c", order: 2, text: "new C", source: "dom", visible: false }
+  ]), true);
+  assert.deepEqual(domOnly.getOrdered().map((turn) => turn.id), ["new-a", "new-b", "new-c"]);
+
+  const captured = new TurnIndex();
+  captured.mergeMany([{ id: "capture-a", order: 0, text: "captured", source: "capture", visible: false }]);
+  assert.equal(captured.replaceDomSnapshot([{ id: "new", order: 0, text: "new", source: "dom", visible: false }]), false);
+  assert.deepEqual(captured.getOrdered().map((turn) => turn.id), ["capture-a"]);
+});
+
 test("TurnIndex canonicalizes fallback-turn ids onto capture order", () => {
   const index = new TurnIndex();
   index.setVisible([
@@ -85,6 +105,13 @@ test("TurnIndex does not reconcile legacy ids from order alone when exact text e
   assert.equal(index.resolveCanonicalId("turn-index-0"), "turn-index-0");
 });
 
+test("TurnIndex can promote a self-describing legacy DOM anchor to a stable canonical id", () => {
+  const index = new TurnIndex();
+  index.mergeMany([{ id: "fallback-turn-41", order: 41, text: "stale", source: "dom", visible: false }]);
+  assert.equal(index.replaceLegacyAnchor("fallback-turn-41", "stable-41"), true);
+  assert.equal(index.records.has("fallback-turn-41"), false);
+  assert.equal(index.resolveCanonicalId("fallback-turn-41"), "stable-41");
+});
 test("TurnIndex reindexes a fully stable UUIDv7 Local history and drops covered legacy rows", () => {
   const index = new TurnIndex();
   index.mergeMany([
@@ -173,6 +200,51 @@ test("TimelineCache persists only user-turn metadata and skips lastSeen-only rew
   assert.deepEqual(cache.load("A").map((turn) => turn.id), ["q1"]);
   assert.equal(cache.save("A", [{ ...input[0], lastSeen: 9999 }]), false);
   assert.equal(writes, 1);
+});
+
+test("TimelineCache rejects duplicate global orders while salvaging only self-describing anchors", () => {
+  const storage = new MemoryStorageAdapter();
+  storage.write(TIMELINE_CACHE_KEY, {
+    schemaVersion: 1,
+    conversations: {
+      bad: { conversationId: "bad", updatedAt: 1, turns: [
+        { id: "uuid-a", order: 0, text: "polluted A" },
+        { id: "uuid-b", order: 0, text: "polluted B" },
+        { id: "fallback-turn-40", order: 40, text: "trusted 40" },
+        { id: "uuid-c", order: 40, text: "polluted C" },
+        { id: "turn-index-41", order: 41, text: "trusted 41" },
+        { id: "uuid-d", order: 41, text: "polluted D" },
+        { id: "fallback-turn-99", order: 2, text: "mismatched suffix" }
+      ] }
+    }
+  });
+  const cache = new TimelineCache({ storage });
+  assert.deepEqual(cache.load("bad").map((turn) => [turn.id, turn.order]), [
+    ["fallback-turn-40", 40],
+    ["turn-index-41", 41]
+  ]);
+  assert.equal(cache.save("good", [
+    { id: "a", order: 0, text: "A" },
+    { id: "b", order: 0, text: "B" }
+  ]), false);
+  const root = storage.read(TIMELINE_CACHE_KEY);
+  assert.equal(root.conversations.good, undefined);
+});
+
+test("Chat and Work Timeline caches are physically isolated and keep independent validation rules", () => {
+  const storage = new MemoryStorageAdapter();
+  const chat = new TimelineCache({ storage });
+  const work = new WorkTimelineCache({ storage });
+  const duplicate = [
+    { id: "work-a", order: 0, text: "A" },
+    { id: "work-b", order: 0, text: "B" }
+  ];
+  assert.equal(chat.save("chat-a", duplicate), false);
+  assert.equal(work.save("local:work-a", duplicate), true);
+  assert.equal(storage.read(TIMELINE_CACHE_KEY, null), null);
+  const workRoot = storage.read(WORK_TIMELINE_CACHE_KEY);
+  assert.equal(workRoot.conversations["local:work-a"].turns.length, 2);
+  assert.deepEqual(work.load("local:work-a").map((turn) => [turn.id, turn.order]), [["work-a", 0], ["work-b", 0]]);
 });
 
 test("Question display normalization extracts My request without mutating source semantics", () => {

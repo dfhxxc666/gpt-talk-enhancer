@@ -7,12 +7,13 @@ import { Toast } from "./toast.js";
 import { BUNDLED_STYLE_TEXT } from "./style-bundle.js";
 
 export class AppShell {
-  constructor({ document, window, host, promptStore, onNavigate, initialPanelOpen = false } = {}) {
+  constructor({ document, window, host, promptStore, onNavigate, onLoadEarlier, initialPanelOpen = false } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
     this.host = host;
     this.promptStore = promptStore;
     this.onNavigate = onNavigate ?? (() => {});
+    this.onLoadEarlier = onLoadEarlier ?? (() => {});
     this.initialPanelOpen = initialPanelOpen;
     this.hostElement = null;
     this.root = null;
@@ -50,6 +51,7 @@ export class AppShell {
       document: this.document,
       window: this.window,
       onSelect: (turnId) => this.onNavigate(turnId),
+      onLoadEarlier: () => this.onLoadEarlier(),
       onOpenChange: (open) => { this.panelOpen = open; },
       getAnchorRect: () => this.rail?.getAnchorRect?.() ?? null
     });
@@ -100,6 +102,10 @@ export class AppShell {
     this.questionList?.setActive(activeTurnId);
     this.rail?.setState(turns, activeTurnId);
     this.questionList?.updatePosition?.();
+  }
+
+  setQuestionHistoryState(state = {}) {
+    this.questionList?.setEarlierAction?.(state);
   }
 
   setNavigationState({ state = "idle", target = null, targetOrder = null, pendingVisible = false } = {}) {
@@ -162,8 +168,11 @@ export class AppShell {
   getStatus() {
     return {
       timelineMounted: Boolean(this.rail?.element),
+      timelineHidden: Boolean(this.rail?.element?.hidden),
+      timelineMarkerCount: Number(this.rail?.markers?.children?.length ?? 0),
       questionPanelOpen: Boolean(this.questionList?.opened),
       questionRenderCount: this.questionList?.renderCount ?? 0,
+      questionTurnCount: Number(this.questionList?.turns?.length ?? 0),
       promptMounted: Boolean(this.promptTrigger?.element),
       promptPanelOpen: Boolean(this.promptPanel?.opened)
     };

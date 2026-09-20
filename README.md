@@ -39,6 +39,8 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 `v0.5.1`、`v0.5.0` 与 `v0.4.5` 均保留原 tag，不移动历史基线。
 
+main 在 v0.5.2 发布基线之上继续包含已实机验证的 Chat / Work 稳定性修复；当前主线检查点见 docs/MAIN-STABILITY-CHECKPOINT-2026-09-20.zh-CN.md。v0.5.2 tag 保持不动。
+
 ## 环境要求
 
 当前主目标是 Windows 桌面端：

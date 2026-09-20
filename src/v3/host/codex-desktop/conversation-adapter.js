@@ -20,13 +20,27 @@ export class ConversationAdapter {
   constructor({ document, window } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
+    this.inferredChatConversationId = null;
   }
 
   getConversationId() {
     return this.getConversationIdentity()?.id ?? null;
   }
 
-  getConversationIdentity() {
+  setInferredChatConversationId(value) {
+    const raw = String(value ?? "").trim();
+    const id = raw && !raw.startsWith("local:") ? parseSidebarConversationKey(raw) : raw;
+    this.inferredChatConversationId = id || null;
+    return Boolean(this.inferredChatConversationId);
+  }
+
+  clearInferredChatConversationId() {
+    const changed = Boolean(this.inferredChatConversationId);
+    this.inferredChatConversationId = null;
+    return changed;
+  }
+
+  getDirectConversationIdentity() {
     const pathname = String(this.window?.location?.pathname ?? "");
     const routeMatch = pathname.match(/\/(?:c|conversation|chat)\/([^/?#]+)/i);
     if (routeMatch?.[1]) {
@@ -53,6 +67,21 @@ export class ConversationAdapter {
     return explicitId
       ? { id: String(explicitId), source: "dom-explicit", host: null, kind: null, stable: false }
       : null;
+  }
+
+  getConversationIdentity() {
+    const direct = this.getDirectConversationIdentity();
+    if (direct?.stable) return direct;
+    if (this.inferredChatConversationId && this.hasVisibleConversationContent()) {
+      return {
+        id: this.inferredChatConversationId,
+        source: "inferred-visible-chat",
+        host: "chatgpt",
+        kind: "conversation",
+        stable: true
+      };
+    }
+    return direct;
   }
 
   getSelectedLocalThreadRow() {

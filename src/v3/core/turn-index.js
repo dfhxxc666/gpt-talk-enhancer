@@ -49,6 +49,17 @@ export class TurnIndex {
     return this.getOrdered();
   }
 
+  replaceDomSnapshot(records = []) {
+    const existing = [...this.records.values()];
+    if (existing.some((record) => record.source !== "dom")) return false;
+    const next = (Array.isArray(records) ? records : []).filter((record) => record?.id);
+    if (!next.length) return false;
+    this.records.clear();
+    this.aliases.clear();
+    this.mergeMany(next.map((record) => ({ ...record, source: "dom" })));
+    return true;
+  }
+
   setVisible(visibleRecords = []) {
     for (const record of this.records.values()) record.visible = false;
     for (const record of visibleRecords) {
@@ -59,6 +70,62 @@ export class TurnIndex {
       this.upsert({ ...record, id: canonicalId, source: "dom", visible: true });
     }
     this.reconcileLegacyAliases(visibleRecords);
+  }
+
+  reassignDomOrders(assignments = []) {
+    const normalized = [];
+    const ids = new Set();
+    const orders = new Set();
+    for (const assignment of Array.isArray(assignments) ? assignments : []) {
+      const id = String(assignment?.id ?? "").trim();
+      const order = Number(assignment?.order);
+      if (!id || !Number.isFinite(order) || order < 0 || ids.has(id) || orders.has(order)) return false;
+      const record = this.records.get(id);
+      if (!record || record.source !== "dom") return false;
+      ids.add(id);
+      orders.add(order);
+      normalized.push({ record, order });
+    }
+    if (normalized.length < 2) return false;
+    for (const { record, order } of normalized) record.order = order;
+    return true;
+  }
+
+  setAlias(aliasId, canonicalId) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical) return false;
+    this.aliases.set(alias, canonical);
+    return true;
+  }
+
+  replaceLegacyAnchor(aliasId, canonicalId) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical) return false;
+    const record = this.records.get(alias);
+    if (!record || record.source?.includes("capture")) return false;
+    const selfOrder = legacyTurnOrder(alias) ?? fallbackOrder(alias);
+    if (selfOrder === null || Number(record.order) !== selfOrder) return false;
+    const existing = this.records.get(canonical);
+    if (existing && Number(existing.order) !== selfOrder) return false;
+    this.aliases.set(alias, canonical);
+    this.records.delete(alias);
+    return true;
+  }
+  replaceStaleDomAnchor(aliasId, canonicalId, { order = null, text = "" } = {}) {
+    const alias = String(aliasId ?? "").trim();
+    const canonical = String(canonicalId ?? "").trim();
+    if (!alias || !canonical || alias === canonical || !Number.isFinite(order)) return false;
+    const record = this.records.get(alias);
+    if (!record || record.source !== "dom" || Number(record.order) !== Number(order)) return false;
+    const expectedText = cleanText(text);
+    if (!expectedText || cleanText(record.text) !== expectedText) return false;
+    const existing = this.records.get(canonical);
+    if (existing && (Number(existing.order) !== Number(order) || cleanText(existing.text) !== expectedText)) return false;
+    this.aliases.set(alias, canonical);
+    this.records.delete(alias);
+    return true;
   }
 
   resolveCanonicalId(id) {
@@ -116,7 +183,7 @@ export class TurnIndex {
     }
 
     for (const [legacyId, legacyRecord] of [...this.records.entries()]) {
-      const legacyOrder = legacyTurnOrder(legacyId);
+      const legacyOrder = legacyTurnOrder(legacyId) ?? fallbackOrder(legacyId);
       if (legacyOrder === null || Number(legacyRecord.order) !== legacyOrder) continue;
       const stableId = stableByOrder.get(legacyOrder);
       if (!stableId || stableId === legacyId) continue;

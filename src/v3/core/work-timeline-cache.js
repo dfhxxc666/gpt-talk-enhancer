@@ -1,10 +1,10 @@
-export const TIMELINE_CACHE_KEY = "gpt-talk-enhancer.timeline-cache.v1";
+export const WORK_TIMELINE_CACHE_KEY = "gpt-talk-enhancer.timeline-cache.work.v1";
 export const TIMELINE_CACHE_SCHEMA_VERSION = 1;
 
-export class TimelineCache {
+export class WorkTimelineCache {
   constructor({
     storage,
-    key = TIMELINE_CACHE_KEY,
+    key = WORK_TIMELINE_CACHE_KEY,
     clock = () => Date.now(),
     maxConversations = 80,
     maxTurnsPerConversation = 1000
@@ -24,10 +24,6 @@ export class TimelineCache {
     const entry = root.conversations[id];
     if (!entry || !Array.isArray(entry.turns)) return [];
     const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(turns)) {
-      this.signatures.delete(id);
-      return trustedOrderAnchors(turns);
-    }
     this.signatures.set(id, turnSignature(turns));
     return turns;
   }
@@ -36,7 +32,6 @@ export class TimelineCache {
     const id = normalizeConversationId(conversationId);
     if (!id) return false;
     const normalized = normalizeTurns(turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(normalized)) return false;
     const signature = turnSignature(normalized);
     if (this.signatures.get(id) === signature) return false;
 
@@ -60,18 +55,6 @@ export class TimelineCache {
       conversations: entries.length,
       turns: entries.reduce((total, entry) => total + (Array.isArray(entry?.turns) ? entry.turns.length : 0), 0)
     };
-  }
-
-  listConversations() {
-    const root = this.#readRoot();
-    return Object.values(root.conversations)
-      .filter((entry) => entry && normalizeConversationId(entry.conversationId))
-      .map((entry) => ({
-        conversationId: normalizeConversationId(entry.conversationId),
-        updatedAt: Number(entry.updatedAt) || 0,
-        turns: normalizeTurns(entry.turns, this.maxTurnsPerConversation)
-      }))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   #readRoot() {
@@ -104,33 +87,6 @@ function normalizeTurns(turns, limit) {
   return [...byId.values()]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
     .slice(0, Math.max(0, Number(limit) || 0));
-}
-
-function hasDuplicateOrders(turns) {
-  const seen = new Set();
-  for (const turn of turns) {
-    if (!Number.isFinite(turn?.order)) continue;
-    const order = Number(turn.order);
-    if (seen.has(order)) return true;
-    seen.add(order);
-  }
-  return false;
-}
-
-function trustedOrderAnchors(turns) {
-  const byOrder = new Map();
-  for (const turn of turns) {
-    const order = trustedOrderFromId(turn?.id);
-    if (order === null || Number(turn?.order) !== order) continue;
-    const current = byOrder.get(order);
-    if (!current || /^fallback-turn-\d+$/.test(String(turn.id))) byOrder.set(order, turn);
-  }
-  return [...byOrder.values()].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
-}
-
-function trustedOrderFromId(id) {
-  const match = String(id ?? "").match(/^(?:fallback-turn|turn-index)-(\d+)$/);
-  return match ? Number.parseInt(match[1], 10) : null;
 }
 
 function turnSignature(turns) {

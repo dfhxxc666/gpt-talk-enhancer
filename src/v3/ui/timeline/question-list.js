@@ -1,16 +1,19 @@
 import { normalizeQuestionDisplayText } from "../../core/question-display.js";
 
 export class QuestionListPanel {
-  constructor({ document, window, onSelect, onOpenChange, getAnchorRect } = {}) {
+  constructor({ document, window, onSelect, onOpenChange, onLoadEarlier, getAnchorRect } = {}) {
     this.document = document ?? globalThis.document;
     this.window = window ?? globalThis.window;
     this.onSelect = onSelect ?? (() => {});
     this.onOpenChange = onOpenChange ?? (() => {});
+    this.onLoadEarlier = onLoadEarlier ?? (() => {});
     this.getAnchorRect = getAnchorRect ?? (() => null);
     this.element = null;
     this.list = null;
     this.count = null;
     this.followButton = null;
+    this.loadEarlierButton = null;
+    this.earlierAction = { visible: false, loading: false, exhausted: false };
     this.turns = [];
     this.signature = "";
     this.activeTurnId = null;
@@ -52,7 +55,18 @@ export class QuestionListPanel {
     close.textContent = "\u00d7";
     close.title = "关闭";
     close.addEventListener("click", () => this.setOpen(false));
-    header.append(title, count, follow, close);
+    const loadEarlier = this.document.createElement("button");
+    loadEarlier.type = "button";
+    loadEarlier.className = "gte-load-earlier";
+    loadEarlier.hidden = true;
+    loadEarlier.textContent = "⇈";
+    loadEarlier.title = "加载全部历史到顶部";
+    loadEarlier.setAttribute("aria-label", "加载全部历史到顶部");
+    loadEarlier.addEventListener("click", () => {
+      if (loadEarlier.disabled || loadEarlier.hidden) return;
+      this.onLoadEarlier();
+    });
+    header.append(title, loadEarlier, count, follow, close);
 
     const list = this.document.createElement("div");
     list.className = "gte-question-list";
@@ -75,6 +89,7 @@ export class QuestionListPanel {
     this.list = list;
     this.count = count;
     this.followButton = follow;
+    this.loadEarlierButton = loadEarlier;
     this.window?.addEventListener?.("resize", this.boundResize, { passive: true });
     this.window?.visualViewport?.addEventListener?.("resize", this.boundResize, { passive: true });
     return panel;
@@ -121,9 +136,17 @@ export class QuestionListPanel {
     this.element.style.right = "auto";
   }
 
+  setEarlierAction({ visible = false, loading = false, exhausted = false } = {}) {
+    this.earlierAction = { visible: Boolean(visible), loading: Boolean(loading), exhausted: Boolean(exhausted) };
+    if (!this.loadEarlierButton || !this.element) return;
+    this.loadEarlierButton.hidden = !this.earlierAction.visible || this.earlierAction.exhausted;
+    this.loadEarlierButton.disabled = this.earlierAction.loading;
+    this.loadEarlierButton.textContent = this.earlierAction.loading ? "…" : "⇈";
+  }
+
   setTurns(turns) {
     const next = Array.isArray(turns) ? turns : [];
-    const signature = next.map((turn) => `${turn.id}\u0000${turn.text}`).join("\u0001");
+    const signature = next.map((turn) => `${turn.id}\u0000${Number.isFinite(turn?.order) ? Number(turn.order) : ""}\u0000${turn.text}`).join("\u0001");
     if (signature === this.signature) {
       this.turns = next;
       return false;
@@ -262,5 +285,6 @@ export class QuestionListPanel {
     this.element = null;
     this.list = null;
     this.pendingTurnId = null;
+    this.loadEarlierButton = null;
   }
 }
