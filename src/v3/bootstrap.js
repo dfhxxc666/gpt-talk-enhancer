@@ -13,7 +13,7 @@ import { CodexDesktopHost } from "./host/codex-desktop/codex-host.js";
 import { parseSidebarConversationKey } from "./host/codex-desktop/conversation-adapter.js";
 import { AppShell } from "./ui/app-shell.js";
 
-export const VERSION = "0.5.2";
+export const VERSION = "0.5.1";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];

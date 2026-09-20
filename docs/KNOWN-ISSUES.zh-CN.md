@@ -1,6 +1,6 @@
 # GPT TalkEnhancer Known Issues
 
-本文记录 GPT TalkEnhancer Desktop 已确认的问题与历史修复结果。v0.5.2 为当前稳定性与快路径基线；v0.5.1 保留为上一版 Navigation Performance 基线。
+本文记录 GPT TalkEnhancer Desktop 已确认的问题与历史修复结果。v0.5.2 后续实机使用发现问题并已回退；当前稳定发布线为 v0.5.1，main 在 0.5.1 runtime 标识下继续承载回退后的稳定性修复。
 
 ## UI-001：全屏 + 折叠左侧栏时 Timeline 跟随侧栏 hover 隐显
 

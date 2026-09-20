@@ -1,12 +1,13 @@
 # GPT TalkEnhancer main 稳定检查点（2026-09-20）
 
-状态：PASS / post-v0.5.2 stability checkpoint
+状态：PASS / v0.5.2 rollback stabilization checkpoint
 
-本文记录 main 在 v0.5.2 release baseline 之后的已验收稳定状态。它不是新 release，不移动 v0.5.2 tag，也不代表 v0.5.3 已发布。
+本文记录 v0.5.2 因后续实机问题回退后，main 在 v0.5.1 runtime 线上继续完成的稳定性修复。它不是新 release，不移动任何历史 tag。
 
 ## 1. 基线与范围
 
-- Release baseline：v0.5.2
+- 当前稳定发布线：v0.5.1
+- 历史问题版本：v0.5.2（tag 保留，但已回退）
 - 当前开发分支：main
 - 当前稳定目标仍是两个核心能力：
   1. Conversation Timeline / Question List
@@ -120,9 +121,9 @@
 
 ## 7. 最终同步记录
 
-- Runtime version：0.5.2
-- main market SHA-256：DB07F3AF7124528CDD1EE187C49B1477D6DD4BB5267769041E295F271316A0B1
-- Desktop bundle SHA-256：F640950F12B1734DC1311F1CF1C1A2F9CF940E80CC2C9F6055CF2E34F2A99C35
+- Runtime version：0.5.1
+- main market SHA-256：98151AB7148A020654E1E585B2690847947C162FFA5B122EA6B16F1F05865B82
+- Desktop bundle SHA-256：51D4548E787CD004370DFE5DD87F7CBAC0C09EF179229B7AC18E51D786C9D1E0
 - Codex++ 单文件安装目标：%APPDATA%/Codex++/user_scripts/gpt-talk-enhancer.js
-- Release tag：v0.5.2 保持不动
-- 本检查点对应 post-v0.5.2 main 稳定快照，不创建新 tag。
+- Release tags：v0.5.1 / v0.5.2 均保持不动；当前推荐稳定发布线为 v0.5.1
+- 本检查点对应 v0.5.2 回退后的 main 稳定快照，不创建新 tag。

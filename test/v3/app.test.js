@@ -1869,7 +1869,7 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
 test("debug status exposes requested v3 runtime fields", () => {
   const { app } = createHarness();
   const status = app.status();
-  assert.equal(status.version, "0.5.2");
+  assert.equal(status.version, "0.5.1");
   assert.deepEqual(status.conversationIdentity, { id: "A", source: "test", host: "test", kind: "conversation", stable: true });
   assert.equal(status.host, "codex-desktop");
   assert.equal(status.hostContract.revision, "codex-desktop-v1");

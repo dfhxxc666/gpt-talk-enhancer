@@ -1,5 +1,5 @@
 /*
- * GPT TalkEnhancer 0.5.2 Desktop bundle
+ * GPT TalkEnhancer 0.5.1 Desktop bundle
  * Includes GPL-3.0-or-later derived Timeline UI material.
  * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.
  */
@@ -6043,7 +6043,7 @@ const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js"
 const { parseSidebarConversationKey } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
 
-const VERSION = "0.5.2";
+const VERSION = "0.5.1";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
