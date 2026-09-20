@@ -2,7 +2,7 @@
 @codex-plus-script
 name: GTE v0.5.4 Official Marker Research
 description: One-shot local research harness for official navigation markers. Idle until manually started.
-version: 0.2.8-research
+version: 0.2.9-research
 author: local-research
 license: UNLICENSED-RESEARCH
 */
@@ -19,7 +19,7 @@ license: UNLICENSED-RESEARCH
   const REPORT_DB = "gte-v054-research";
   const REPORT_DB_STORE = "handles";
   const REPORT_DIR_KEY = "report-directory";
-  const VERSION = "0.2.8-research";
+  const VERSION = "0.2.9-research";
   const DEFAULTS = {
     manualClicks: 7,
     samplesPerMode: 4,
@@ -1405,6 +1405,109 @@ license: UNLICENSED-RESEARCH
     return true;
   }
 
+  async function runChatCapability(label = "normal-chat") {
+    guideDismissed = false;
+
+    let reportFileHandle;
+    try {
+      reportFileHandle = await requestReportFile();
+    } catch (storageError) {
+      const failed = {
+        schemaVersion: 1,
+        scriptVersion: VERSION,
+        kind: "chat-capability",
+        label: String(label || "normal-chat"),
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        running: false,
+        aborted: true,
+        abortReason: "report-file-unavailable",
+        error: {
+          name: storageError?.name || "Error",
+          message: String(storageError?.message || storageError)
+        }
+      };
+      current = failed;
+      try { localStorage.setItem(STORE, JSON.stringify(failed)); } catch {}
+      return failed;
+    }
+
+    const startedAt = new Date().toISOString();
+    const captured = capability(label || "normal-chat");
+    const run = current = {
+      schemaVersion: 1,
+      scriptVersion: VERSION,
+      kind: "chat-capability",
+      label: String(label || "normal-chat"),
+      startedAt,
+      finishedAt: null,
+      running: true,
+      aborted: false,
+      config: {
+        persist: true,
+        readOnly: true,
+        programmaticNavigation: false
+      },
+      reportFileHandle,
+      reportFileName: reportFileHandle?.name || null,
+      conversationId: captured.identity?.id || captured.conversationId || null,
+      capability: captured,
+      summary: {
+        appPresent: Boolean(captured.app?.present),
+        appVersion: captured.app?.version || null,
+        appHealth: captured.app?.health || null,
+        hostMode: captured.hostMode || null,
+        surface: captured.surface || null,
+        identityStable: Boolean(captured.identity?.stable),
+        knownTurns: captured.timeline?.knownTurns ?? null,
+        visibleTurns: captured.timeline?.visibleTurns ?? null,
+        orderHealthy: captured.timeline?.orderHealth?.healthy === true,
+        cacheHydrationStatus: captured.timeline?.cacheHydration?.status || null,
+        scrollOwner: captured.scrollOwnership?.owner || null,
+        scrollConflict: Boolean(captured.scrollOwnership?.conflict),
+        markerCount: captured.mapping?.markerCount ?? 0,
+        uniqueMarkerIdCount: captured.mapping?.uniqueMarkerIdCount ?? 0,
+        duplicateMarkerIds: clone(captured.mapping?.duplicateMarkerIds || []),
+        knownTurnCount: captured.mapping?.knownTurnCount ?? 0,
+        uniqueExactTurnMatches: captured.mapping?.uniqueExactTurnMatches ?? 0,
+        exactTurnCoverage: captured.mapping?.exactTurnCoverage ?? 0,
+        missingTurnCount: captured.mapping?.missingTurnCount ?? 0,
+        extraMarkerCount: captured.mapping?.extraMarkerCount ?? 0,
+        bridgeEligible: Boolean(captured.mapping?.bridgeEligible),
+        oneToOneExact: Boolean(captured.mapping?.oneToOneExact)
+      },
+      error: null
+    };
+
+    run.finishedAt = new Date().toISOString();
+    run.running = false;
+    persist(run);
+
+    const saveResult = await flushFileCheckpoint(run);
+    guideDismissed = false;
+    if (saveResult?.written === true) {
+      showGuide(
+        "Chat capability 报告已保存",
+        "模式：" + String(run.summary.hostMode || "(unknown)")
+          + "\nknown turns：" + String(run.summary.knownTurns)
+          + "\nofficial markers：" + String(run.summary.markerCount)
+          + "\nexact turn coverage：" + String(run.summary.exactTurnCoverage)
+          + "\n文件：" + String(saveResult.fileName || run.reportFileName || "(未知)"),
+        "success"
+      );
+      hideGuide(12000);
+    } else {
+      showGuide(
+        "Chat capability 报告写入失败",
+        String(saveResult?.error || saveResult?.reason || "unknown write failure"),
+        "error"
+      );
+    }
+
+    console.info("[GTE v0.5.4] chat capability", run);
+    return run;
+  }
+
   function loadLatest() {
     try {
       const raw = localStorage.getItem(STORE);
@@ -1420,6 +1523,7 @@ license: UNLICENSED-RESEARCH
   W[API] = {
     version: VERSION,
     runAll: runAll,
+    runChatCapability: runChatCapability,
     abort: abort,
     capability: capability,
     captureCapability: label => {
@@ -1448,5 +1552,5 @@ license: UNLICENSED-RESEARCH
     }
   };
 
-  console.info("[GTE v0.5.4 research] loaded. Start with: await __GTEV054Research.runAll()");
+  console.info("[GTE v0.5.4 research] loaded. Work: await __GTEV054Research.runAll() | Chat capability: await __GTEV054Research.runChatCapability('normal-chat')");
 })();
