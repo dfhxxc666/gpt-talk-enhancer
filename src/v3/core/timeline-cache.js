@@ -15,28 +15,76 @@ export class TimelineCache {
     this.maxConversations = maxConversations;
     this.maxTurnsPerConversation = maxTurnsPerConversation;
     this.signatures = new Map();
+    this.loadDiagnostics = new Map();
   }
 
   load(conversationId) {
+    return this.loadWithHealth(conversationId).turns;
+  }
+
+  loadWithHealth(conversationId) {
     const id = normalizeConversationId(conversationId);
-    if (!id) return [];
+    if (!id) {
+      return {
+        turns: [],
+        status: "invalid-conversation",
+        health: analyzeTimelineCacheOrderHealth([]),
+        sourceTurnCount: 0,
+        loadedTurnCount: 0
+      };
+    }
     const root = this.#readRoot();
     const entry = root.conversations[id];
-    if (!entry || !Array.isArray(entry.turns)) return [];
-    const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(turns)) {
-      this.signatures.delete(id);
-      return trustedOrderAnchors(turns);
+    if (!entry || !Array.isArray(entry.turns)) {
+      const diagnostics = {
+        status: "empty",
+        health: analyzeTimelineCacheOrderHealth([]),
+        sourceTurnCount: 0,
+        loadedTurnCount: 0
+      };
+      this.loadDiagnostics.set(id, diagnostics);
+      return { turns: [], ...diagnostics };
     }
+
+    const health = analyzeTimelineCacheOrderHealth(entry.turns);
+    const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
+    if (health.corrupt) {
+      const salvaged = trustedOrderAnchors(turns);
+      const diagnostics = {
+        status: salvaged.length ? "salvaged" : "rejected",
+        health,
+        sourceTurnCount: entry.turns.length,
+        loadedTurnCount: salvaged.length
+      };
+      this.signatures.delete(id);
+      this.loadDiagnostics.set(id, diagnostics);
+      return { turns: salvaged, ...diagnostics };
+    }
+
+    const diagnostics = {
+      status: "healthy",
+      health,
+      sourceTurnCount: entry.turns.length,
+      loadedTurnCount: turns.length
+    };
     this.signatures.set(id, turnSignature(turns));
-    return turns;
+    this.loadDiagnostics.set(id, diagnostics);
+    return { turns, ...diagnostics };
+  }
+
+  getLoadDiagnostics(conversationId) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return null;
+    const value = this.loadDiagnostics.get(id);
+    return value ? JSON.parse(JSON.stringify(value)) : null;
   }
 
   save(conversationId, turns = []) {
     const id = normalizeConversationId(conversationId);
     if (!id) return false;
+    const health = analyzeTimelineCacheOrderHealth(turns);
+    if (health.corrupt) return false;
     const normalized = normalizeTurns(turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(normalized)) return false;
     const signature = turnSignature(normalized);
     if (this.signatures.get(id) === signature) return false;
 
@@ -69,7 +117,12 @@ export class TimelineCache {
       .map((entry) => ({
         conversationId: normalizeConversationId(entry.conversationId),
         updatedAt: Number(entry.updatedAt) || 0,
-        turns: normalizeTurns(entry.turns, this.maxTurnsPerConversation)
+        turns: (() => {
+          const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
+          return analyzeTimelineCacheOrderHealth(entry.turns).corrupt
+            ? trustedOrderAnchors(turns)
+            : turns;
+        })()
       }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
@@ -83,11 +136,75 @@ export class TimelineCache {
   }
 }
 
-export function normalizeCachedTurn(input = {}) {
-  if (!input?.id) return null;
+export function analyzeTimelineCacheOrderHealth(turns = []) {
+  const records = Array.isArray(turns) ? turns : [];
+  const ids = new Set();
+  const duplicateIds = [];
+  const counts = new Map();
+  let invalidIdCount = 0;
+  let invalidOrderCount = 0;
+
+  for (const turn of records) {
+    const id = String(turn?.id ?? "").trim();
+    if (!id) {
+      invalidIdCount += 1;
+    } else if (ids.has(id)) {
+      duplicateIds.push(id);
+    } else {
+      ids.add(id);
+    }
+
+    const order = Number(turn?.order);
+    if (!Number.isInteger(order) || order < 0) {
+      invalidOrderCount += 1;
+      continue;
+    }
+    counts.set(order, (counts.get(order) ?? 0) + 1);
+  }
+
+  const orders = [...counts.keys()].sort((a, b) => a - b);
+  const duplicateOrders = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([order]) => order)
+    .sort((a, b) => a - b);
+  const min = orders.length ? orders[0] : null;
+  const max = orders.length ? orders.at(-1) : null;
+  const missingOrders = [];
+  if (Number.isInteger(min) && Number.isInteger(max)) {
+    for (let order = min; order <= max; order += 1) {
+      if (!counts.has(order)) missingOrders.push(order);
+    }
+  }
+
+  const corrupt = invalidIdCount > 0
+    || invalidOrderCount > 0
+    || duplicateIds.length > 0
+    || duplicateOrders.length > 0
+    || missingOrders.length > 0;
+
   return {
-    id: String(input.id),
-    order: Number.isFinite(input.order) ? Number(input.order) : 0,
+    healthy: !corrupt,
+    corrupt,
+    count: records.length,
+    validIdCount: ids.size,
+    uniqueOrderCount: orders.length,
+    min,
+    max,
+    duplicateIds: [...new Set(duplicateIds)].sort(),
+    duplicateOrders,
+    missingOrders,
+    invalidIdCount,
+    invalidOrderCount
+  };
+}
+
+export function normalizeCachedTurn(input = {}) {
+  const id = String(input?.id ?? "").trim();
+  const order = Number(input?.order);
+  if (!id || !Number.isInteger(order) || order < 0) return null;
+  return {
+    id,
+    order,
     text: normalizeWhitespace(input.text),
     shortText: normalizeWhitespace(input.shortText ?? input.text),
     type: String(input.type ?? "text"),
@@ -104,17 +221,6 @@ function normalizeTurns(turns, limit) {
   return [...byId.values()]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
     .slice(0, Math.max(0, Number(limit) || 0));
-}
-
-function hasDuplicateOrders(turns) {
-  const seen = new Set();
-  for (const turn of turns) {
-    if (!Number.isFinite(turn?.order)) continue;
-    const order = Number(turn.order);
-    if (seen.has(order)) return true;
-    seen.add(order);
-  }
-  return false;
 }
 
 function trustedOrderAnchors(turns) {

@@ -1,5 +1,8 @@
 # GPT TalkEnhancer main 稳定检查点（2026-09-20）
 
+状态补充：该 rollback stabilization checkpoint 已由 v0.5.3 Final Acceptance 取代；保留本文仅用于追溯 v0.5.2 回退后的收口过程。
+
+
 状态：PASS / v0.5.2 rollback stabilization checkpoint
 
 本文记录 v0.5.2 因后续实机问题回退后，main 在 v0.5.1 runtime 线上继续完成的稳定性修复。它不是新 release，不移动任何历史 tag。
@@ -111,7 +114,7 @@
 
 最终门禁结果：
 
-- 自动测试：273 / 273 PASS
+- 自动测试：278 / 278 PASS
 - npm run check：PASS
 - npm run build：PASS
 - npm run build:market：PASS
@@ -122,8 +125,8 @@
 ## 7. 最终同步记录
 
 - Runtime version：0.5.1
-- main market SHA-256：98151AB7148A020654E1E585B2690847947C162FFA5B122EA6B16F1F05865B82
-- Desktop bundle SHA-256：51D4548E787CD004370DFE5DD87F7CBAC0C09EF179229B7AC18E51D786C9D1E0
+- main market SHA-256：E2CD1D3150836780C7243337A4573DD5C5711C274A030F9006723755C50FD4F1
+- Desktop bundle SHA-256：ECF85EA64782BBE1D28D7EDBD307FFBB425A71B6F7526689A6940C3F1D8F8D62
 - Codex++ 单文件安装目标：%APPDATA%/Codex++/user_scripts/gpt-talk-enhancer.js
 - Release tags：v0.5.1 / v0.5.2 均保持不动；当前推荐稳定发布线为 v0.5.1
 - 本检查点对应 v0.5.2 回退后的 main 稳定快照，不创建新 tag。

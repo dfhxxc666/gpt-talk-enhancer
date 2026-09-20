@@ -1,6 +1,6 @@
 # GPT TalkEnhancer Known Issues
 
-本文记录 GPT TalkEnhancer Desktop 已确认的问题与历史修复结果。v0.5.2 后续实机使用发现问题并已回退；当前稳定发布线为 v0.5.1，main 在 0.5.1 runtime 标识下继续承载回退后的稳定性修复。
+本文记录 GPT TalkEnhancer Desktop 已确认的问题与历史修复结果。v0.5.2 后续实机使用发现问题并已回退；当前稳定发布线为 v0.5.3；v0.5.2 仍作为已回退历史版本保留。
 
 ## UI-001：全屏 + 折叠左侧栏时 Timeline 跟随侧栏 hover 隐显
 
@@ -206,3 +206,36 @@ Local Work tail target backtracks from physical bottom when the final user turn 
 ```
 
 定向 `host.test.js`：74/74 PASS；完整 `npm run check`：234/234 PASS。
+
+## STAB-001：Chat Timeline order 污染与滚动所有权
+
+- 状态：Resolved in v0.5.3
+- 类型：Chat Timeline / Cache / Navigation stability
+
+### 现象
+
+手机或其他设备创建的 Chat 曾出现 Q 编号洞，例如缺少 Q16；继续点击中段 Q 时，页面可能在两个虚拟窗口之间上下振荡。
+
+### 根因
+
+运行态 TurnIndex 曾允许重复或缺失 global order；旧 cache 与新 UUID window 冲突时，occupied-order 会阻止新记录进入，而 navigation 仍可能继续使用已污染 index。
+
+另一个潜在边界是首次 bootstrap 尚未结束时，手动 Load All 仍可尝试启动第二条 Chat history hydration。
+
+### v0.5.3 收口
+
+- TimelineCache 在 load/save 边界验证 id/order、duplicate 与内部 gap。
+- 损坏 cache 只 salvage self-describing trusted anchors，否则拒绝恢复。
+- replaceDomSnapshot 在替换前验证完整、连续、唯一的 snapshot，失败时保持旧 index 原样。
+- 同 refresh staged-order collision 被拒绝。
+- 运行态 orderHealth 继续检测 duplicate / missing order，并触发纯 DOM index repair。
+- scrollOwnership 汇总 bootstrap / repair / earlier / navigation 所有权。
+- bootstrap 持有 Chat scroll 时，manual Load All 不会启动第二个滚动任务。
+- repair 期间 Timeline navigation 保持互斥。
+
+### 验证
+
+- 用户实机在修复前置版本确认：Q16 恢复、Q13 不再上下跳，反馈为“无问题，好了”。
+- v0.5.3 consolidation 自动回归：Desktop v3 226 / 226 PASS；全量 284 / 284 PASS。
+- Work frozen path 保持 PASS。
+- CHAT_PREDICTIVE_FAST_PATH=ABSENT。

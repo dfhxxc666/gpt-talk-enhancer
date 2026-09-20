@@ -406,7 +406,7 @@ test("Prompt and Timeline CSS avoid the old fixed panel geometry", () => {
 });
 
 
-test("Restored v0.5.2 Question List defers active follow until the next frame", () => {
+test("Question List defers active follow until the next frame", () => {
   const document = new FakeDocument();
   const root = new FakeElement();
   let scheduled = null;
@@ -429,7 +429,7 @@ test("Restored v0.5.2 Question List defers active follow until the next frame", 
   assert.equal(follows, 1);
 });
 
-test("Restored v0.5.2 AppShell hides Prompt when host overlay blocks it", () => {
+test("AppShell hides Prompt when host overlay blocks it", () => {
   const shell = new AppShell({ host: { isPromptOverlayBlocked: () => true } });
   const calls = [];
   shell.rail = { setVisible: (value) => calls.push(["rail", value]) };

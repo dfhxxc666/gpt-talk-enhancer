@@ -52,8 +52,8 @@ export class TurnIndex {
   replaceDomSnapshot(records = []) {
     const existing = [...this.records.values()];
     if (existing.some((record) => record.source !== "dom")) return false;
-    const next = (Array.isArray(records) ? records : []).filter((record) => record?.id);
-    if (!next.length) return false;
+    const next = Array.isArray(records) ? records : [];
+    if (!isValidCompleteDomSnapshot(next)) return false;
     this.records.clear();
     this.aliases.clear();
     this.mergeMany(next.map((record) => ({ ...record, source: "dom" })));
@@ -268,6 +268,25 @@ export class TurnIndex {
   signature() {
     return this.getOrdered().map((record) => `${record.id}\u0000${record.order}\u0000${record.text}`).join("\u0001");
   }
+}
+
+export function isValidCompleteDomSnapshot(records = []) {
+  const values = Array.isArray(records) ? records : [];
+  if (!values.length) return false;
+  const ids = new Set();
+  const orders = new Set();
+  for (const record of values) {
+    const id = String(record?.id ?? "").trim();
+    const order = Number(record?.order);
+    if (!id || ids.has(id) || !Number.isInteger(order) || order < 0 || orders.has(order)) return false;
+    ids.add(id);
+    orders.add(order);
+  }
+  if (!orders.has(0) || orders.size !== values.length) return false;
+  for (let order = 0; order < values.length; order += 1) {
+    if (!orders.has(order)) return false;
+  }
+  return true;
 }
 
 export function compareTurns(a, b) {

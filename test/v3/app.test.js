@@ -2069,7 +2069,7 @@ test("navigation debug preserves detailed failure diagnostics", async () => {
 test("debug status exposes requested v3 runtime fields", () => {
   const { app } = createHarness();
   const status = app.status();
-  assert.equal(status.version, "0.5.1");
+  assert.equal(status.version, "0.5.3");
   assert.deepEqual(status.conversationIdentity, { id: "A", source: "test", host: "test", kind: "conversation", stable: true });
   assert.equal(status.host, "codex-desktop");
   assert.equal(status.hostContract.revision, "codex-desktop-v1");
@@ -2334,7 +2334,7 @@ test("Local Work navigation waits for the short host restore settle window", asy
 });
 
 
-test("Restored v0.5.2 saves current Work scroll before switching threads", () => {
+test("Work saves current scroll before switching threads", () => {
   const { app, host } = createHarness();
   let saved = 0;
   host.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
@@ -2348,7 +2348,7 @@ test("Restored v0.5.2 saves current Work scroll before switching threads", () =>
   assert.equal(saved, 1);
 });
 
-test("Restored v0.5.2 notifies Codex++ before isolated Work navigation", async () => {
+test("Work notifies Codex++ before isolated navigation", async () => {
   const { app, host } = createHarness();
   host.getConversationIdentity = () => ({ id: "local:01a057ce-32ff-75b3-83fb-4179df90399f", source: "sidebar-local", host: "local", kind: "local", stable: true });
   app.localNavigationSettleUntil = 0;
@@ -2390,6 +2390,68 @@ test("Work earliest Question loads one batch while the header Load All action hy
   assert.equal(app.loadAllEarlierHistory(), true);
   await app.workEarlierHydrationPromise;
   assert.deepEqual(calls, [true, false]);
+});
+
+test("Chat manual Load All refuses to start while bootstrap owns the scroll container", async () => {
+  const { app, host } = createHarness();
+  const conversationId = "chat-bootstrap-owner";
+  const index = new TurnIndex();
+  index.mergeMany([{ id: "q1", order: 0, text: "Q1", source: "dom", visible: false }]);
+  app.turnIndexes.set(conversationId, index);
+  app.currentConversationId = conversationId;
+  app.shell.getStatus = () => ({
+    timelineMounted: true,
+    promptMounted: true,
+    questionPanelOpen: true,
+    promptPanelOpen: false
+  });
+  const identity = { id: conversationId, source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true };
+  host.getConversationIdentity = () => identity;
+  host.getConversationId = () => conversationId;
+  let hydrateCalls = 0;
+  host.hydrateChatEarlierHistory = async () => {
+    hydrateCalls += 1;
+    return { ok: true, started: true, reason: "earlier-boundary-exhausted" };
+  };
+  app.chatBootstrapHydrationPromise = Promise.resolve({ ok: true });
+  app.lastChatBootstrapDiagnostics = { repairReason: null };
+
+  assert.equal(app.maybeStartChatEarlierHydration({
+    conversationId,
+    index,
+    identity,
+    explicit: true
+  }), false);
+  assert.equal(hydrateCalls, 0);
+  assert.deepEqual(app.getScrollOwnershipState(), {
+    owner: "chat-bootstrap",
+    owners: ["chat-bootstrap"],
+    conflict: false
+  });
+});
+
+test("Scroll ownership diagnostics distinguish repair and detect impossible overlap", () => {
+  const { app } = createHarness();
+  assert.deepEqual(app.getScrollOwnershipState(), {
+    owner: "idle",
+    owners: [],
+    conflict: false
+  });
+
+  app.chatBootstrapHydrationPromise = Promise.resolve();
+  app.lastChatBootstrapDiagnostics = { repairReason: "corrupt-dom-orders" };
+  assert.deepEqual(app.getScrollOwnershipState(), {
+    owner: "chat-repair",
+    owners: ["chat-repair"],
+    conflict: false
+  });
+
+  app.chatEarlierHydrationPromise = Promise.resolve();
+  assert.deepEqual(app.getScrollOwnershipState(), {
+    owner: "conflict",
+    owners: ["chat-repair", "chat-earlier"],
+    conflict: true
+  });
 });
 
 test("Chat header Load All action uses the isolated Chat history hydrator", async () => {

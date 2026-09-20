@@ -1961,7 +1961,7 @@ test("Chat unknown UUID window replacement counts as structural hydration progre
   assert.equal(outcome.progressed, true);
 });
 
-test("Restored v0.5.2 Work Later uses positive wheel hydration on the isolated Work navigator", async () => {
+test("Work Later uses positive wheel hydration on the isolated Work navigator", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
@@ -1996,7 +1996,7 @@ test("Restored v0.5.2 Work Later uses positive wheel hydration on the isolated W
   assert.ok(wheelDeltas.every((value) => value > 0));
 });
 
-test("Restored Work tail backtracks from physical bottom to the final user turn", async () => {
+test("Work tail backtracks from physical bottom to the final user turn", async () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   window.getComputedStyle = () => ({ flexDirection: "column-reverse" });
@@ -2030,7 +2030,7 @@ test("Restored Work tail backtracks from physical bottom to the final user turn"
   assert.ok(trace.some((entry) => entry.mode === "work-tail-backtrack" && entry.direction === -1));
 });
 
-test("CodexDesktopHost restored navigation intent uses only the active Work navigator", () => {
+test("CodexDesktopHost navigation intent uses only the active Work navigator", () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   const host = new CodexDesktopHost({ document, window });
@@ -2047,7 +2047,7 @@ test("CodexDesktopHost restored navigation intent uses only the active Work navi
   assert.equal(chatCalls, 0);
 });
 
-test("ComposerAdapter restored v0.5.2 anchor rejects a page-sized form", () => {
+test("ComposerAdapter anchor rejects a page-sized form", () => {
   const document = new FakeDocument();
   const window = fakeWindow(document);
   const pageForm = new FakeElement("form");
@@ -2063,7 +2063,7 @@ test("ComposerAdapter restored v0.5.2 anchor rejects a page-sized form", () => {
   assert.equal(adapter.getComposerForm(), local);
 });
 
-test("OverlayDetector restored v0.5.2 blocks visible host dialog", () => {
+test("OverlayDetector blocks a visible host dialog", () => {
   const document = new FakeDocument();
   const dialog = new FakeElement("div");
   dialog.setAttribute("role", "dialog");

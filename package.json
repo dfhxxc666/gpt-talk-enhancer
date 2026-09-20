@@ -1,11 +1,12 @@
 {
   "name": "gpt-talk-enhancer",
-  "version": "0.5.1",
+  "version": "0.5.3",
   "private": true,
   "type": "module",
   "description": "Desktop-first ChatGPT/Codex conversation timeline and prompt library with a hybrid Codex++ host architecture.",
   "scripts": {
     "test": "node --test",
+    "test:v3-regression": "node --test test/v3/app.test.js test/v3/core.test.js test/v3/host.test.js test/v3/ui.test.js",
     "build": "npm run build:userscript && npm run build:extension && npm run build:v3",
     "check": "npm test && npm run build",
     "build:userscript": "node scripts/build.mjs",

@@ -12,6 +12,8 @@
 | SHELL-PS-001 | PowerShell、$Host、别名 r、脚本补丁 | Windows 开发命令 | 有效 | [避免 PowerShell 保留变量和短别名](#shell-ps-001避免-powershell-保留变量和短别名) |
 | TEST-PATH-001 | Project Relay、fixture、Windows、Filename too long、CWapi durable | Relay 隔离测试 | 有效 | [长工作区下缩短 fixture 路径](#test-path-001长工作区下缩短-fixture-路径) |
 | NAV-TAIL-001 | Work、最后一问、physical tail、长 assistant 回复、Q71、未能定位 | Local Work Timeline 导航 | 有效 | [最后一问不等于对话最底部](#nav-tail-001最后一问不等于对话最底部) |
+| CACHE-ORDER-001 | cache、duplicate order、missing Q、occupied-order | Chat Timeline Cache | 有效 | 坏 cache 必须在恢复边界被拦截 |
+| SCROLL-OWNER-001 | bootstrap、repair、Earlier、navigation、上下跳动 | Chat scroll ownership | 有效 | 同一时刻只能有一个滚动所有者 |
 
 ## ENV-WORKSPACE-001：绑定实际执行环境与 worktree
 
@@ -84,6 +86,28 @@
 - **适用**：v0.5.2 后续 main 的 Local Work Navigation。
 - **最后验证**：2026-09-10 自动回归；真实修复后的宿主复验待本次安装后确认。
 - **失效条件**：Codex Desktop 改变 Local Work 虚拟化/scroll model，或未来有公开稳定的 turn navigation API 时重新评估。
+## CACHE-ORDER-001：坏 cache 必须在恢复边界被拦截
+
+- 状态：有效
+- 触发：Timeline 缺 Q、duplicate order、stale cache、occupied-order 冲突。
+- 错误做法：先把 cache 全量灌入 TurnIndex，再等待 reconcile 或 navigation 在后续阶段发现污染。
+- 正确动作：TimelineCache load/save 先验证 id/order 不变量；duplicate、invalid 或内部 gap 视为 corrupt。仅 self-describing fallback anchor 可以 salvage，其余 fail-closed。
+- 原子性要求：repair snapshot 必须先完整验证，再替换旧 TurnIndex；验证失败不得先 clear。
+- 最小验证：gapped UUID cache 返回 rejected；duplicate cache 只保留可信 anchor；非法 snapshot 替换失败后旧 index 内容不变。
+- 适用：v0.5.3 及后续 Chat Timeline。
+- 最后验证：2026-09-20，自动回归 PASS。
+
+## SCROLL-OWNER-001：同一时刻只能有一个滚动所有者
+
+- 状态：有效
+- 触发：bootstrap、repair、manual Earlier / Load All、Timeline navigation 同时可能驱动虚拟列表。
+- 错误做法：只靠各自 promise 或局部 flag 判断，不定义统一 ownership，导致两个控制器都认为自己可以继续写 scrollTop。
+- 正确动作：汇总 scrollOwnership；正常状态只能是 idle 或单一 owner。出现 conflict 视为诊断异常。bootstrap 持有 scroll 时 manual Load All fail-closed；repair 期间 navigation 不启动。
+- v0.5.4 约束：任何 fast path candidate 只能在 order health healthy、identity stable、scroll owner idle 时启动；否则直接走 v0.5.3 baseline。
+- 最小验证：bootstrap + manual Load All 不产生第二次 hydration；人工构造双 owner 时 diagnostics.conflict=true。
+- 适用：v0.5.3 及后续所有导航/快路径研究。
+- 最后验证：2026-09-20，自动回归 PASS。
+
 ## 维护规则
 
 - 只记录有证据、可复用的失误、防错动作或冻结路线；不保存每轮尝试。

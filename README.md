@@ -1,6 +1,6 @@
 # GPT TalkEnhancer
 
-GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定运行线为 **v0.5.1**。
+GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量增强项目，当前稳定运行线为 **v0.5.3**。
 
 它专注于两个核心能力：
 
@@ -24,22 +24,22 @@ GPT TalkEnhancer 是一个面向 **Codex / ChatGPT Desktop + Codex++** 的轻量
 
 ## 当前状态
 
-**main / rollback-stabilized · runtime v0.5.1**
+**v0.5.3 / stable**
 
-- 自动测试：273 / 273 PASS
+- 自动测试：284 / 284 PASS
 - `npm run check`：PASS
 - `npm run build`：PASS
 - `npm run build:market`：PASS
 - 真实 Codex Desktop Chat / Work：PASS
 - Codex++ 单文件安装：PASS
-- 当前 main 单文件 SHA-256：98151AB7148A020654E1E585B2690847947C162FFA5B122EA6B16F1F05865B82
-- 当前 main Desktop bundle SHA-256：51D4548E787CD004370DFE5DD87F7CBAC0C09EF179229B7AC18E51D786C9D1E0
+- v0.5.3 单文件 SHA-256：576B45744AD682405C42831670906059A5E4EE60E8CC601E0C42E699C26A9627
+- v0.5.3 Desktop bundle SHA-256：19B003F9A02A61828C6DF4286508BB31AE8DC521F5C66D0CC74134AEA51737CA
 
-正式稳定发布基线见 docs/V0.5.1-FINAL-ACCEPTANCE.zh-CN.md。v0.5.2 的验收与研究文档继续保留为历史记录，但该版本已因后续实机问题回退。
+v0.5.3 正式验收见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。v0.5.2 的验收与研究文档继续保留为历史记录，但该版本已因后续实机问题回退。
 
-v0.5.2、v0.5.1、v0.5.0 与 v0.4.5 均保留原 tag；当前推荐稳定发布线为 v0.5.1。
+v0.5.2、v0.5.1、v0.5.0 与 v0.4.5 均保留原 tag；当前推荐稳定发布线为 v0.5.3。
 
-main 当前沿用 0.5.1 runtime 标识，并包含 v0.5.2 回退后继续完成的 Chat / Work 稳定性修复；当前主线检查点见 docs/MAIN-STABILITY-CHECKPOINT-2026-09-20.zh-CN.md。
+main 已将 v0.5.2 回退后的 Chat / Work 稳定性修复正式收口为 v0.5.3；后续快路径研究进入 v0.5.4 独立阶段。
 
 ## 环境要求
 
@@ -47,28 +47,28 @@ main 当前沿用 0.5.1 runtime 标识，并包含 v0.5.2 回退后继续完成�
 
 - Windows 11
 - Codex / ChatGPT Desktop
-- Codex++，已确认可工作的版本：`1.2.56`
+- Codex++，已确认可工作的版本：`1.3.0`
 - Codex++ User Scripts 功能已启用
 
-> `1.2.56` 是当前已验证版本，不代表严格的最低兼容版本。
+> `1.3.0` 是当前已验证版本，不代表严格的最低兼容版本。
 
 ## 安装
 
 ### 方式一：AI 一键安装（推荐）
 
-如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。v0.5.1 稳定发布版的推荐安装形态继续为 **一个 User Script 文件**。
+如果你正在使用能够访问本机文件和终端的 AI coding agent，可以直接把下面整段提示词交给它。v0.5.3 稳定发布版的推荐安装形态继续为 **一个 User Script 文件**。
 
 ```text
-请为我安装 GPT TalkEnhancer v0.5.1 到当前 Windows 用户的 Codex++ User Scripts。
+请为我安装 GPT TalkEnhancer v0.5.3 到当前 Windows 用户的 Codex++ User Scripts。
 
 要求：
-1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.5.1 tag 获取：
+1. 只从官方仓库 https://github.com/dfhxxc666/gpt-talk-enhancer 的 v0.5.3 tag 获取：
    - dist/market/gpt-talk-enhancer.js
    不要使用 main 上的开发版本。
 2. 安装目标为 %APPDATA%\Codex++\user_scripts\gpt-talk-enhancer.js；目录不存在时可以创建。
 3. 只新增或更新这个 GPT TalkEnhancer 文件，不要删除、覆盖或修改其他 User Scripts，也不要修改 Codex++ 本体。
 4. 下载后核对 SHA-256：
-   - gpt-talk-enhancer.js = C38332911D1DE554559B3760FA7B80D368A00985EE265078CE899876A8E0FB03
+   - gpt-talk-enhancer.js = 576B45744AD682405C42831670906059A5E4EE60E8CC601E0C42E699C26A9627
 5. 如果本机有 Node.js，对已安装文件执行 node --check。
 6. 不要直接编辑 Codex++ 的 user_scripts.json；如旧版 0.4.x 双文件仍处于启用状态，请告诉我在 Codex++ UI 中禁用旧的 00-gpt-talk-enhancer.v3.bundle.js 与 10-gpt-talk-enhancer.v3.loader.js，避免重复加载，不要擅自删除其他文件。
 7. 完成后报告安装路径、实际 SHA-256、语法检查结果，以及是否需要重启 Codex Desktop。
@@ -78,7 +78,7 @@ main 当前沿用 0.5.1 runtime 标识，并包含 v0.5.2 回退后继续完成�
 
 ### 方式二：使用稳定单文件
 
-1. 下载或克隆 `v0.5.1` 对应源码。
+1. 下载或克隆 `v0.5.3` 对应源码。
 2. 找到：
 
 ```text
@@ -110,7 +110,7 @@ npm run build:market
 
 推荐安装 `dist/market/gpt-talk-enhancer.js`。
 
-`dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 与 `dist/v3/10-gpt-talk-enhancer.v3.loader.js` 继续保留为开发/兼容构建，但不再是 v0.5.1 推荐安装形态。
+`dist/v3/00-gpt-talk-enhancer.v3.bundle.js` 与 `dist/v3/10-gpt-talk-enhancer.v3.loader.js` 继续保留为开发/兼容构建，但不再是 v0.5.3 推荐安装形态。
 
 ## 验证安装
 
@@ -123,7 +123,7 @@ window.__GPTTalkEnhancerDebug
 正常情况下应至少能看到：
 
 ```text
-version: 0.5.1
+version: 0.5.3
 hostContract.status: ready
 ```
 
@@ -273,10 +273,15 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 - [`docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md`](docs/V0.4.4-WIP-CHECKPOINT.zh-CN.md)：0.4.4 长 Work / Local Thread 调试与验收记录
 - [`docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md`](docs/V0.3-FINAL-ACCEPTANCE.zh-CN.md)：0.3 Desktop 架构基线
 
+- docs/V0.5.3-WIP-CHECKPOINT.zh-CN.md：v0.5.3 当前工作检查点
+- docs/V0.5.3-REGRESSION-MATRIX.zh-CN.md：v0.5.3 固定回归矩阵
+
 ## 已知问题
 
-当前问题与历史修复记录见 docs/KNOWN-ISSUES.zh-CN.md。v0.5.2 后续实机使用发现问题并已回退；当前在 0.5.1 runtime 线上继续收口 Timeline 稳定性，新的产品功能候选继续留到 0.6.0。
+当前问题与历史修复记录见 docs/KNOWN-ISSUES.zh-CN.md。v0.5.2 后续实机使用发现问题并已回退；其后的稳定性修复已在 v0.5.3 收口。下一阶段为 v0.5.4 Fast Path Research，产品功能继续留到 v0.6.0。
 
 ## Roadmap
 
-0.4.x 已冻结。0.5.0 完成 Compatibility & Distribution 基线；0.5.1 是当前稳定发布线；0.5.2 作为历史发布保留，但后续实机问题导致回退。当前 main 在 0.5.1 runtime 标识下继续稳定性修复，新的产品功能候选推迟到 0.6.0。
+- v0.5.3：Recovery & Consolidation，已完成并冻结为当前稳定基线。详见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。
+- v0.5.4：Fast Path Research。继续研究 Chat / Work 导航快路径，但实验默认关闭，正常运行时保持 v0.5.3 baseline。详见 docs/V0.5.4-FAST-PATH-RESEARCH-PLAN.zh-CN.md。
+- v0.6.0：Product Features。优先 Timeline Search + Prompt Library v2，并在完整回归保护下逐步拆分 bootstrap.js。详见 docs/V0.6.0-PLAN.zh-CN.md。

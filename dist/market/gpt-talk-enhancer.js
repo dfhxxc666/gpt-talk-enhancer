@@ -2,7 +2,7 @@
 @codex-plus-script
 name: GPT TalkEnhancer
 description: Conversation Timeline / Question List and Prompt Library for Codex Desktop.
-version: 0.5.1
+version: 0.5.3
 author: dfhxxc666
 homepage: https://github.com/dfhxxc666/gpt-talk-enhancer
 license: GPL-3.0-or-later
@@ -12,7 +12,7 @@ See the project NOTICE.md and LICENSE for attribution and license details.
 */
 
 /*
- * GPT TalkEnhancer 0.5.1 Desktop bundle
+ * GPT TalkEnhancer 0.5.3 Desktop bundle
  * Includes GPL-3.0-or-later derived Timeline UI material.
  * See NOTICE-GPL.md and THIRD_PARTY_GPL-3.0.txt in this distribution.
  */
@@ -258,8 +258,8 @@ class TurnIndex {
   replaceDomSnapshot(records = []) {
     const existing = [...this.records.values()];
     if (existing.some((record) => record.source !== "dom")) return false;
-    const next = (Array.isArray(records) ? records : []).filter((record) => record?.id);
-    if (!next.length) return false;
+    const next = Array.isArray(records) ? records : [];
+    if (!isValidCompleteDomSnapshot(next)) return false;
     this.records.clear();
     this.aliases.clear();
     this.mergeMany(next.map((record) => ({ ...record, source: "dom" })));
@@ -476,6 +476,25 @@ class TurnIndex {
   }
 }
 
+function isValidCompleteDomSnapshot(records = []) {
+  const values = Array.isArray(records) ? records : [];
+  if (!values.length) return false;
+  const ids = new Set();
+  const orders = new Set();
+  for (const record of values) {
+    const id = String(record?.id ?? "").trim();
+    const order = Number(record?.order);
+    if (!id || ids.has(id) || !Number.isInteger(order) || order < 0 || orders.has(order)) return false;
+    ids.add(id);
+    orders.add(order);
+  }
+  if (!orders.has(0) || orders.size !== values.length) return false;
+  for (let order = 0; order < values.length; order += 1) {
+    if (!orders.has(order)) return false;
+  }
+  return true;
+}
+
 function compareTurns(a, b) {
   return finiteOr(a?.order, Number.MAX_SAFE_INTEGER) - finiteOr(b?.order, Number.MAX_SAFE_INTEGER)
     || String(a?.id ?? "").localeCompare(String(b?.id ?? ""));
@@ -517,7 +536,7 @@ function finiteOr(...values) {
   return 0;
 }
 
-Object.assign(exports, { TurnIndex, compareTurns, fallbackOrder, isUuidV7, legacyTurnOrder });
+Object.assign(exports, { TurnIndex, isValidCompleteDomSnapshot, compareTurns, fallbackOrder, isUuidV7, legacyTurnOrder });
 
 },
 "src/v3/core/timeline-state.js": (module, exports, __require) => {
@@ -713,28 +732,76 @@ class TimelineCache {
     this.maxConversations = maxConversations;
     this.maxTurnsPerConversation = maxTurnsPerConversation;
     this.signatures = new Map();
+    this.loadDiagnostics = new Map();
   }
 
   load(conversationId) {
+    return this.loadWithHealth(conversationId).turns;
+  }
+
+  loadWithHealth(conversationId) {
     const id = normalizeConversationId(conversationId);
-    if (!id) return [];
+    if (!id) {
+      return {
+        turns: [],
+        status: "invalid-conversation",
+        health: analyzeTimelineCacheOrderHealth([]),
+        sourceTurnCount: 0,
+        loadedTurnCount: 0
+      };
+    }
     const root = this.#readRoot();
     const entry = root.conversations[id];
-    if (!entry || !Array.isArray(entry.turns)) return [];
-    const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(turns)) {
-      this.signatures.delete(id);
-      return trustedOrderAnchors(turns);
+    if (!entry || !Array.isArray(entry.turns)) {
+      const diagnostics = {
+        status: "empty",
+        health: analyzeTimelineCacheOrderHealth([]),
+        sourceTurnCount: 0,
+        loadedTurnCount: 0
+      };
+      this.loadDiagnostics.set(id, diagnostics);
+      return { turns: [], ...diagnostics };
     }
+
+    const health = analyzeTimelineCacheOrderHealth(entry.turns);
+    const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
+    if (health.corrupt) {
+      const salvaged = trustedOrderAnchors(turns);
+      const diagnostics = {
+        status: salvaged.length ? "salvaged" : "rejected",
+        health,
+        sourceTurnCount: entry.turns.length,
+        loadedTurnCount: salvaged.length
+      };
+      this.signatures.delete(id);
+      this.loadDiagnostics.set(id, diagnostics);
+      return { turns: salvaged, ...diagnostics };
+    }
+
+    const diagnostics = {
+      status: "healthy",
+      health,
+      sourceTurnCount: entry.turns.length,
+      loadedTurnCount: turns.length
+    };
     this.signatures.set(id, turnSignature(turns));
-    return turns;
+    this.loadDiagnostics.set(id, diagnostics);
+    return { turns, ...diagnostics };
+  }
+
+  getLoadDiagnostics(conversationId) {
+    const id = normalizeConversationId(conversationId);
+    if (!id) return null;
+    const value = this.loadDiagnostics.get(id);
+    return value ? JSON.parse(JSON.stringify(value)) : null;
   }
 
   save(conversationId, turns = []) {
     const id = normalizeConversationId(conversationId);
     if (!id) return false;
+    const health = analyzeTimelineCacheOrderHealth(turns);
+    if (health.corrupt) return false;
     const normalized = normalizeTurns(turns, this.maxTurnsPerConversation);
-    if (hasDuplicateOrders(normalized)) return false;
     const signature = turnSignature(normalized);
     if (this.signatures.get(id) === signature) return false;
 
@@ -767,7 +834,12 @@ class TimelineCache {
       .map((entry) => ({
         conversationId: normalizeConversationId(entry.conversationId),
         updatedAt: Number(entry.updatedAt) || 0,
-        turns: normalizeTurns(entry.turns, this.maxTurnsPerConversation)
+        turns: (() => {
+          const turns = normalizeTurns(entry.turns, this.maxTurnsPerConversation);
+          return analyzeTimelineCacheOrderHealth(entry.turns).corrupt
+            ? trustedOrderAnchors(turns)
+            : turns;
+        })()
       }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
@@ -781,11 +853,75 @@ class TimelineCache {
   }
 }
 
-function normalizeCachedTurn(input = {}) {
-  if (!input?.id) return null;
+function analyzeTimelineCacheOrderHealth(turns = []) {
+  const records = Array.isArray(turns) ? turns : [];
+  const ids = new Set();
+  const duplicateIds = [];
+  const counts = new Map();
+  let invalidIdCount = 0;
+  let invalidOrderCount = 0;
+
+  for (const turn of records) {
+    const id = String(turn?.id ?? "").trim();
+    if (!id) {
+      invalidIdCount += 1;
+    } else if (ids.has(id)) {
+      duplicateIds.push(id);
+    } else {
+      ids.add(id);
+    }
+
+    const order = Number(turn?.order);
+    if (!Number.isInteger(order) || order < 0) {
+      invalidOrderCount += 1;
+      continue;
+    }
+    counts.set(order, (counts.get(order) ?? 0) + 1);
+  }
+
+  const orders = [...counts.keys()].sort((a, b) => a - b);
+  const duplicateOrders = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([order]) => order)
+    .sort((a, b) => a - b);
+  const min = orders.length ? orders[0] : null;
+  const max = orders.length ? orders.at(-1) : null;
+  const missingOrders = [];
+  if (Number.isInteger(min) && Number.isInteger(max)) {
+    for (let order = min; order <= max; order += 1) {
+      if (!counts.has(order)) missingOrders.push(order);
+    }
+  }
+
+  const corrupt = invalidIdCount > 0
+    || invalidOrderCount > 0
+    || duplicateIds.length > 0
+    || duplicateOrders.length > 0
+    || missingOrders.length > 0;
+
   return {
-    id: String(input.id),
-    order: Number.isFinite(input.order) ? Number(input.order) : 0,
+    healthy: !corrupt,
+    corrupt,
+    count: records.length,
+    validIdCount: ids.size,
+    uniqueOrderCount: orders.length,
+    min,
+    max,
+    duplicateIds: [...new Set(duplicateIds)].sort(),
+    duplicateOrders,
+    missingOrders,
+    invalidIdCount,
+    invalidOrderCount
+  };
+}
+
+function normalizeCachedTurn(input = {}) {
+  const id = String(input?.id ?? "").trim();
+  const order = Number(input?.order);
+  if (!id || !Number.isInteger(order) || order < 0) return null;
+  return {
+    id,
+    order,
     text: normalizeWhitespace(input.text),
     shortText: normalizeWhitespace(input.shortText ?? input.text),
     type: String(input.type ?? "text"),
@@ -802,17 +938,6 @@ function normalizeTurns(turns, limit) {
   return [...byId.values()]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
     .slice(0, Math.max(0, Number(limit) || 0));
-}
-
-function hasDuplicateOrders(turns) {
-  const seen = new Set();
-  for (const turn of turns) {
-    if (!Number.isFinite(turn?.order)) continue;
-    const order = Number(turn.order);
-    if (seen.has(order)) return true;
-    seen.add(order);
-  }
-  return false;
 }
 
 function trustedOrderAnchors(turns) {
@@ -854,7 +979,7 @@ function normalizeWhitespace(value) {
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
-Object.assign(exports, { TIMELINE_CACHE_KEY, TIMELINE_CACHE_SCHEMA_VERSION, TimelineCache, normalizeCachedTurn });
+Object.assign(exports, { TIMELINE_CACHE_KEY, TIMELINE_CACHE_SCHEMA_VERSION, TimelineCache, analyzeTimelineCacheOrderHealth, normalizeCachedTurn });
 
 },
 "src/v3/core/work-timeline-cache.js": (module, exports, __require) => {
@@ -6056,7 +6181,7 @@ const { CodexDesktopHost } = __require("src/v3/host/codex-desktop/codex-host.js"
 const { parseSidebarConversationKey } = __require("src/v3/host/codex-desktop/conversation-adapter.js");
 const { AppShell } = __require("src/v3/ui/app-shell.js");
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.3";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
@@ -7097,6 +7222,7 @@ class TalkEnhancerV3App {
     this.timelineCache = this.chatTimelineCache;
     this.workTimelineCache = new WorkTimelineCache({ storage: this.storage });
     this.cacheHydrationCounts = new Map();
+    this.cacheHydrationDiagnostics = new Map();
     this.turnIndexes = new Map();
     this.currentConversationId = null;
     this.recentStableChatIdentity = null;
@@ -7887,9 +8013,19 @@ class TalkEnhancerV3App {
   getTurnIndex(conversationId) {
     if (!this.turnIndexes.has(conversationId)) {
       const index = new TurnIndex();
-      const cached = this.getTimelineCache(conversationId).load(conversationId);
+      const cache = this.getTimelineCache(conversationId);
+      const loaded = typeof cache?.loadWithHealth === "function"
+        ? cache.loadWithHealth(conversationId)
+        : { turns: cache?.load?.(conversationId) ?? [], status: "legacy", health: null };
+      const cached = Array.isArray(loaded?.turns) ? loaded.turns : [];
       if (cached.length) index.mergeMany(cached.map((turn) => ({ ...turn, source: "dom", visible: false })));
       this.cacheHydrationCounts.set(conversationId, cached.length);
+      this.cacheHydrationDiagnostics.set(conversationId, {
+        status: loaded?.status ?? "unknown",
+        sourceTurnCount: Number(loaded?.sourceTurnCount ?? cached.length),
+        loadedTurnCount: Number(loaded?.loadedTurnCount ?? cached.length),
+        health: loaded?.health ? JSON.parse(JSON.stringify(loaded.health)) : null
+      });
       this.turnIndexes.set(conversationId, index);
     }
     return this.turnIndexes.get(conversationId);
@@ -7898,6 +8034,23 @@ class TalkEnhancerV3App {
   persistTimelineCache(conversationId, index = this.turnIndexes.get(conversationId)) {
     if (!conversationId || !index) return false;
     return this.getTimelineCache(conversationId).save(conversationId, index.getOrdered());
+  }
+
+  getScrollOwnershipState() {
+    const owners = [];
+    if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") {
+      owners.push("navigation");
+    }
+    if (this.chatBootstrapHydrationPromise) {
+      owners.push(this.lastChatBootstrapDiagnostics?.repairReason ? "chat-repair" : "chat-bootstrap");
+    }
+    if (this.chatEarlierHydrationPromise) owners.push("chat-earlier");
+    if (this.workEarlierHydrationPromise) owners.push("work-earlier");
+    return {
+      owner: owners.length === 0 ? "idle" : owners.length === 1 ? owners[0] : "conflict",
+      owners,
+      conflict: owners.length > 1
+    };
   }
 
   getDiagnosticConversationOrdinal(conversationId) {
@@ -8184,7 +8337,8 @@ class TalkEnhancerV3App {
       && trustedVisible.length
       && !repairExistingChatIndex) return false;
     if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
-    if (this.chatEarlierHydrationPromise || this.chatBootstrapHydrationPromise) return true;
+    if (this.chatBootstrapHydrationPromise) return true;
+    if (this.chatEarlierHydrationPromise) return false;
     if (this.chatBootstrapAttempted.has(conversationId)) return false;
     const failureCount = Number(this.chatBootstrapFailures.get(conversationId) ?? 0);
     if (failureCount >= CHAT_BOOTSTRAP_MAX_FAILURES) return false;
@@ -8465,6 +8619,7 @@ class TalkEnhancerV3App {
       return false;
     }
     if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
+    if (this.chatBootstrapHydrationPromise) return false;
     const turnCount = Number(index.size?.() ?? 0);
     if (this.chatEarlierHydrationExhausted.get(conversationId) === turnCount) return false;
     if (this.chatEarlierHydrationPromise) return true;
@@ -8976,6 +9131,7 @@ class TalkEnhancerV3App {
         ...summarizeOrders(knownTurns),
         idModes: idModeCounts(knownTurns),
         cacheRestoredTurns: this.cacheHydrationCounts.get(internalConversationId) ?? 0,
+        cacheHydration: this.cacheHydrationDiagnostics.get(internalConversationId) ?? null,
         orderHealth: analyzeChatIndexOrderHealth(knownTurns)
       },
       visibleContent: Boolean(this.host?.conversation?.hasVisibleConversationContent?.()),
@@ -8990,6 +9146,7 @@ class TalkEnhancerV3App {
       },
       questionPanelOpen: Boolean(shellStatus.questionPanelOpen),
       chatBootstrapDiagnostics: this.lastChatBootstrapDiagnostics ? { ...this.lastChatBootstrapDiagnostics } : null,
+      scrollOwnership: this.getScrollOwnershipState(),
       captureDiagnostics: this.captureDiagnostics.map((entry) => ({ ...entry })),
       chatScrollDiagnostics: this.chatScrollDiagnostics.map((entry) => ({ ...entry, identity: { ...entry.identity } })),
       sidebarStructure: collectSidebarStructureDiagnostics(this.document),
@@ -9030,7 +9187,9 @@ class TalkEnhancerV3App {
         mounted: Boolean(shell.timelineMounted),
         questionPanelOpen: Boolean(shell.questionPanelOpen),
         renderCount: shell.questionRenderCount ?? 0,
-        cacheRestoredTurns: this.cacheHydrationCounts.get(this.currentConversationId) ?? 0
+        cacheRestoredTurns: this.cacheHydrationCounts.get(this.currentConversationId) ?? 0,
+        cacheHydration: this.cacheHydrationDiagnostics.get(this.currentConversationId) ?? null,
+        orderHealth: analyzeChatIndexOrderHealth(index?.getOrdered?.() ?? [])
       },
       prompt: { composerDetected: Boolean(this.host?.getComposer?.()), mounted: Boolean(shell.promptMounted), panelOpen: Boolean(shell.promptPanelOpen) },
       overlayBlocked: surface === SURFACE.MEDIA_VIEWER,
@@ -9041,6 +9200,7 @@ class TalkEnhancerV3App {
       lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
+      scrollOwnership: this.getScrollOwnershipState(),
       pinnedChatProbe: this.pinnedChatProbe ? JSON.parse(JSON.stringify(this.pinnedChatProbe)) : null,
       pinnedClickTransition: this.lastPinnedClickTransition ? { ...this.lastPinnedClickTransition } : null,
       pinnedIdentityLatched: Boolean(this.activePinnedChatConversationId),

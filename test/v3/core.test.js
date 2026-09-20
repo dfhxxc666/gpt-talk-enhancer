@@ -5,7 +5,7 @@ import { TurnIndex } from "../../src/v3/core/turn-index.js";
 import { TimelineState, sampleRailMarkers } from "../../src/v3/core/timeline-state.js";
 import { MemoryStorageAdapter } from "../../src/v3/core/storage.js";
 import { PromptStore } from "../../src/v3/core/prompt-store.js";
-import { TimelineCache, TIMELINE_CACHE_KEY } from "../../src/v3/core/timeline-cache.js";
+import { TimelineCache, TIMELINE_CACHE_KEY, analyzeTimelineCacheOrderHealth } from "../../src/v3/core/timeline-cache.js";
 import { WorkTimelineCache, WORK_TIMELINE_CACHE_KEY } from "../../src/v3/core/work-timeline-cache.js";
 import { normalizeQuestionDisplayText } from "../../src/v3/core/question-display.js";
 
@@ -73,6 +73,32 @@ test("TurnIndex replaces a pure DOM snapshot but refuses to replace capture-back
   captured.mergeMany([{ id: "capture-a", order: 0, text: "captured", source: "capture", visible: false }]);
   assert.equal(captured.replaceDomSnapshot([{ id: "new", order: 0, text: "new", source: "dom", visible: false }]), false);
   assert.deepEqual(captured.getOrdered().map((turn) => turn.id), ["capture-a"]);
+});
+
+test("TurnIndex DOM snapshot replacement is atomic when the candidate snapshot is invalid", () => {
+  const index = new TurnIndex();
+  index.mergeMany([
+    { id: "old-a", order: 0, text: "old A", source: "dom", visible: false },
+    { id: "old-b", order: 1, text: "old B", source: "dom", visible: false }
+  ]);
+  const before = index.getOrdered().map((turn) => [turn.id, turn.order, turn.text]);
+
+  assert.equal(index.replaceDomSnapshot([
+    { id: "new-a", order: 0, text: "new A" },
+    { id: "new-b", order: 0, text: "new B" }
+  ]), false);
+  assert.deepEqual(index.getOrdered().map((turn) => [turn.id, turn.order, turn.text]), before);
+
+  assert.equal(index.replaceDomSnapshot([
+    { id: "new-a", order: 0, text: "new A" },
+    { id: "new-c", order: 2, text: "new C" }
+  ]), false);
+  assert.deepEqual(index.getOrdered().map((turn) => [turn.id, turn.order, turn.text]), before);
+
+  assert.equal(index.replaceDomSnapshot([
+    { id: "new-a", order: -1, text: "new A" }
+  ]), false);
+  assert.deepEqual(index.getOrdered().map((turn) => [turn.id, turn.order, turn.text]), before);
 });
 
 test("TurnIndex canonicalizes fallback-turn ids onto capture order", () => {
@@ -180,6 +206,85 @@ test("PromptStore create/edit/favorite/search/delete persists through adapter", 
   assert.equal(store.list().length, 5);
 });
 
+
+test("TimelineCache order health accepts contiguous partial ranges and rejects gaps or invalid orders", () => {
+  assert.deepEqual(analyzeTimelineCacheOrderHealth([
+    { id: "a", order: 10 },
+    { id: "b", order: 11 },
+    { id: "c", order: 12 }
+  ]), {
+    healthy: true,
+    corrupt: false,
+    count: 3,
+    validIdCount: 3,
+    uniqueOrderCount: 3,
+    min: 10,
+    max: 12,
+    duplicateIds: [],
+    duplicateOrders: [],
+    missingOrders: [],
+    invalidIdCount: 0,
+    invalidOrderCount: 0
+  });
+
+  const gapped = analyzeTimelineCacheOrderHealth([
+    { id: "a", order: 10 },
+    { id: "b", order: 12 }
+  ]);
+  assert.equal(gapped.corrupt, true);
+  assert.deepEqual(gapped.missingOrders, [11]);
+
+  const invalid = analyzeTimelineCacheOrderHealth([
+    { id: "a", order: -1 },
+    { id: "a", order: 1.5 },
+    { id: "", order: 2 }
+  ]);
+  assert.equal(invalid.corrupt, true);
+  assert.equal(invalid.invalidOrderCount, 2);
+  assert.equal(invalid.invalidIdCount, 1);
+  assert.deepEqual(invalid.duplicateIds, ["a"]);
+});
+
+test("TimelineCache loadWithHealth rejects gapped UUID cache and reports the rejected restore", () => {
+  const storage = new MemoryStorageAdapter();
+  storage.write(TIMELINE_CACHE_KEY, {
+    schemaVersion: 1,
+    conversations: {
+      stale: {
+        conversationId: "stale",
+        updatedAt: 1,
+        turns: [
+          { id: "11111111-1111-4111-8111-111111111111", order: 0, text: "Q1" },
+          { id: "33333333-3333-4333-8333-333333333333", order: 2, text: "Q3" }
+        ]
+      }
+    }
+  });
+  const cache = new TimelineCache({ storage });
+  const loaded = cache.loadWithHealth("stale");
+  assert.equal(loaded.status, "rejected");
+  assert.equal(loaded.health.corrupt, true);
+  assert.deepEqual(loaded.health.missingOrders, [1]);
+  assert.deepEqual(loaded.turns, []);
+  assert.deepEqual(cache.getLoadDiagnostics("stale"), {
+    status: "rejected",
+    health: loaded.health,
+    sourceTurnCount: 2,
+    loadedTurnCount: 0
+  });
+});
+
+test("TimelineCache save rejects gapped and invalid-order snapshots", () => {
+  const storage = new MemoryStorageAdapter();
+  const cache = new TimelineCache({ storage });
+  assert.equal(cache.save("gap", [
+    { id: "a", order: 0, text: "A" },
+    { id: "c", order: 2, text: "C" }
+  ]), false);
+  assert.equal(cache.save("negative", [{ id: "a", order: -1, text: "A" }]), false);
+  assert.equal(cache.save("fractional", [{ id: "a", order: 1.5, text: "A" }]), false);
+  assert.equal(storage.read(TIMELINE_CACHE_KEY, null), null);
+});
 
 test("TimelineCache persists only user-turn metadata and skips lastSeen-only rewrites", () => {
   const base = new MemoryStorageAdapter();

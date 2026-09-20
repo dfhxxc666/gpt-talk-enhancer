@@ -13,7 +13,7 @@ import { CodexDesktopHost } from "./host/codex-desktop/codex-host.js";
 import { parseSidebarConversationKey } from "./host/codex-desktop/conversation-adapter.js";
 import { AppShell } from "./ui/app-shell.js";
 
-export const VERSION = "0.5.1";
+export const VERSION = "0.5.3";
 const NAVIGATION_PENDING_DELAY_MS = 650;
 const LOCAL_NAVIGATION_SETTLE_MS = 500;
 const CHAT_CONVERSATION_SETTLE_DELAYS_MS = [240, 600, 1200];
@@ -1054,6 +1054,7 @@ export class TalkEnhancerV3App {
     this.timelineCache = this.chatTimelineCache;
     this.workTimelineCache = new WorkTimelineCache({ storage: this.storage });
     this.cacheHydrationCounts = new Map();
+    this.cacheHydrationDiagnostics = new Map();
     this.turnIndexes = new Map();
     this.currentConversationId = null;
     this.recentStableChatIdentity = null;
@@ -1844,9 +1845,19 @@ export class TalkEnhancerV3App {
   getTurnIndex(conversationId) {
     if (!this.turnIndexes.has(conversationId)) {
       const index = new TurnIndex();
-      const cached = this.getTimelineCache(conversationId).load(conversationId);
+      const cache = this.getTimelineCache(conversationId);
+      const loaded = typeof cache?.loadWithHealth === "function"
+        ? cache.loadWithHealth(conversationId)
+        : { turns: cache?.load?.(conversationId) ?? [], status: "legacy", health: null };
+      const cached = Array.isArray(loaded?.turns) ? loaded.turns : [];
       if (cached.length) index.mergeMany(cached.map((turn) => ({ ...turn, source: "dom", visible: false })));
       this.cacheHydrationCounts.set(conversationId, cached.length);
+      this.cacheHydrationDiagnostics.set(conversationId, {
+        status: loaded?.status ?? "unknown",
+        sourceTurnCount: Number(loaded?.sourceTurnCount ?? cached.length),
+        loadedTurnCount: Number(loaded?.loadedTurnCount ?? cached.length),
+        health: loaded?.health ? JSON.parse(JSON.stringify(loaded.health)) : null
+      });
       this.turnIndexes.set(conversationId, index);
     }
     return this.turnIndexes.get(conversationId);
@@ -1855,6 +1866,23 @@ export class TalkEnhancerV3App {
   persistTimelineCache(conversationId, index = this.turnIndexes.get(conversationId)) {
     if (!conversationId || !index) return false;
     return this.getTimelineCache(conversationId).save(conversationId, index.getOrdered());
+  }
+
+  getScrollOwnershipState() {
+    const owners = [];
+    if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") {
+      owners.push("navigation");
+    }
+    if (this.chatBootstrapHydrationPromise) {
+      owners.push(this.lastChatBootstrapDiagnostics?.repairReason ? "chat-repair" : "chat-bootstrap");
+    }
+    if (this.chatEarlierHydrationPromise) owners.push("chat-earlier");
+    if (this.workEarlierHydrationPromise) owners.push("work-earlier");
+    return {
+      owner: owners.length === 0 ? "idle" : owners.length === 1 ? owners[0] : "conflict",
+      owners,
+      conflict: owners.length > 1
+    };
   }
 
   getDiagnosticConversationOrdinal(conversationId) {
@@ -2141,7 +2169,8 @@ export class TalkEnhancerV3App {
       && trustedVisible.length
       && !repairExistingChatIndex) return false;
     if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
-    if (this.chatEarlierHydrationPromise || this.chatBootstrapHydrationPromise) return true;
+    if (this.chatBootstrapHydrationPromise) return true;
+    if (this.chatEarlierHydrationPromise) return false;
     if (this.chatBootstrapAttempted.has(conversationId)) return false;
     const failureCount = Number(this.chatBootstrapFailures.get(conversationId) ?? 0);
     if (failureCount >= CHAT_BOOTSTRAP_MAX_FAILURES) return false;
@@ -2422,6 +2451,7 @@ export class TalkEnhancerV3App {
       return false;
     }
     if (this.activeNavigation?.status === "running" || this.navigationUx.state === "pending") return false;
+    if (this.chatBootstrapHydrationPromise) return false;
     const turnCount = Number(index.size?.() ?? 0);
     if (this.chatEarlierHydrationExhausted.get(conversationId) === turnCount) return false;
     if (this.chatEarlierHydrationPromise) return true;
@@ -2933,6 +2963,7 @@ export class TalkEnhancerV3App {
         ...summarizeOrders(knownTurns),
         idModes: idModeCounts(knownTurns),
         cacheRestoredTurns: this.cacheHydrationCounts.get(internalConversationId) ?? 0,
+        cacheHydration: this.cacheHydrationDiagnostics.get(internalConversationId) ?? null,
         orderHealth: analyzeChatIndexOrderHealth(knownTurns)
       },
       visibleContent: Boolean(this.host?.conversation?.hasVisibleConversationContent?.()),
@@ -2947,6 +2978,7 @@ export class TalkEnhancerV3App {
       },
       questionPanelOpen: Boolean(shellStatus.questionPanelOpen),
       chatBootstrapDiagnostics: this.lastChatBootstrapDiagnostics ? { ...this.lastChatBootstrapDiagnostics } : null,
+      scrollOwnership: this.getScrollOwnershipState(),
       captureDiagnostics: this.captureDiagnostics.map((entry) => ({ ...entry })),
       chatScrollDiagnostics: this.chatScrollDiagnostics.map((entry) => ({ ...entry, identity: { ...entry.identity } })),
       sidebarStructure: collectSidebarStructureDiagnostics(this.document),
@@ -2987,7 +3019,9 @@ export class TalkEnhancerV3App {
         mounted: Boolean(shell.timelineMounted),
         questionPanelOpen: Boolean(shell.questionPanelOpen),
         renderCount: shell.questionRenderCount ?? 0,
-        cacheRestoredTurns: this.cacheHydrationCounts.get(this.currentConversationId) ?? 0
+        cacheRestoredTurns: this.cacheHydrationCounts.get(this.currentConversationId) ?? 0,
+        cacheHydration: this.cacheHydrationDiagnostics.get(this.currentConversationId) ?? null,
+        orderHealth: analyzeChatIndexOrderHealth(index?.getOrdered?.() ?? [])
       },
       prompt: { composerDetected: Boolean(this.host?.getComposer?.()), mounted: Boolean(shell.promptMounted), panelOpen: Boolean(shell.promptPanelOpen) },
       overlayBlocked: surface === SURFACE.MEDIA_VIEWER,
@@ -2998,6 +3032,7 @@ export class TalkEnhancerV3App {
       lastSlowNavigation: this.slowNavigationHistory.length ? cloneSlowNavigationRecord(this.slowNavigationHistory.at(-1)) : null,
       navigationUx: { ...this.navigationUx },
       navigationCompatibility: this.host?.getNavigationCompatibility?.() ?? null,
+      scrollOwnership: this.getScrollOwnershipState(),
       pinnedChatProbe: this.pinnedChatProbe ? JSON.parse(JSON.stringify(this.pinnedChatProbe)) : null,
       pinnedClickTransition: this.lastPinnedClickTransition ? { ...this.lastPinnedClickTransition } : null,
       pinnedIdentityLatched: Boolean(this.activePinnedChatConversationId),
