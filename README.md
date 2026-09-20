@@ -283,5 +283,5 @@ GPT TalkEnhancer 以 **GNU General Public License v3.0 or later** 发布。详�
 ## Roadmap
 
 - v0.5.3：Recovery & Consolidation，已完成并冻结为当前稳定基线。详见 docs/V0.5.3-FINAL-ACCEPTANCE.zh-CN.md。
-- v0.5.4：Fast Path Research。继续研究 Chat / Work 导航快路径，但实验默认关闭，正常运行时保持 v0.5.3 baseline。详见 docs/V0.5.4-FAST-PATH-RESEARCH-PLAN.zh-CN.md。
+- v0.5.4：Fast Path Research。继续研究 Chat / Work 导航快路径，但实验默认关闭，正常运行时保持 v0.5.3 baseline。主计划见 docs/V0.5.4-FAST-PATH-RESEARCH-PLAN.zh-CN.md；当前未验证 Official Marker 研究快照见 docs/V0.5.4-OFFICIAL-MARKER-RESEARCH-CHECKPOINT.zh-CN.md。
 - v0.6.0：Product Features。优先 Timeline Search + Prompt Library v2，并在完整回归保护下逐步拆分 bootstrap.js。详见 docs/V0.6.0-PLAN.zh-CN.md。
