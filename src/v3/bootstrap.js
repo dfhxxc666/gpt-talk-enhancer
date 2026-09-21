@@ -1104,6 +1104,7 @@ export class TalkEnhancerV3App {
     this.chatBootstrapHydrationPromise = null;
     this.chatBootstrapAttempted = new Set();
     this.chatBootstrapFailures = new Map();
+    this.chatAutoRepairBlocked = new Set();
     this.chatBootstrapRetryTimer = null;
     this.chatBootstrapCollector = null;
     this.chatBootstrapSampleTimer = null;
@@ -2135,6 +2136,7 @@ export class TalkEnhancerV3App {
     const repairExistingChatIndex = repairIncompletePinnedCache
       || repairCorruptDomChatIndex
       || repairConflictedDomChatIndex;
+    const autoRepairBlocked = repairExistingChatIndex && this.chatAutoRepairBlocked.has(conversationId);
     const repairReason = repairCorruptDomChatIndex
       ? "corrupt-dom-orders"
       : repairConflictedDomChatIndex
@@ -2142,13 +2144,34 @@ export class TalkEnhancerV3App {
         : repairIncompletePinnedCache
           ? "incomplete-synthetic-cache"
           : null;
+    if (autoRepairBlocked) {
+      this.lastChatBootstrapDiagnostics = {
+        conversationOrdinal: this.getDiagnosticConversationOrdinal(conversationId),
+        result: "repair-blocked",
+        repairReason,
+        repairRejected: true,
+        repairRejectReason: "previous-shrinking-candidate",
+        preRepairOrderHealth,
+        bootstrapped: false
+      };
+      return false;
+    }
     if (repairCorruptDomChatIndex || repairConflictedDomChatIndex) {
       this.chatBootstrapAttempted.delete(conversationId);
-      this.chatBootstrapFailures.delete(conversationId);
       this.chatEarlierHydrationExhausted.delete(conversationId);
     }
     if (existingTurns.length !== 0 && !repairExistingChatIndex) return false;
     if (!visible.length) return false;
+    if (!repairExistingChatIndex && existingTurns.length === 0 && visible.length === 1) {
+      this.lastChatBootstrapDiagnostics = {
+        conversationOrdinal: this.getDiagnosticConversationOrdinal(conversationId),
+        result: "single-turn-auto-bootstrap-suppressed",
+        visibleTurnCount: 1,
+        preRepairOrderHealth,
+        bootstrapped: false
+      };
+      return false;
+    }
     const container = this.host.getScrollContainer?.() ?? null;
     if (!container || container.isConnected === false) return false;
     const initialUuidWindow = analyzeChatBootstrapWindowForContainer(
@@ -2302,6 +2325,10 @@ export class TalkEnhancerV3App {
         const coversInitialWindow = bootstrapMode !== "uuid"
           || bootstrapSequenceCoversIds(stitched.turns, initialRequiredIds);
         let bootstrapped = false;
+        let repairRejected = false;
+        let repairRejectReason = null;
+        let repairExistingCount = existingTurns.length;
+        let repairCandidateCount = 0;
         if (result?.reason === "earlier-boundary-exhausted"
           && stitched.complete
           && stitched.turns.length
@@ -2317,15 +2344,43 @@ export class TalkEnhancerV3App {
             source: "dom",
             visible: false
           }));
-          const replaced = repairExistingChatIndex
-            ? currentIndex.replaceDomSnapshot?.(snapshot) === true
-            : false;
-          if (!replaced) currentIndex.mergeMany(snapshot);
-          this.persistTimelineCache(conversationId, currentIndex);
-          this.chatEarlierHydrationExhausted.set(conversationId, Number(currentIndex.size?.() ?? stitched.turns.length));
-          this.chatBootstrapAttempted.add(conversationId);
-          this.chatBootstrapFailures.delete(conversationId);
-          bootstrapped = true;
+          const currentExisting = currentIndex.getOrdered?.() ?? [];
+          repairExistingCount = currentExisting.length;
+          repairCandidateCount = snapshot.length;
+
+          let applied = false;
+          if (repairExistingChatIndex) {
+            if (snapshot.length < currentExisting.length) {
+              repairRejected = true;
+              repairRejectReason = "candidate-shrinks-existing";
+              this.chatAutoRepairBlocked.add(conversationId);
+            } else {
+              applied = currentIndex.replaceDomSnapshot?.(snapshot) === true;
+              if (!applied) {
+                repairRejected = true;
+                repairRejectReason = "replacement-rejected";
+              }
+            }
+          } else {
+            currentIndex.mergeMany(snapshot);
+            applied = true;
+          }
+
+          if (applied) {
+            this.persistTimelineCache(conversationId, currentIndex);
+            this.chatEarlierHydrationExhausted.set(conversationId, Number(currentIndex.size?.() ?? stitched.turns.length));
+            this.chatBootstrapAttempted.add(conversationId);
+            this.chatBootstrapFailures.delete(conversationId);
+            this.chatAutoRepairBlocked.delete(conversationId);
+            bootstrapped = true;
+          } else if (isCurrent()) {
+            this.chatBootstrapFailures.set(
+              conversationId,
+              repairRejectReason === "candidate-shrinks-existing"
+                ? CHAT_BOOTSTRAP_MAX_FAILURES
+                : Math.min(CHAT_BOOTSTRAP_MAX_FAILURES, failureCount + 1)
+            );
+          }
         } else if (isCurrent()) {
           this.chatBootstrapFailures.set(
             conversationId,
@@ -2350,6 +2405,10 @@ export class TalkEnhancerV3App {
           repairedConflictedDomIndex: Boolean(bootstrapped && repairConflictedDomChatIndex),
           repairReason,
           repairConflictCount: conflictCount,
+          repairRejected,
+          repairRejectReason,
+          repairExistingCount,
+          repairCandidateCount,
           preRepairOrderHealth,
           bootstrapMode,
           collectionMode,
@@ -2427,6 +2486,10 @@ export class TalkEnhancerV3App {
       repairedConflictedDomIndex: false,
       repairReason,
       repairConflictCount: conflictCount,
+      repairRejected: false,
+      repairRejectReason: null,
+      repairExistingCount: existingTurns.length,
+      repairCandidateCount: 0,
       preRepairOrderHealth,
       bootstrapMode,
       collectionMode: "running",
@@ -2663,17 +2726,17 @@ export class TalkEnhancerV3App {
       && (index.getOrdered?.() ?? []).every((turn) => turn?.source === "dom")
     );
     if (this.chatBootstrapHydrationPromise || repairableChatIndex) {
-      if (repairableChatIndex) {
+      const autoRepairBlocked = repairableChatIndex && this.chatAutoRepairBlocked.has(conversationId);
+      if (repairableChatIndex && !autoRepairBlocked) {
         this.chatBootstrapAttempted.delete(conversationId);
-        this.chatBootstrapFailures.delete(conversationId);
         this.scheduleRefresh("chat-index-repair-before-navigation");
       }
-      this.shell?.showToast?.("正在修复时间线…");
+      this.shell?.showToast?.(autoRepairBlocked ? "时间线索引异常，已暂停自动修复" : "正在修复时间线…");
       return {
         ok: false,
         verified: false,
         target: turnId,
-        reason: "chat-index-repairing",
+        reason: autoRepairBlocked ? "chat-index-auto-repair-blocked" : "chat-index-repairing",
         orderHealth: chatOrderHealth
       };
     }

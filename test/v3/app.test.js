@@ -1137,12 +1137,48 @@ test("Mobile-created Chat bootstraps Q order only after true-top history exhaust
   assert.equal(app.lastChatBootstrapDiagnostics.bootstrapped, true);
 });
 
+test("Chat auto bootstrap stays idle for one unanchored visible turn", () => {
+  const { app, host } = createHarness();
+  const conversationId = "fresh-single-turn";
+  const container = { scrollTop: 0, isConnected: true };
+  const visible = [
+    { id: "12345678-1234-4234-8234-123456789e01", order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q1", source: "dom", visible: true }
+  ];
+  const identity = { id: conversationId, source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true };
+  let hydrateCalls = 0;
+
+  app.turnIndexes.clear();
+  app.currentConversationId = conversationId;
+  host.getConversationId = () => conversationId;
+  host.getConversationIdentity = () => identity;
+  host.getScrollContainer = () => container;
+  host.getVisibleTurns = () => visible;
+  host.getChatVisibleTurns = () => visible;
+  host.hydrateChatEarlierHistory = async () => {
+    hydrateCalls += 1;
+    return { ok: true, started: true, reason: "earlier-boundary-exhausted" };
+  };
+
+  const index = app.getTurnIndex(conversationId);
+  assert.equal(app.maybeStartChatTrueTopBootstrap({
+    conversationId,
+    index,
+    identity,
+    visibleRecords: visible,
+    trustedVisible: []
+  }), false);
+  assert.equal(hydrateCalls, 0);
+  assert.equal(app.chatBootstrapHydrationPromise, null);
+  assert.equal(app.lastChatBootstrapDiagnostics.result, "single-turn-auto-bootstrap-suppressed");
+});
+
 test("Chat true-top bootstrap fails closed when UUID windows cannot form a contiguous overlap chain", async () => {
   const { app, host } = createHarness();
   const conversationId = "mobile-gap";
   const container = { scrollTop: 0, isConnected: true };
   let currentWindow = [
-    { id: "12345678-1234-4234-8234-123456789d03", order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q3", source: "dom", visible: true }
+    { id: "12345678-1234-4234-8234-123456789d03", order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q3", source: "dom", visible: true },
+    { id: "12345678-1234-4234-8234-123456789d04", order: 1, windowOrder: 1, visualOrder: 1, orderTrust: "window", text: "Q4", source: "dom", visible: true }
   ];
   const identity = { id: conversationId, source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true };
   app.turnIndexes.clear();
@@ -1154,7 +1190,8 @@ test("Chat true-top bootstrap fails closed when UUID windows cannot form a conti
   host.getVisibleTurns = () => currentWindow;
   host.hydrateChatEarlierHistory = async ({ onProgress }) => {
     currentWindow = [
-      { id: "12345678-1234-4234-8234-123456789d01", order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q1", source: "dom", visible: true }
+      { id: "12345678-1234-4234-8234-123456789d01", order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q1", source: "dom", visible: true },
+      { id: "12345678-1234-4234-8234-123456789d02", order: 1, windowOrder: 1, visualOrder: 1, orderTrust: "window", text: "Q2", source: "dom", visible: true }
     ];
     onProgress?.();
     return { ok: true, started: true, reason: "earlier-boundary-exhausted" };
@@ -1845,6 +1882,82 @@ test("Direct mobile Chat bootstrap replaces a corrupt pure-DOM index with one co
   assert.equal(app.lastChatBootstrapDiagnostics.repairReason, "corrupt-dom-orders");
   assert.equal(app.lastChatBootstrapDiagnostics.repairedCorruptDomIndex, true);
   assert.equal(app.lastChatBootstrapDiagnostics.bootstrapped, true);
+});
+
+test("Chat repair rejects a shrinking sweep and preserves the larger existing index", async () => {
+  const { app, host } = createHarness();
+  const conversationId = "12345678-1234-4234-8234-777777777777";
+  const container = { scrollTop: -120, isConnected: true };
+  const uuid = (n) => "dddddddd-dddd-4ddd-8ddd-" + String(n).padStart(12, "0");
+  const makeWindow = (a, b) => [
+    { id: uuid(a), order: 0, windowOrder: 0, visualOrder: 0, orderTrust: "window", text: "Q" + a, source: "dom", visible: true },
+    { id: uuid(b), order: 1, windowOrder: 1, visualOrder: 1, orderTrust: "window", text: "Q" + b, source: "dom", visible: true }
+  ];
+  const index = new TurnIndex();
+  index.mergeMany([
+    { id: uuid(1), order: 0, text: "Q1", source: "dom", visible: false },
+    { id: uuid(2), order: 1, text: "Q2", source: "dom", visible: false },
+    { id: uuid(3), order: 2, text: "Q3", source: "dom", visible: false },
+    { id: uuid(4), order: 3, text: "Q4", source: "dom", visible: false },
+    { id: uuid(5), order: 4, text: "Q5", source: "dom", visible: false },
+    { id: uuid(6), order: 4, text: "Q6", source: "dom", visible: false }
+  ]);
+  const beforeIds = index.getOrdered().map((turn) => turn.id);
+  let currentWindow = makeWindow(3, 4);
+  const identity = { id: conversationId, source: "sidebar-chatgpt", host: "chatgpt", kind: "conversation", stable: true };
+
+  app.turnIndexes.clear();
+  app.turnIndexes.set(conversationId, index);
+  app.currentConversationId = conversationId;
+  app.scheduleRefresh = () => {};
+  app.startChatBootstrapSampleLoop = () => {};
+  app.stopChatBootstrapSampleLoop = () => {};
+  host.getSurface = () => SURFACE.CONVERSATION;
+  host.getConversationId = () => conversationId;
+  host.getConversationIdentity = () => identity;
+  host.getScrollContainer = () => container;
+  host.getVisibleTurns = () => currentWindow;
+  host.getChatVisibleTurns = () => currentWindow;
+  host.hydrateChatEarlierHistory = async () => ({ ok: true, started: true, reason: "earlier-boundary-exhausted" });
+  host.sweepLoadedChatHistory = async ({ onWindow }) => {
+    const windows = [makeWindow(1, 2), makeWindow(2, 3), makeWindow(3, 4)];
+    for (const window of windows) {
+      currentWindow = window;
+      onWindow?.({ turns: window });
+    }
+    return { ok: true, started: true, reason: "sweep-complete", steps: 3, windowCount: 3 };
+  };
+
+  assert.equal(app.maybeStartChatTrueTopBootstrap({
+    conversationId,
+    index,
+    identity,
+    visibleRecords: currentWindow,
+    trustedVisible: [currentWindow[1]],
+    reconcileDiagnostics: { turns: [{ reason: "occupied-order" }] }
+  }), true);
+  await app.chatBootstrapHydrationPromise;
+
+  assert.deepEqual(index.getOrdered().map((turn) => turn.id), beforeIds);
+  assert.equal(index.size(), 6);
+  assert.equal(app.lastChatBootstrapDiagnostics.repairRejected, true);
+  assert.equal(app.lastChatBootstrapDiagnostics.repairRejectReason, "candidate-shrinks-existing");
+  assert.equal(app.lastChatBootstrapDiagnostics.repairExistingCount, 6);
+  assert.equal(app.lastChatBootstrapDiagnostics.repairCandidateCount, 4);
+  assert.equal(app.lastChatBootstrapDiagnostics.bootstrapped, false);
+  assert.equal(app.chatAutoRepairBlocked.has(conversationId), true);
+  assert.equal(app.chatBootstrapFailures.get(conversationId), 3);
+
+  const second = app.maybeStartChatTrueTopBootstrap({
+    conversationId,
+    index,
+    identity,
+    visibleRecords: currentWindow,
+    trustedVisible: [],
+    reconcileDiagnostics: { turns: [{ reason: "occupied-order" }] }
+  });
+  assert.equal(second, false);
+  assert.equal(app.lastChatBootstrapDiagnostics.result, "repair-blocked");
 });
 
 test("Pinned Chat bootstrap replaces an old disconnected Q1-Q7 DOM cache with the complete chain", async () => {
